@@ -65,11 +65,27 @@ doc is as much the product as the code.
   the latest checksum-valid display frame per (terminal, row) as raw wire
   bytes, so a capture client connecting mid-session can be replayed a full
   screen instead of waiting hours for a static page to repaint.
+- `src/plan_fields.h` — the field-extraction engine: matcher kinds for every
+  observed row shape (anchored label + number, tokens, scheduler slots, ...),
+  page identity, and the content-driven Input/Output scan. The spec *table* —
+  which page paints what where — is device application data and lives with
+  the consumer; this header ships the matchers and the runner.
+- `src/plan_nav.h` — the navigation engine: verified primitives (settle-then-
+  verify step, Esc-to-anchor, band-verified menu select, selection-band
+  seek) shared by both machines below, plus `PlanNav`, a scheduled scrape
+  runner that executes a consumer-supplied `ScrapeStep[]` route — every step
+  screen-verified, each visited page emitted for extraction, exponential
+  backoff on failure. Routes, menu tables, and walk budgets are device
+  application data.
+- `src/plan_edit.h` — `PlanEdit`, the transactional edit engine (navigate
+  with whole-route retry, focus-hop, one press per read-back, commit +
+  verify, Esc abort on any divergence, digit-by-digit PIN gate entry),
+  multi-op page visits (`set_ops`) and non-committing selector sweeps
+  (`read_sweep`), plus `EditArbiter`: one nav owner at a time on the single
+  enrolled session, writes jumping ahead of queued reads. The macro
+  registry (`MacroDef` tables) is device application data.
 - `src/hex_format.h` — hex line formatting for capture logs, in the format
   planscope's offline tools parse.
-
-More of the terminal stack (navigation/edit engines) is being extracted
-here from the firmware it was developed in; see the commit history.
 
 ## Getting started: capture the bus
 
@@ -93,6 +109,9 @@ c++ -std=c++17 test/test_integration.cpp   -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_screen.cpp   -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_snapshot.cpp -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_hex_format.cpp    -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_plan_fields.cpp   -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_plan_nav.cpp      -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_plan_edit.cpp     -o /tmp/t && /tmp/t  # prints "ok"
 ```
 
 `test_integration.cpp` drives `PlanTerminal` end to end against a mock µPC
