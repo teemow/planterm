@@ -34,6 +34,15 @@ transport.
   designated TX bytes. How you achieve that (parity tricks, bit-banging) is
   platform-specific and out of scope for the core.
 
+## Protocol documentation
+
+[docs/protocol.md](docs/protocol.md) is a standalone reference for the pLAN
+protocol as reverse-engineered here: physical layer, addressing, both
+checksum grammars, the poll/reply heartbeat, roll-call enrollment, keypad
+reports, the display session, the captured attach sequence, multi-terminal
+behavior, and measured timings. For an otherwise undocumented protocol, the
+doc is as much the product as the code.
+
 ## Contents
 
 - `src/plan_frame.h` — the frame grammar: byte-sum boundary oracle
