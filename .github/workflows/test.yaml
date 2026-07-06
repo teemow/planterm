@@ -1,0 +1,20 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run all host tests
+        run: |
+          set -e
+          for t in test/test_*.cpp; do
+            echo "== $t"
+            c++ -std=c++17 -Wall -Wextra -Werror "$t" -o /tmp/t
+            /tmp/t
+          done

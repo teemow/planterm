@@ -1,0 +1,21 @@
+{
+  "name": "planterm",
+  "version": "0.1.0",
+  "description": "CAREL pLAN terminal protocol library: act as a pGD terminal to decode, enroll, navigate and edit. Header-only, platform-agnostic C++17.",
+  "keywords": ["carel", "plan", "pgd", "rs485", "heat-pump", "hvac", "protocol"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teemow/planterm.git"
+  },
+  "authors": [
+    {
+      "name": "Timo Derstappen",
+      "url": "https://github.com/teemow",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": "*",
+  "platforms": "*",
+  "headers": "plan_frame.h"
+}
