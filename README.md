@@ -56,10 +56,22 @@ doc is as much the product as the code.
   the latest checksum-valid display frame per (terminal, row) as raw wire
   bytes, so a capture client connecting mid-session can be replayed a full
   screen instead of waiting hours for a static page to repaint.
+- `src/hex_format.h` — hex line formatting for capture logs, in the format
+  planscope's offline tools parse.
 
 More of the terminal stack (enrollment state machine, navigation/edit
 engines) is being extracted here from the firmware it was developed in; see
 the commit history.
+
+## Getting started: capture the bus
+
+[examples/BusCapture](examples/BusCapture/BusCapture.ino) is the place to
+start: a passive, transmit-never sketch that taps the RS-485 bus through a
+MAX3485, splits the byte stream into pLAN frames with the boundary oracle
+and prints them as hex — the "is my tap point right?" tool. The sketch
+header documents the wiring and the 8N2-receive caveat (passive capture
+needs no 9-bit handling; full terminal emulation does — see the transport
+notes in [docs/protocol.md](docs/protocol.md#1-physical-layer)).
 
 ## Tests
 
@@ -71,9 +83,11 @@ c++ -std=c++17 test/test_plan_frame.cpp    -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_decode.cpp   -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_screen.cpp   -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_snapshot.cpp -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_hex_format.cpp    -o /tmp/t && /tmp/t  # prints "ok"
 ```
 
-CI runs all of them on every push and pull request.
+CI runs all of them on every push and pull request, and additionally builds
+the BusCapture example for an ESP32-C3 board with PlatformIO.
 
 `test_plan_screen.cpp` replays an archived menu-walk capture (parsed by the
 shared `test/walk_replay.h` harness) through `PlanScreen` and asserts the
