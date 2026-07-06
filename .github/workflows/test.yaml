@@ -18,3 +18,20 @@ jobs:
             c++ -std=c++17 -Wall -Wextra -Werror "$t" -o /tmp/t
             /tmp/t
           done
+
+  example-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-espressif32-6.9.0
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build BusCapture example (ESP32-C3)
+        run: >
+          pio ci examples/BusCapture/BusCapture.ino
+          --lib .
+          --board lolin_c3_mini
+          --project-option "platform=espressif32@6.9.0"
