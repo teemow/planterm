@@ -87,6 +87,14 @@ doc is as much the product as the code.
 - `src/hex_format.h` — hex line formatting for capture logs, in the format
   planscope's offline tools parse.
 
+## Install
+
+- **Arduino IDE**: Library Manager → search "planterm".
+- **PlatformIO**: add `lib_deps = teemow/planterm` to `platformio.ini`.
+
+Or vendor it directly — it is header-only; `#include <planterm.h>` pulls in
+everything, or include the individual headers you need.
+
 ## Getting started: capture the bus
 
 [examples/BusCapture](examples/BusCapture/BusCapture.ino) is the place to

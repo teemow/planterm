@@ -17,5 +17,5 @@
   "license": "MIT",
   "frameworks": "*",
   "platforms": "*",
-  "headers": ["plan_frame.h", "plan_terminal.h", "plan_screen.h", "plan_snapshot.h", "hex_format.h"]
+  "headers": "planterm.h"
 }
