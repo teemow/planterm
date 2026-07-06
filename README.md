@@ -48,6 +48,15 @@ doc is as much the product as the code.
 - `src/plan_frame.h` — the frame grammar: byte-sum boundary oracle
   (`frame_len_at`), keypad-report encode/validate, poll-token matcher,
   response-slot reply with 9th-bit mask, display/measurement record decode.
+- `src/plan_terminal.h` — `PlanTerminal`, the terminal-side protocol state
+  machine: byte + 9th bit in, `TxAction` out. Poll matching, roll-call
+  enrollment (claim and graceful renounce), session-frame acking with both
+  checksum grammars, ident reply, key injection into the response slot,
+  link-reset and rejection detection, bus telemetry. Time is injected via
+  parameters; the caller owns the transport and reports back via
+  `tx_sent()`/`tx_not_sent()`. This code has run an ISR on a live bus for
+  weeks — it is deliberately frozen in its proven shape (see the inline
+  comments before restructuring anything).
 - `src/plan_screen.h` — `PlanScreen`, the pGD screen reconstructor:
   accumulates display frames (`0x0B` text rows, `0x0C` single cells, `0x64`
   graphics bands, `0x65` page sync) into 2 terminals × 8 rows × 22 chars,
@@ -59,9 +68,8 @@ doc is as much the product as the code.
 - `src/hex_format.h` — hex line formatting for capture logs, in the format
   planscope's offline tools parse.
 
-More of the terminal stack (enrollment state machine, navigation/edit
-engines) is being extracted here from the firmware it was developed in; see
-the commit history.
+More of the terminal stack (navigation/edit engines) is being extracted
+here from the firmware it was developed in; see the commit history.
 
 ## Getting started: capture the bus
 
@@ -81,10 +89,19 @@ binary per test:
 ```sh
 c++ -std=c++17 test/test_plan_frame.cpp    -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_decode.cpp   -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_integration.cpp   -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_screen.cpp   -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_snapshot.cpp -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_hex_format.cpp    -o /tmp/t && /tmp/t  # prints "ok"
 ```
+
+`test_integration.cpp` drives `PlanTerminal` end to end against a mock µPC
+controller (`test/mock_controller.h`) whose every emitted frame and
+validation rule cites a behavior captured off a live bus: enrollment at
+address 31, 100 uncontested poll cycles, key injection in the enrolled
+slot, session acks under both checksum grammars, the ident reply, the
+re-poll rejection signal, FF-walk link-reset detection, and the graceful
+disenroll drain.
 
 CI runs all of them on every push and pull request, and additionally builds
 the BusCapture example for an ESP32-C3 board with PlatformIO.
