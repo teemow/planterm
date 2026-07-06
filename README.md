@@ -39,10 +39,18 @@ transport.
 - `src/plan_frame.h` — the frame grammar: byte-sum boundary oracle
   (`frame_len_at`), keypad-report encode/validate, poll-token matcher,
   response-slot reply with 9th-bit mask, display/measurement record decode.
+- `src/plan_screen.h` — `PlanScreen`, the pGD screen reconstructor:
+  accumulates display frames (`0x0B` text rows, `0x0C` single cells, `0x64`
+  graphics bands, `0x65` page sync) into 2 terminals × 8 rows × 22 chars,
+  with inverse-video band tracking (the menu cursor) and settle timestamps.
+- `src/plan_snapshot.h` — `PlanSnapshot`, the screen-snapshot cache: keeps
+  the latest checksum-valid display frame per (terminal, row) as raw wire
+  bytes, so a capture client connecting mid-session can be replayed a full
+  screen instead of waiting hours for a static page to repaint.
 
-More of the terminal stack (screen reconstruction, enrollment state machine,
-navigation/edit engines) is being extracted here from the firmware it was
-developed in; see the commit history.
+More of the terminal stack (enrollment state machine, navigation/edit
+engines) is being extracted here from the firmware it was developed in; see
+the commit history.
 
 ## Tests
 
@@ -50,11 +58,24 @@ Every header is host-testable with a plain C++17 compiler, one standalone
 binary per test:
 
 ```sh
-c++ -std=c++17 test/test_plan_frame.cpp -o /tmp/t && /tmp/t   # prints "ok"
-c++ -std=c++17 test/test_plan_decode.cpp -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_plan_frame.cpp    -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_plan_decode.cpp   -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_plan_screen.cpp   -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_plan_snapshot.cpp -o /tmp/t && /tmp/t  # prints "ok"
 ```
 
 CI runs all of them on every push and pull request.
+
+`test_plan_screen.cpp` replays an archived menu-walk capture (parsed by the
+shared `test/walk_replay.h` harness) through `PlanScreen` and asserts the
+reconstruction invariants ported from planscope's `replay_test.go`: at most
+one selection band below the title bar on every settled page, and the row
+content of documented pages matching their reference dumps
+(digit-normalized — live values drift). The reference capture is not part
+of this repo; without one the test skips cleanly (still exits 0, as in CI).
+To run it against a capture, tee one with `planscope observe --raw live.log`
+(or `planscope log`) and pass it as the first argument — add `--live` to
+relax the coverage assertions to what a scrape-route capture visits.
 
 ## Companion tooling
 
