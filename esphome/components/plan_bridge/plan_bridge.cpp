@@ -1,0 +1,758 @@
+#include "plan_bridge.h"
+#include <plan_frame.h>
+#include "esphome/core/log.h"
+#include "esphome/core/hal.h"
+#include "esphome/components/network/util.h"
+
+#include <driver/gpio.h>
+#include <esp_attr.h>
+#include <esp_rom_sys.h>
+#include <esp_timer.h>
+#include <hal/gpio_ll.h>
+#include <soc/gpio_struct.h>
+#include <soc/uart_periph.h>
+
+#include <lwip/sockets.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace esphome {
+namespace plan_bridge {
+
+static const char *const TAG = "plan_bridge";
+
+// Depth of the pending-key-press queue. A human pressing menu buttons never
+// outruns this; extra presses are dropped rather than queued unboundedly.
+static const int QUEUE_DEPTH = 8;
+// ISR -> logging-task stream of (byte, bit9) pairs. Sized for bursts (display
+// redraws are a few hundred bytes); overflow only drops *log* bytes, never
+// affects injection.
+static const size_t STREAM_BUF_SIZE = 4096;
+// Lossless capture stream: TCP server one port above the native API. The
+// ESPHome logger proved unusable as a byte transport (it drops whole lines
+// under burst load and truncates long ones -- detectable, never repairable),
+// so the raw (byte, bit9) stream goes out ONLY here; the logger carries
+// nothing but prose (state, TX, telemetry).
+static const uint16_t CAP_PORT = 6054;
+static const char CAP_BANNER[8] = {'P', 'L', 'A', 'N', 'C', 'A', 'P', '2'};
+// PLANCAP2 record types (u8 prefix on every record; PLANCAP1 had none).
+// Event kinds (EV_*) live in plan_bridge.h -- plan_observe emits too.
+static const uint8_t CAP_REC_PAIRS = 0;  // (byte, bit9) capture record
+static const uint8_t CAP_REC_EVENT = 1;  // typed device event
+// A client that stops reading gets cut instead of stalling the bus task; the
+// records queued-but-unsent consume seq numbers, so the loss is declared as
+// a seq gap downstream, exactly like a dropped log line.
+static const size_t CAP_BACKLOG_MAX = 32 * 1024;
+// Hold counter of a "fresh" press. Ground truth (capture 2026-07-02): a real
+// pGD tap is exactly ONE keypad report with NN=0x01; NN only ramps while a
+// key is held.
+static const uint8_t HOLD_BASE = 0x01;
+// Whether we win the response slot depends on how busy the real pGD is: while
+// it is redrawing it answers polls slowly (>2 ms) and our burst fits; on a
+// static idle screen it answers in ~0.4 ms and collides with us every time.
+// A rejected injection resets the link, whose full-screen redraw (~2 s later)
+// makes the pGD slow again -- pacing retries at 600 ms reaches into that
+// window, so the first (sacrificial) attempt bootstraps acceptance.
+static const int MAX_RETRIES = 10;
+static const uint32_t RETRY_SPACING_MS = 600;
+
+struct KeyReq {
+  uint8_t keycode;
+  bool internal;  // observe navigation: bypasses the armed gate
+};
+
+// pLAN is a 9-bit multidrop protocol: every frame's leading address byte is
+// sent with a 9th "address" bit; payload bytes are not. The wire format is
+// start + 8 data + bit9 + stop. We receive it as 8E1 -- the 9th bit lands in
+// the parity flag: bit9 = even_parity(data) XOR parity_error. We transmit it
+// by choosing EVEN/ODD parity per byte so the emitted parity bit equals the
+// desired 9th bit. This is why byte-perfect 8N2 injections were ignored: the
+// controller's UART filters on the address bit, our frames never reached its
+// firmware.
+// The ESP32-C3 UART core latches conf0 (parity/stop) writes only when the
+// UART_ID_REG.reg_update handshake bit is pulsed; without it the per-byte
+// parity switch silently never reaches the shifter (loopback-verified: every
+// byte went out with the boot-time EVEN parity). IDF 5.5's C3 uart_ll has no
+// wrapper for it, so poke the bit directly.
+static inline void IRAM_ATTR uart_reg_update(uart_dev_t *hw) {
+  hw->id.update = 1;
+  while (hw->id.update) {
+  }
+}
+
+// Transmit with 2 stop bits: the pGD's own bytes are start+8+bit9+2 stop
+// (Phase 0 read the bus cleanly as 8N2 = 12 bit-slots); a wider inter-byte
+// idle can only help the controller's sampler, RX ignores extra idle.
+static void IRAM_ATTR tx_9bit(uart_dev_t *hw, const uint8_t *f, size_t len, uint32_t bit9_mask) {
+  uart_ll_set_stop_bits(hw, UART_STOP_BITS_2);
+  uart_reg_update(hw);
+  for (size_t i = 0; i < len; i++) {
+    bool bit9 = (bit9_mask >> i) & 1;
+    bool ones = __builtin_parity(f[i]) != 0;
+    // EVEN parity emits the data-bit XOR; ODD emits its complement.
+    uart_ll_set_parity(hw, (ones == bit9) ? UART_PARITY_EVEN : UART_PARITY_ODD);
+    uart_reg_update(hw);
+    uint8_t b = f[i];
+    uart_ll_write_txfifo(hw, &b, 1);
+    // The parity register must not change while a byte is shifting out, so
+    // wait for TX idle between bytes (~192 us each at 62500 baud).
+    while (!uart_ll_is_tx_idle(hw)) {
+    }
+  }
+  // Restore RX framing (8E1: parity slot = bit9 detector).
+  uart_ll_set_parity(hw, UART_PARITY_EVEN);
+  uart_ll_set_stop_bits(hw, UART_STOP_BITS_1);
+  uart_reg_update(hw);
+}
+
+// UART RX interrupt. Runs on every received byte (RX-FIFO threshold 1,
+// ~6250 IRQ/s at 62500 baud -- negligible). Feeds each byte to the pure
+// PlanTerminal state machine (plan_terminal.h -- the same code the host
+// integration tests run against the mock controller) and, when it returns a
+// transmit action, answers the response slot from inside the ISR: check the
+// FIFO is still quiet, wait the turnaround, raise DE, 9-bit-transmit, drop
+// DE. Reaction time is single-digit microseconds -- well ahead of the pGD's
+// own ~0.4 ms turnaround -- which the buffered-UART driver path could never
+// achieve.
+void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
+  auto *self = static_cast<PlanBridge *>(arg);
+  uart_dev_t *hw = self->hw_;
+  uint32_t status = uart_ll_get_intsts_mask(hw);
+
+  BaseType_t hpw = pdFALSE;
+  for (;;) {
+    uint32_t pending = uart_ll_get_rxfifo_len(hw);
+    if (pending == 0)
+      break;
+    // bit9 attribution is only exact while each ISR pass finds exactly one
+    // byte queued: the parity flag below is read once at entry and applied
+    // to every byte of a backlog. Count backlogs so any misattribution
+    // window is visible in bus10s (measured 0 in every window so far, idle
+    // AND enrolled -- at 62500 baud bytes are ~176 us apart vs
+    // single-digit-us ISR latency).
+    if (pending > 1) {
+      self->isr_multi_drain_ = self->isr_multi_drain_ + 1;
+      if (pending > self->isr_drain_max_)
+        self->isr_drain_max_ = pending;
+    }
+    // A parity "error" under 8E1 means the wire's 9th bit differs from even
+    // parity of the data bits, i.e. this is an address byte (or vice versa).
+    // The flag comes from the ENTRY status snapshot. Do NOT restructure this
+    // (per-byte snapshot-and-clear of UART_INTR_PARITY_ERR, or hoisting perr
+    // out of the loop with a post-loop drain counter): both variants
+    // live-tested (2026-07-03) as a deterministic enroll->link-reset storm
+    // -- the controller rejected every roll-call reply -- while this exact
+    // shape enrolls cleanly. Same unexplained ISR-shape sensitivity as the
+    // claim_mask_ and ack-always incidents; the multi_drain counter above is
+    // the guard that the entry-snapshot simplification stays valid.
+    bool perr = (status & UART_INTR_PARITY_ERR) != 0;
+    uint8_t b;
+    uart_ll_read_rxfifo(hw, &b, 1);
+    uint8_t bit9 = static_cast<uint8_t>((__builtin_parity(b) != 0) ^ perr);
+
+    plan::TxAction act = self->term_.on_byte(b, bit9, esp_timer_get_time());
+    if (act.kind != plan::TxAction::NONE) {
+      // The response slot only belongs to us if no further byte has arrived
+      // behind the match (a stale match means the controller moved on) --
+      // checked before AND after the turnaround delay.
+      if (uart_ll_get_rxfifo_len(hw) == 0) {
+        esp_rom_delay_us(self->turnaround_us_);
+        if (uart_ll_get_rxfifo_len(hw) == 0) {
+          gpio_ll_set_level(&GPIO, static_cast<gpio_num_t>(self->de_pin_), 1);
+          uint8_t f[sizeof(act.frame)];
+          for (size_t i = 0; i < act.len; i++)
+            f[i] = act.frame[i];
+          tx_9bit(hw, f, act.len, act.bit9_mask);
+          gpio_ll_set_level(&GPIO, static_cast<gpio_num_t>(self->de_pin_), 0);
+          self->term_.tx_sent(act, esp_timer_get_time());
+        } else {
+          self->term_.tx_not_sent(act);
+        }
+      } else {
+        self->term_.tx_not_sent(act);
+      }
+    }
+
+    uint8_t pair[2] = {b, bit9};
+    // The ISR is IRAM-resident so it keeps answering polls while the flash
+    // cache is disabled (WiFi/NVS/OTA writes). That is only safe if every
+    // function it calls is IRAM too: the device YAML must set
+    // CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=n, otherwise this
+    // stream-buffer call panics the moment the ISR fires during a flash
+    // write (crash-looped v1 of the IRAM fix straight into an OTA rollback).
+    if (self->stream_ != nullptr) {
+      // Drop whole pairs, never half: a partial send would shift the
+      // (byte, bit9) pairing for everything after it and garble the rest of
+      // the capture. The only other party is the reader task, which can only
+      // FREE space, so a >=2 check here guarantees the full send succeeds.
+      if (xStreamBufferSpacesAvailable(self->stream_) >= 2)
+        xStreamBufferSendFromISR(self->stream_, pair, 2, &hpw);
+      else
+        self->cap_drop_bytes_ = self->cap_drop_bytes_ + 2;
+    }
+  }
+
+  uart_ll_clr_intsts_mask(hw, status);
+  if (hpw == pdTRUE)
+    portYIELD_FROM_ISR();
+}
+
+void PlanBridge::setup() {
+  uart_config_t cfg = {};
+  cfg.baud_rate = static_cast<int>(baud_rate_);
+  cfg.data_bits = UART_DATA_8_BITS;
+  // The wire frame is start + 8 data + address bit + stop: exactly 8E1 with
+  // the address bit in the parity slot. stop_bits_ from YAML is ignored.
+  cfg.parity = UART_PARITY_EVEN;
+  cfg.stop_bits = UART_STOP_BITS_1;
+  cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+  cfg.source_clk = UART_SCLK_DEFAULT;
+
+  // No uart_driver_install: we own the interrupt. uart_param_config still
+  // enables the peripheral clock and sets baud/format.
+  esp_err_t err = uart_param_config(uart_num_, &cfg);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "uart_param_config failed: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  int tx = (tx_pin_ >= 0) ? tx_pin_ : UART_PIN_NO_CHANGE;
+  err = uart_set_pin(uart_num_, tx, rx_pin_, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "uart_set_pin failed: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  // MAX3485 DE+RE tied, driven directly by the ISR around the 9-bit transmit.
+  // RE low keeps the receiver live while idle; it is muted during our own TX,
+  // so we never capture our own frame.
+  gpio_reset_pin(static_cast<gpio_num_t>(de_pin_));
+  gpio_set_direction(static_cast<gpio_num_t>(de_pin_), GPIO_MODE_OUTPUT);
+  gpio_set_level(static_cast<gpio_num_t>(de_pin_), 0);
+
+  queue_ = xQueueCreate(QUEUE_DEPTH, sizeof(KeyReq));
+  stream_ = xStreamBufferCreate(STREAM_BUF_SIZE, 1);
+  if (queue_ == nullptr || stream_ == nullptr) {
+    ESP_LOGE(TAG, "queue/stream alloc failed");
+    this->mark_failed();
+    return;
+  }
+  hw_ = UART_LL_GET_HW(uart_num_);
+  uart_ll_rxfifo_rst(hw_);
+  uart_ll_txfifo_rst(hw_);
+  // Interrupt on every byte: the poll hunt must track the bus in real time.
+  uart_ll_set_rxfifo_full_thr(hw_, 1);
+  uart_ll_clr_intsts_mask(hw_, UART_LL_INTR_MASK);
+  // ESP_INTR_FLAG_IRAM keeps the handler runnable while the flash cache is
+  // disabled (WiFi/NVS/OTA writes). Without it the ISR is blocked for
+  // milliseconds at a time, we miss polls to our enrolled terminal address,
+  // and the controller resets the pLAN link ("no link" flicker on the pGD).
+  err = esp_intr_alloc(uart_periph_signal[uart_num_].irq, ESP_INTR_FLAG_IRAM,
+                       &PlanBridge::uart_isr, this, &intr_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_intr_alloc failed: %s", esp_err_to_name(err));
+    this->mark_failed();
+    return;
+  }
+  uart_ll_ena_intr_mask(hw_, UART_INTR_RXFIFO_FULL | UART_INTR_PARITY_ERR);
+
+  // Logging/injection-bookkeeping task; all hard timing lives in the ISR.
+  BaseType_t ok = xTaskCreatePinnedToCore(task_trampoline, "plan_ctrl", 4096, this,
+                                          configMAX_PRIORITIES - 3, &task_, 0);
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG, "task create failed");
+    this->mark_failed();
+    return;
+  }
+  ready_ = true;
+}
+
+void PlanBridge::press_key(uint8_t keycode) {
+  if (!ready_ || queue_ == nullptr)
+    return;
+  KeyReq r{keycode, false};
+  if (xQueueSend(queue_, &r, 0) != pdTRUE)
+    ESP_LOGW(TAG, "key queue full, press 0x%02X dropped", keycode);
+}
+
+void PlanBridge::press_key_internal(uint8_t keycode) {
+  if (!ready_ || queue_ == nullptr)
+    return;
+  KeyReq r{keycode, true};
+  if (xQueueSend(queue_, &r, 0) != pdTRUE)
+    ESP_LOGW(TAG, "key queue full, internal press 0x%02X dropped", keycode);
+}
+
+void PlanBridge::log_state_() {
+  ESP_LOGI(TAG, "state: armed=%s enroll=%s tx_mode=%d", armed_ ? "yes" : "no",
+           term_.drain_ ? "drain" : (term_.enroll_ ? "yes" : "no"),
+           static_cast<int>(term_.tx_mode_));
+}
+
+// Emit the current state as an EV_STATE event record. Bus task only (the
+// backlog vector is single-owner); other tasks set state_dirty_ instead.
+void PlanBridge::capture_event_state_() {
+  uint8_t enroll = term_.drain_ ? 2 : (term_.enroll_ ? 1 : 0);
+  uint8_t a = static_cast<uint8_t>((armed_ ? 1 : 0) | (enroll << 1));
+  capture_event_(EV_STATE, a, static_cast<uint8_t>(term_.tx_mode_));
+}
+
+void PlanBridge::set_armed(bool a) {
+  bool changed = armed_ != a;
+  armed_ = a;
+  // Codegen calls this before setup(); only log runtime changes.
+  if (changed && ready_) {
+    log_state_();
+    state_dirty_ = true;  // event goes out from the bus task
+  }
+}
+
+void PlanBridge::set_enroll(bool e) {
+  if (e) {
+    // Re-arm the join event: on a fresh enroll it fires after the roll-call
+    // walk adopts us; when already on the link, the next answered poll
+    // (tens of ms) re-fires it -- either way it certifies a live poll slot.
+    join_polls_base_ = term_.enroll_polls_;
+    join_logged_ = false;
+    term_.drain_ = false;
+    term_.drain_replied_ = false;
+    term_.claim_mask_ = plan::OWN_BIT;
+    term_.enroll_ = true;
+  } else if (term_.enroll_ && !term_.drain_) {
+    // Graceful leave: stay fully on the link but renounce our bit in the next
+    // periodic roll-call walk (~12 s cadence). task_main finishes the leave on
+    // drain_replied_ or at the deadline.
+    term_.drain_replied_ = false;
+    term_.claim_mask_ = 0;
+    term_.drain_ = true;
+    drain_deadline_ms_ = millis() + 15000;
+  } else {
+    term_.drain_ = false;
+    term_.claim_mask_ = plan::OWN_BIT;
+    term_.enroll_ = false;
+  }
+  if (ready_) {
+    log_state_();
+    state_dirty_ = true;  // event goes out from the bus task
+  }
+}
+
+void PlanBridge::task_trampoline(void *arg) { static_cast<PlanBridge *>(arg)->task_main(); }
+
+void PlanBridge::arm_isr_tx_() {
+  uint8_t f[plan::REPLY9_LEN];
+  plan::encode_reply9(pending_key_, hold_, f);
+  for (size_t i = 0; i < plan::REPLY9_LEN; i++)
+    term_.tx_frame_[i] = f[i];
+  term_.tx_fired_ = false;
+  term_.tx_pending_ = true;  // last: publishes the frame to the ISR
+}
+
+// Slow path only: drain the ISR's byte stream for frame logging and run the
+// press bookkeeping (arm the ISR, ramp the hold counter, deadline aborts).
+void PlanBridge::task_main() {
+  uint8_t tmp[128];
+  uint32_t last_gap_report_ = 0;
+  for (;;) {
+    // (The old boot-time loopback self-test is gone: with TX and RX parity
+    // coupled in loopback it could only ever show the data bytes' own parity,
+    // proving nothing -- and it made us deaf right when enrollment needs us
+    // answering every poll.)
+    // Periodic pGD-turnaround report: how fast the real display answers its
+    // polls right now (drifts with its rendering workload; drives whether our
+    // injected replies win the slot).
+    // Finish a graceful drain: the renouncing roll-call reply went out (or
+    // the walk never came before the deadline) -> actually leave the link.
+    if (term_.drain_ && (term_.drain_replied_ || millis() > drain_deadline_ms_)) {
+      if (term_.drain_replied_)
+        vTaskDelay(pdMS_TO_TICKS(200));  // let the controller finish processing the walk
+      term_.enroll_ = false;
+      term_.drain_ = false;
+      ESP_LOGI(TAG, "drain done (%s)", term_.drain_replied_ ? "renounced in roll-call" : "deadline, hard stop");
+      log_state_();
+      state_dirty_ = true;
+    }
+
+    // State changes from other tasks (set_armed/set_enroll run on the main
+    // loop task) are emitted here: the capture backlog is bus-task-only.
+    if (state_dirty_) {
+      state_dirty_ = false;
+      capture_event_state_();
+    }
+    if (hold_pending_ != 0) {
+      uint8_t h = hold_pending_;
+      hold_pending_ = 0;
+      capture_event_(EV_HOLD, static_cast<uint8_t>(h - 1), 0);
+    }
+
+    // Explicit join event (see join_logged_ in the header): the first poll
+    // to our address answered since set_enroll(true) proves the controller
+    // actually polls us -- the join the host waits on instead of the state
+    // line's wish flag.
+    if (!join_logged_ && term_.enroll_ && term_.enroll_polls_ != join_polls_base_) {
+      join_logged_ = true;
+      ESP_LOGI(TAG, "enrolled: first poll answered");
+      capture_event_(EV_JOIN, 0, 0);
+    }
+
+    if (millis() - last_gap_report_ > 10000) {
+      last_gap_report_ = millis();
+      log_state_();
+      capture_event_state_();  // periodic truth: the host watchdog's heal path
+      // Phase 0 telemetry summary: per-address frame counts, checksum
+      // failures (the objective garble detector), and the smallest gap
+      // between our TX end and the next RX byte (collision indicator).
+      // Read-then-reset per window; a byte landing between the reads is
+      // counted in the next window (ponytail: no ISR lock, off-by-one-frame
+      // per 10 s window is irrelevant at ~30 frames/s).
+      // cap_drop_bytes_ stays MONOTONIC (the capture stream declares it
+      // in-band, a reset would look like time travel); bus10s shows the
+      // per-window delta like the other counters.
+      uint32_t drop_now = cap_drop_bytes_;
+      ESP_LOGI(TAG,
+               "bus10s: ctrl=%u pgd=%u us=%u other=%u cksum_fail=%u post_tx_gap_min=%uus "
+               "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u",
+               static_cast<unsigned>(term_.tel_frames_ctrl_),
+               static_cast<unsigned>(term_.tel_frames_pgd_),
+               static_cast<unsigned>(term_.tel_frames_us_),
+               static_cast<unsigned>(term_.tel_frames_other_),
+               static_cast<unsigned>(term_.tel_cksum_fail_),
+               static_cast<unsigned>(term_.tel_post_tx_gap_min_us_),
+               static_cast<unsigned>(drop_now - drop_last_window_),
+               static_cast<unsigned>(isr_multi_drain_), static_cast<unsigned>(isr_drain_max_),
+               static_cast<unsigned>(cap_seq_));
+      drop_last_window_ = drop_now;
+      term_.tel_frames_ctrl_ = 0;
+      term_.tel_frames_pgd_ = 0;
+      term_.tel_frames_us_ = 0;
+      term_.tel_frames_other_ = 0;
+      term_.tel_cksum_fail_ = 0;
+      term_.tel_post_tx_gap_min_us_ = 0;
+      isr_multi_drain_ = 0;
+      isr_drain_max_ = 0;
+      if (term_.enroll_ || term_.enroll_replies_ > 0)
+        ESP_LOGI(TAG,
+                 "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "
+                 "%u ident replies, %u acks withheld (cksum fail)",
+                 plan::ENROLL_ADDR, static_cast<unsigned>(term_.enroll_replies_),
+                 static_cast<unsigned>(term_.enroll_polls_),
+                 static_cast<unsigned>(term_.session_acks_),
+                 static_cast<unsigned>(term_.ident_replies_),
+                 static_cast<unsigned>(term_.ack_ck_fail_));
+      if (term_.gap_n_ > 0) {
+        char buf[160];
+        int p = 0;
+        uint32_t n = term_.gap_n_ < 16 ? term_.gap_n_ : 16;
+        for (uint32_t i = 0; i < n && p < (int) sizeof(buf) - 12; i++)
+          p += snprintf(buf + p, sizeof(buf) - p, "%u ", static_cast<unsigned>(term_.gap_ring_[i]));
+        ESP_LOGD(TAG, "pGD turnaround (us, last %u): %s", static_cast<unsigned>(n), buf);
+      }
+    }
+
+    capture_poll_();
+    size_t n = xStreamBufferReceive(stream_, tmp, sizeof(tmp), pdMS_TO_TICKS(gap_ms_));
+    if (n > 0) {
+      capture_send_(tmp, n);
+      // Screen-snapshot cache (slow path, never the ISR): remember the
+      // latest valid display frame per (terminal, row) for replay to the
+      // next capture client. The observe listener rides the same drain.
+      uint32_t now = millis();
+      for (size_t i = 0; i + 1 < n; i += 2) {
+        snap_.feed(tmp[i], tmp[i + 1], now);
+        if (stream_listener_)
+          stream_listener_(tmp[i], tmp[i + 1], now);
+      }
+    }
+    capture_flush_();
+
+    uint32_t now = millis();
+    if (pending_frames_ == 0) {
+      KeyReq req;
+      if (xQueueReceive(queue_, &req, 0) != pdTRUE)
+        continue;
+      if (!armed_ && !req.internal) {
+        ESP_LOGW(TAG, "key 0x%02X ignored: not armed", req.keycode);
+        continue;
+      }
+      ESP_LOGI(TAG, "injecting key 0x%02X: %d poll-slot(s)", req.keycode, repeat_);
+      pending_key_ = req.keycode;
+      pending_frames_ = repeat_;
+      hold_ = HOLD_BASE;
+      term_.isr_stale_ = 0;
+      retries_ = 0;
+      term_.tx_rejected_ = false;
+      term_.link_reset_ = false;
+      inject_deadline_ms_ = now + 2000;
+      arm_isr_tx_();
+      continue;
+    }
+
+    if (term_.tx_fired_) {
+      term_.tx_fired_ = false;
+      ESP_LOGD(TAG,
+               "TX(9bit) %02X' %02X %02X %02X %02X %02X %02X  %02X' %02X %02X %02X (stale polls: "
+               "%u, attempt %d)",
+               term_.tx_frame_[0], term_.tx_frame_[1], term_.tx_frame_[2], term_.tx_frame_[3],
+               term_.tx_frame_[4], term_.tx_frame_[5], term_.tx_frame_[6], term_.tx_frame_[7],
+               term_.tx_frame_[8], term_.tx_frame_[9], term_.tx_frame_[10],
+               static_cast<unsigned>(term_.isr_stale_), retries_);
+      capture_event_(EV_TX_FIRED, pending_key_, static_cast<uint8_t>(retries_));
+      // Verdict phase. Two rejection signatures exist: an immediate re-poll
+      // (tx_rejected_, within ms) and the silent discard, which surfaces only
+      // as the controller's link-reset FF-walk ~2 s later. Only 2.5 s of
+      // quiet after the TX means the key was accepted.
+      //
+      // In tx_mode 2 the report rides in OUR OWN poll slot: no pGD to collide
+      // with and (measured 2026-07-02, dozens of injections) no silent
+      // discards -- every key was accepted on attempt 0. The rejection
+      // re-poll lands within ~5 ms of our TX (the ISR flags it), so two
+      // 20 ms ticks cover it with margin and the accepted verdict logs
+      // ~40 ms after the TX instead of 300 ms.
+      bool failed = false;
+      int verdict_ticks = (term_.tx_mode_ == 2) ? 2 : 25;
+      uint32_t tick_ms = (term_.tx_mode_ == 2) ? 20 : 100;
+      for (int i = 0; i < verdict_ticks; i++) {
+        vTaskDelay(pdMS_TO_TICKS(tick_ms));
+        if (term_.tx_rejected_ || term_.link_reset_) {
+          failed = true;
+          break;
+        }
+      }
+      if (failed) {
+        bool was_reset = term_.link_reset_;
+        term_.tx_rejected_ = false;
+        term_.link_reset_ = false;
+        if (++retries_ <= MAX_RETRIES) {
+          ESP_LOGW(TAG, "key 0x%02X: %s, retry %d/%d", pending_key_,
+                   was_reset ? "link reset (silent discard)" : "collision with pGD reply",
+                   retries_, MAX_RETRIES);
+          // A link reset is followed by a full-screen redraw that keeps the
+          // pGD busy (slow poll replies) -- the retry lands in that window.
+          vTaskDelay(pdMS_TO_TICKS(was_reset ? 400 : RETRY_SPACING_MS));
+          inject_deadline_ms_ = millis() + 2000;
+          arm_isr_tx_();
+          continue;
+        }
+        ESP_LOGW(TAG, "key 0x%02X: gave up after %d attempts", pending_key_, MAX_RETRIES);
+        pending_frames_ = 0;
+        continue;
+      }
+      hold_ = (hold_ + 2 > 0xC8) ? 0xC8 : static_cast<uint8_t>(hold_ + 2);
+      if (--pending_frames_ == 0) {
+        ESP_LOGI(TAG, "key 0x%02X: accepted (attempt %d)", pending_key_, retries_);
+        capture_event_(EV_KEY_ACCEPTED, pending_key_, static_cast<uint8_t>(retries_));
+      } else {
+        // Space repeats at roughly the pGD's cadence, then re-arm.
+        vTaskDelay(pdMS_TO_TICKS(repeat_interval_ms_));
+        arm_isr_tx_();
+      }
+    } else if ((int32_t) (now - inject_deadline_ms_) >= 0) {
+      // No poll slot could be filled (the pGD beat us into every one).
+      // That costs nothing on the bus, so retry on the same budget.
+      if (++retries_ <= MAX_RETRIES) {
+        ESP_LOGW(TAG, "key 0x%02X: no clean slot, retry %d/%d", pending_key_, retries_,
+                 MAX_RETRIES);
+        inject_deadline_ms_ = now + 2000;
+        continue;
+      }
+      term_.tx_pending_ = false;
+      ESP_LOGW(TAG, "key 0x%02X: aborted (%d slot(s) unfilled, stale polls: %u)", pending_key_,
+               pending_frames_, static_cast<unsigned>(term_.isr_stale_));
+      pending_frames_ = 0;
+    }
+  }
+}
+
+// --- lossless capture + event stream (TCP 6054) -----------------------------
+//
+// After the 8-byte "PLANCAP2" banner every record starts with a u8 type;
+// all integers little-endian.
+//
+// type 0 (CAP_REC_PAIRS) -- raw bus bytes:
+//   u32 seq   monotonic per record (client detects loss as a gap)
+//   u32 ts_ms device millis() at drain time
+//   u32 drops cumulative ISR->stream-buffer dropped BYTES (in-band, so even
+//             the one remaining loss mode is visible in the data itself)
+//   u16 n     pair count
+//   n * (byte, bit9) pairs -- the exact stream the hex log lines carry
+//
+// type 1 (CAP_REC_EVENT) -- typed device event, the machine interface that
+// replaced regex-parsing of log prose (fixed 7 bytes after the type):
+//   u32 ts_ms device millis()
+//   u8 kind   EV_* above
+//   u8 a, b   kind-specific (STATE: a = armed|enroll<<1, b = tx_mode;
+//             TX_FIRED/KEY_ACCEPTED: a = keycode, b = attempt)
+//
+// A fresh client gets the screen-snapshot replay plus one EV_STATE right
+// after the banner, so it starts with truth instead of waiting for the
+// 10 s periodic state event.
+//
+// Single client (planscope); a second connect replaces the first. All
+// sockets are non-blocking: the bus task must never wait on the network.
+
+static void cap_set_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
+
+static void cap_put_u32(std::vector<uint8_t> &v, uint32_t x) {
+  v.push_back(static_cast<uint8_t>(x));
+  v.push_back(static_cast<uint8_t>(x >> 8));
+  v.push_back(static_cast<uint8_t>(x >> 16));
+  v.push_back(static_cast<uint8_t>(x >> 24));
+}
+
+void PlanBridge::capture_close_client_() {
+  if (cap_client_fd_ >= 0) {
+    close(cap_client_fd_);
+    cap_client_fd_ = -1;
+  }
+  cap_backlog_.clear();
+}
+
+void PlanBridge::capture_poll_() {
+  if (cap_listen_fd_ < 0) {
+    // The bus task starts at HARDWARE setup priority, long before WiFi:
+    // touching lwIP sockets before the TCP/IP stack is up crashes the boot
+    // (measured: illegal-instruction panic + OTA rollback). Wait for an IP.
+    if (!network::is_connected())
+      return;
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0)
+      return;  // out of sockets right now; retried next loop
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(CAP_PORT);
+    if (bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0 ||
+        listen(fd, 1) < 0) {
+      close(fd);
+      return;
+    }
+    cap_set_nonblock(fd);
+    cap_listen_fd_ = fd;
+    ESP_LOGI(TAG, "capture stream listening on tcp/%u", CAP_PORT);
+  }
+  int fd = accept(cap_listen_fd_, nullptr, nullptr);
+  if (fd >= 0) {
+    capture_close_client_();  // single client: newest wins
+    cap_set_nonblock(fd);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    cap_client_fd_ = fd;
+    cap_backlog_.assign(CAP_BANNER, CAP_BANNER + sizeof(CAP_BANNER));
+    capture_send_snapshot_();
+    capture_event_state_();  // state truth up front, not 10 s later
+    ESP_LOGI(TAG, "capture stream client connected (screen snapshot replayed)");
+  }
+  // Detect a closed client: it never sends, so any read readiness is EOF/RST.
+  if (cap_client_fd_ >= 0) {
+    uint8_t junk[16];
+    ssize_t r = recv(cap_client_fd_, junk, sizeof(junk), MSG_DONTWAIT);
+    if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
+      ESP_LOGI(TAG, "capture stream client gone (log lines resume)");
+      capture_close_client_();
+    }
+  }
+}
+
+// Replay the screen-snapshot cache right after the banner: one seq-0 record
+// per cached frame (seq 0 marks "replayed state, not live traffic" -- live
+// seq starts at 1, so the client's gap accounting is untouched). ts_ms
+// carries when the frame was actually seen. 0x20 frames get the constant
+// pGD-ack trailer appended, which the client's frame parser anchors on.
+void PlanBridge::capture_send_snapshot_() {
+  snap_.visit([this](const uint8_t *bytes, size_t len, uint32_t at_ms, bool trailer) {
+    cap_backlog_.push_back(CAP_REC_PAIRS);
+    cap_put_u32(cap_backlog_, 0);
+    cap_put_u32(cap_backlog_, at_ms);
+    cap_put_u32(cap_backlog_, cap_drop_bytes_);
+    size_t np = len + (trailer ? sizeof(plan::SNAP_TRAILER) : 0);
+    cap_backlog_.push_back(static_cast<uint8_t>(np));
+    cap_backlog_.push_back(static_cast<uint8_t>(np >> 8));
+    for (size_t i = 0; i < len; i++) {
+      cap_backlog_.push_back(bytes[i]);
+      cap_backlog_.push_back(i == 0 ? 1 : 0);  // bit9 on the address byte
+    }
+    if (trailer) {
+      for (size_t i = 0; i < sizeof(plan::SNAP_TRAILER); i++) {
+        cap_backlog_.push_back(plan::SNAP_TRAILER[i]);
+        cap_backlog_.push_back(i == 0 ? 1 : 0);
+      }
+    }
+  });
+}
+
+void PlanBridge::capture_send_(const uint8_t *pairs, size_t n) {
+  if (cap_client_fd_ < 0)
+    return;
+  size_t npairs = n / 2;
+  if (npairs == 0)
+    return;
+  cap_seq_++;
+  if (cap_backlog_.size() > CAP_BACKLOG_MAX) {
+    // Client stalled: skip the record but keep counting seq, so the client
+    // sees an honest gap instead of silently thinned data.
+    return;
+  }
+  cap_backlog_.push_back(CAP_REC_PAIRS);
+  cap_put_u32(cap_backlog_, cap_seq_);
+  cap_put_u32(cap_backlog_, millis());
+  cap_put_u32(cap_backlog_, cap_drop_reported_ = cap_drop_bytes_);
+  cap_backlog_.push_back(static_cast<uint8_t>(npairs));
+  cap_backlog_.push_back(static_cast<uint8_t>(npairs >> 8));
+  cap_backlog_.insert(cap_backlog_.end(), pairs, pairs + 2 * npairs);
+}
+
+// One typed event record into the backlog. Bus task only. A backlog past
+// the cap means the client stalled long ago (pair records stopped at the
+// cap); with the device scraping 24/7 the per-keypress events would then
+// grow the heap without bound, so cut the client instead -- a reconnect
+// replays the snapshot plus one EV_STATE, so no state truth is lost.
+void PlanBridge::capture_event_(uint8_t kind, uint8_t a, uint8_t b) {
+  if (cap_client_fd_ < 0)
+    return;
+  if (cap_backlog_.size() > CAP_BACKLOG_MAX) {
+    ESP_LOGW(TAG, "capture stream client stalled (backlog %u), dropping client",
+             static_cast<unsigned>(cap_backlog_.size()));
+    capture_close_client_();
+    return;
+  }
+  cap_backlog_.push_back(CAP_REC_EVENT);
+  cap_put_u32(cap_backlog_, millis());
+  cap_backlog_.push_back(kind);
+  cap_backlog_.push_back(a);
+  cap_backlog_.push_back(b);
+}
+
+bool PlanBridge::capture_flush_() {
+  if (cap_client_fd_ < 0 || cap_backlog_.empty())
+    return true;
+  ssize_t w = send(cap_client_fd_, cap_backlog_.data(), cap_backlog_.size(), MSG_DONTWAIT);
+  if (w > 0) {
+    cap_backlog_.erase(cap_backlog_.begin(), cap_backlog_.begin() + w);
+    return true;
+  }
+  if (w < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+    return true;
+  ESP_LOGW(TAG, "capture stream send failed (errno %d), dropping client", errno);
+  capture_close_client_();
+  return false;
+}
+
+void PlanBridge::dump_config() {
+  ESP_LOGCONFIG(TAG, "pLAN control (9-bit ISR key-press injection):");
+  ESP_LOGCONFIG(TAG, "  UART%d  RX=%d  TX=%d  DE/RE(GPIO)=%d", static_cast<int>(uart_num_),
+                rx_pin_, tx_pin_, de_pin_);
+  ESP_LOGCONFIG(TAG, "  %u baud, 8+bit9 (as 8E1), gap %ums", baud_rate_, gap_ms_);
+  ESP_LOGCONFIG(TAG, "  repeat %dx @ %ums, armed=%s, capture stream tcp/%u", repeat_,
+                repeat_interval_ms_, armed_ ? "yes" : "no", CAP_PORT);
+  ESP_LOGCONFIG(TAG, "  enroll=%s (terminal 0x%02X), tx_mode=%d", term_.enroll_ ? "yes" : "no",
+                plan::ENROLL_ADDR, static_cast<int>(term_.tx_mode_));
+}
+
+}  // namespace plan_bridge
+}  // namespace esphome

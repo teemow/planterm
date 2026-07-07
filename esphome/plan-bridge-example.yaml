@@ -1,0 +1,126 @@
+# Minimal plan_bridge device config: an ESP32-C3 + MAX3485 on the CAREL pLAN
+# bus, controllable from Home Assistant and readable by planscope.
+#
+# Wiring (the reference rig, see ../README.md#reference-hardware):
+#   GPIO20 <- MAX3485 RO   (RX; capture + poll detection)
+#   GPIO21 -> MAX3485 DI   (TX; keypad reports)
+#   GPIO7  -> MAX3485 DE+RE tied (EN); GPIO driven by the RX ISR
+#
+# SAFETY: transmit is gated behind the write-enable switch below (and the
+# set_armed action). It comes up OFF on every boot; key buttons/actions do
+# nothing until it is turned on. Keep the machine's real terminal connected
+# as reference display and manual fallback, and watch it while injecting.
+
+esphome:
+  name: plan-bridge
+  friendly_name: pLAN bridge
+
+esp32:
+  board: lolin_c3_mini
+  framework:
+    type: esp-idf  # required: the component owns the UART interrupt
+    # Keep FreeRTOS in IRAM: the RX ISR (ESP_INTR_FLAG_IRAM) calls
+    # xStreamBufferSendFromISR during flash-cache-off windows (OTA/NVS).
+    sdkconfig_options:
+      CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH: "n"
+
+# baud_rate: 0 disables the serial logger (a busy bus filling the USB FIFO
+# with no host draining it would starve the API task). The logger carries
+# prose only; the raw byte stream goes out over the TCP capture stream.
+logger:
+  level: DEBUG
+  baud_rate: 0
+
+wifi:
+  ssid: "your-ssid"
+  password: "your-wifi-password"
+
+api:
+  encryption:
+    # Generate your own: openssl rand -base64 32
+    key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+  # Callable from Home Assistant or via the ESPHome API (e.g.
+  # `planscope call set_armed true`). set_armed is the write-enable gate;
+  # inject_key sends one keycode (a no-op while disarmed).
+  actions:
+    - action: set_armed
+      variables:
+        enabled: bool
+      then:
+        - lambda: "id(bridge).set_armed(enabled);"
+    - action: set_enroll
+      variables:
+        enabled: bool
+      then:
+        - lambda: "id(bridge).set_enroll(enabled);"
+    - action: inject_key
+      variables:
+        code: int
+      then:
+        - lambda: "id(bridge).press_key((uint8_t) code);"
+
+ota:
+  - platform: esphome
+    password: "your-ota-password"
+
+external_components:
+  # Local source so this repo's CI compiles the checkout under test. On your
+  # device use the published component instead:
+  #   - source: github://teemow/planterm@main
+  #     components: [plan_bridge]
+  - source:
+      type: local
+      path: components
+    components: [plan_bridge]
+
+plan_bridge:
+  id: bridge
+  rx_pin: GPIO20   # MAX3485 RO
+  tx_pin: GPIO21   # MAX3485 DI
+  de_pin: GPIO7    # MAX3485 DE+RE tied (EN)
+  baud_rate: 62500
+  # armed defaults false; the switch/action below arm it at runtime.
+  # enroll defaults false; enable it (or call set_enroll) once terminal
+  # address 31 is in the controller's terminal list.
+
+# Write-enable gate. OFF on boot; only when ON will a key transmit.
+switch:
+  - platform: template
+    name: "Write enable"
+    id: write_enable
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: "id(bridge).set_armed(true);"
+    turn_off_action:
+      - lambda: "id(bridge).set_armed(false);"
+
+# The six pGD buttons (keycodes: docs/protocol.md section 6). Each enqueues
+# one key press (a no-op while the write-enable switch is OFF). Start
+# validation with a navigation key from a known screen and watch the real
+# terminal move.
+button:
+  - platform: template
+    name: "Key Up"
+    on_press:
+      - lambda: "id(bridge).press_key(0x0F);"
+  - platform: template
+    name: "Key Down"
+    on_press:
+      - lambda: "id(bridge).press_key(0x10);"
+  - platform: template
+    name: "Key Enter"
+    on_press:
+      - lambda: "id(bridge).press_key(0x0E);"
+  - platform: template
+    name: "Key Esc"
+    on_press:
+      - lambda: "id(bridge).press_key(0x01);"
+  - platform: template
+    name: "Key Prg"
+    on_press:
+      - lambda: "id(bridge).press_key(0x06);"
+  - platform: template
+    name: "Key Alarm"
+    on_press:
+      - lambda: "id(bridge).press_key(0x0D);"
