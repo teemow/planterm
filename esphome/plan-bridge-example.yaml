@@ -37,7 +37,9 @@ wifi:
 
 api:
   encryption:
-    # Generate your own: openssl rand -base64 32
+    # Generate your own: openssl rand -base64 32. One key secures both
+    # channels: the native API and the PLANCAP capture socket (plan_bridge
+    # picks it up as its default capture_key).
     key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
   # Callable from Home Assistant or via the ESPHome API (e.g.
   # `planscope call set_armed true`). set_armed is the write-enable gate;

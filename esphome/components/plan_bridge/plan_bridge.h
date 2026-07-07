@@ -1,11 +1,17 @@
 #pragma once
 
+#include "esphome/core/component.h"
+#include "esphome/core/defines.h"
+
 // The pure pLAN protocol logic comes from the planterm library
-// (github.com/teemow/planterm, pinned in __init__.py).
+// (github.com/teemow/planterm, pinned in __init__.py). PLAN_CAP_NOISE is a
+// global build flag set by codegen when a PLANCAP key is configured; it
+// turns on the Noise responder inside plan_cap.h (noise-c arrives via
+// add_library).
+#include <plan_cap.h>
 #include <plan_snapshot.h>
 #include <plan_terminal.h>
 
-#include "esphome/core/component.h"
 #include <driver/uart.h>
 #include <hal/uart_ll.h>
 #include <esp_intr_alloc.h>
@@ -13,6 +19,7 @@
 #include <freertos/queue.h>
 #include <freertos/stream_buffer.h>
 #include <freertos/task.h>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -20,10 +27,10 @@
 namespace esphome {
 namespace plan_bridge {
 
-// Typed device events on the capture stream (PLANCAP2 record type 1) -- the
-// machine interface planscope consumes instead of regex-parsing log prose.
-// The ESP_LOG lines stay for humans; these values are the wire protocol
-// (planscope mirrors them in internal/esphome/capture.go).
+// Typed device events on the capture stream (PLANCAP record type 0x01,
+// docs/capture-protocol.md section 5.2) -- the machine interface host tools
+// consume instead of regex-parsing log prose. The ESP_LOG lines stay for
+// humans; these values are the wire protocol.
 static const uint8_t EV_STATE = 1;         // a = armed | enroll<<1 (0 no, 1 yes, 2 drain), b = tx_mode
 static const uint8_t EV_JOIN = 2;          // first poll to our address answered since set_enroll(true)
 static const uint8_t EV_TX_FIRED = 3;      // a = keycode, b = attempt
@@ -108,6 +115,14 @@ class PlanBridge : public Component {
   // 1 = send the 7-byte keypad report after the pGD's own poll exchange,
   // 2 = inject in our enrolled terminal's poll slot (needs enroll).
   void set_tx_mode(int m) { term_.tx_mode_ = m; }
+  // The PLANCAP PSK (raw 32 bytes, from base64 in YAML -- on ESPHome devices
+  // codegen defaults it to api.encryption.key). Called by codegen only when
+  // a key is configured (which also sets the PLAN_CAP_NOISE build flag);
+  // without a key the capture socket serves the keyless plaintext mode.
+  void set_capture_psk(std::array<uint8_t, 32> psk) {
+    cap_psk_ = psk;
+    cap_has_psk_ = true;
+  }
 
   // Enqueue a single key press. Safe to call from loop()/the API/a YAML
   // lambda -- it just hands a keycode to the bus task via a FreeRTOS queue and
@@ -128,18 +143,27 @@ class PlanBridge : public Component {
   static void task_trampoline(void *arg);
   void task_main();
   void arm_isr_tx_();    // encode pending_key_/hold_ into tx_frame_ and hand it to the ISR
-  void log_state_();     // one "state: armed=... enroll=..." line (device truth for planscope)
-  // Lossless capture stream (TCP 6054): accept/health-check the single
-  // client, frame drained pairs into binary records, flush non-blocking.
-  void capture_poll_();                                  // listen/accept/detect-close
-  void capture_send_(const uint8_t *pairs, size_t n);    // one record into the backlog
+  void log_state_();     // one "state: armed=... enroll=..." line (human prose)
+  // The PLANCAP server (TCP 6054, docs/capture-protocol.md): accept the
+  // single client, run the session (handshake, record framing/encryption
+  // via plan::PlanCapSession), flush non-blocking. All bus task only.
+  void capture_poll_();                                  // listen/accept/read/handshake
+  void capture_send_(const uint8_t *pairs, size_t n);    // one bus-bytes record
   bool capture_flush_();                                 // false = client died
   void capture_close_client_();
   void capture_send_snapshot_();  // replay the screen cache as seq-0 records
-  // Typed event records (PLANCAP2 type 1): the machine interface planscope
-  // consumes instead of regex-parsing log prose. Bus task only.
+  bool capture_out_();  // enqueue cap_rec_ as one framed (encrypted) record
+  // Typed event records (PLANCAP type 0x01). Bus task only.
   void capture_event_(uint8_t kind, uint8_t a, uint8_t b);
   void capture_event_state_();  // EV_STATE from the current armed/enroll/tx_mode
+  // Plan-related prose: one line to the logger (for humans at `esphome
+  // logs`) AND, when a capture client is established, as a PLANCAP
+  // diagnostic record (type 0x02) -- host tools never parse the logger.
+  // Severity = plan::CAP_DIAG_* (mapped to the matching log level).
+  void capture_diag_(uint8_t severity, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+  // A client command record (type 0x03): dispatch into the same internals
+  // the ESPHome services call, then ack (type 0x04).
+  void capture_command_(uint8_t id, uint8_t op, uint8_t arg);
 
   int tx_pin_{-1};
   int rx_pin_{-1};
@@ -159,16 +183,21 @@ class PlanBridge : public Component {
   uart_dev_t *hw_{nullptr};
   bool ready_{false};
 
-  // Lossless capture stream: a single-client TCP server (port 6054), the
-  // ONLY transport for the raw (byte, bit9) stream -- the logger carries
-  // prose, never bytes. Every drained chunk goes out as one length-prefixed
-  // record with a sequence number and the in-band ISR-drop count: TCP is
-  // reliable, so the only loss modes left (stream-buffer overflow, a stalled
-  // client cut off) are declared in the data instead of vanishing. Records
-  // queue in cap_backlog_ and are flushed non-blocking so a stalled client
-  // can never stall the bus task.
+  // The PLANCAP server: a single-client TCP server (port 6054), the ONLY
+  // transport for the raw (byte, bit9) stream -- the logger carries prose,
+  // never bytes. Every drained chunk goes out as one record with a sequence
+  // number and the in-band ISR-drop count: TCP is reliable, so the only
+  // loss modes left (stream-buffer overflow, a stalled client cut off) are
+  // declared in the data instead of vanishing. Wire bytes (framed, and on a
+  // keyed session Noise-encrypted, by cap_sess_) queue in cap_backlog_ and
+  // are flushed non-blocking so a stalled client can never stall the bus
+  // task.
   int cap_listen_fd_{-1};
   int cap_client_fd_{-1};
+  plan::PlanCapSession cap_sess_;
+  std::vector<uint8_t> cap_rec_;  // scratch: one plaintext record being built
+  std::array<uint8_t, 32> cap_psk_{};
+  bool cap_has_psk_{false};
   uint32_t cap_seq_{0};
   volatile uint32_t cap_drop_bytes_{0};  // bytes the ISR could not stream (buffer full)
   uint32_t cap_drop_reported_{0};        // cap_drop_bytes_ already declared in-band

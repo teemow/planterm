@@ -14,9 +14,11 @@ Two channels, two audiences:
   (`set_armed`, `set_enroll`, `inject_key`, …) and whatever template
   switches/buttons the device YAML declares — see the
   [example YAML](../../plan-bridge-example.yaml).
-- **Capture socket** (host tools): TCP port 6054 serves the raw bus stream,
-  typed device events and the screen-snapshot replay — the machine
-  interface planscope consumes. Format below.
+- **PLANCAP socket** (host tools): TCP port 6054 serves the raw bus
+  stream, typed device events, diagnostics and the command channel
+  (arm/enroll/inject with acks) — authenticated and encrypted with the
+  device's API key. This is the machine interface host tools consume; a
+  tool needs no other channel for its live features.
 
 ## Hardware
 
@@ -75,12 +77,11 @@ task-side slow path — never in the ISR.
 
 Transmit is gated behind an **`armed`** flag, default **false**, so a
 reboot never comes up able to move the machine. Arm it at runtime (a
-template switch in the YAML, the `set_armed` API service, or — once the
-capture socket speaks PLANCAP — its arm command). A key press requested
-while disarmed is dropped
-and logged. Enrollment (`set_enroll`) is passive with respect to the
-controlled machine — key injection stays gated behind `armed` even while
-enrolled.
+template switch in the YAML, the `set_armed` API service, or PLANCAP's
+arm command). A key press requested while disarmed is dropped, logged
+and — over PLANCAP — rejected in the ack. Enrollment (`set_enroll`) is
+passive with respect to the controlled machine — key injection stays
+gated behind `armed` even while enrolled.
 
 Injection self-limits: a press answers at most `repeat` polls, spaced by
 `repeat_interval_ms`, and aborts on a deadline if polls stop — it can
@@ -113,6 +114,7 @@ plan_bridge:
 | `repeat_interval_ms` | `60` | min spacing between poll-slot responses |
 | `armed` | `false` | compile-time default of the write-enable gate |
 | `enroll` | `false` | join the pLAN as a second terminal at boot (address 31 must be in the controller's terminal list) |
+| `capture_key` | `api.encryption.key` | the PLANCAP PSK (base64, 32 bytes). Defaults to the device's API key so one key secures both channels; set it explicitly only on devices without an encrypted API. **No key at all = unauthenticated plaintext mode: trusted networks only.** |
 
 The component pulls the planterm library from its own checkout — pinning
 the `external_components` ref pins library and component together. Do not
@@ -138,36 +140,32 @@ bridge without touching the ISR:
 - `post_hold_event(bool)` — surface a walk-yield handshake to host tools
   as an `EV_HOLD` event on the capture stream.
 
-## Capture stream (TCP 6054) — bytes and events
+## PLANCAP (TCP 6054) — capture, events, diagnostics, commands
 
-Raw bus bytes **and typed device events** are served exclusively on TCP
-port 6054 (= ESPHome API port + 1); the ESPHome logger carries human prose
-only. Log lines proved structurally lossy as a data transport (dropped
-whole lines under burst load, truncated long ones), so nothing
-machine-parses log prose.
+The device end of **[PLANCAP](../../../docs/capture-protocol.md)** (the
+normative spec), served on TCP port 6054 (= ESPHome API port + 1); the
+ESPHome logger carries human prose only. Log lines proved structurally
+lossy as a data transport (dropped whole lines under burst load,
+truncated long ones), so nothing machine-parses log prose.
 
-> **Interim protocol.** What follows is today's unauthenticated
-> `PLANCAP2` stream. It is being replaced by
-> [PLANCAP](../../../docs/capture-protocol.md) — same records, plus Noise
-> authentication/encryption, commands and diagnostics. Until that lands,
-> treat the capture port as exposing full display content to anyone who
-> can reach it: trusted networks only.
+Single client (newest connection wins), 7-byte banner `PLANCAP`, then a
+Noise `NNpsk0_25519_ChaChaPoly_SHA256` handshake (prologue `PLANCAP`,
+PSK = the `capture_key`, i.e. by default the device's
+`api.encryption.key`) — or, on a keyless device, the plaintext hello.
+Every record travels in one `0x01`/`0x00` + `u16 BE len` frame. Record
+types (all integers little-endian; exact layouts in the spec):
 
-Protocol: single client (newest connection wins), 8-byte banner
-`PLANCAP2`, then records prefixed with a `u8 type`, all little-endian:
-
-- **type 0, bus bytes**: `u32 seq`, `u32 millis`, `u32 cumulative
-  ISR→stream-buffer drop count` (in-band), `u16 n`, then `n` (byte, bit9)
-  pairs. TCP makes the transport lossless; the only residual loss modes —
-  ISR stream-buffer overflow and a stalled client being cut — are declared
-  in the data instead of vanishing.
-- **type 1, device event**: `u32 millis`, `u8 kind`, `u8 a`, `u8 b`.
-  Emitted only from the bus task, so events order exactly with the bus
-  bytes around them.
+| Type | Direction | Content |
+|---|---|---|
+| `0x00` bus bytes | → client | `seq`, `ts_ms`, in-band drop count, `n` (byte, bit9) pairs |
+| `0x01` device event | → client | kind + 2 payload bytes, see below |
+| `0x02` diagnostic | → client | severity + one line of prose, ordered with the bus bytes it refers to |
+| `0x03` command | client → | arm / enroll / inject_key, dispatching into the same internals as the API services |
+| `0x04` ack | → client | echoes the command id; accepted / rejected / unknown op |
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `EV_STATE` (1) | armed, enroll (no/yes/drain), tx_mode | device truth, on change + every 10 s + once on capture-client connect |
+| `EV_STATE` (1) | armed, enroll (no/yes/drain), tx_mode | device truth, on change + every 10 s (the in-band keepalive) + once on session establish |
 | `EV_JOIN` (2) | — | the actual link join: first poll to our address answered since `set_enroll(true)` |
 | `EV_TX_FIRED` (3) | keycode, attempt | the keypad report went out |
 | `EV_KEY_ACCEPTED` (4) | keycode, attempt | verdict: no rejection signature followed |
@@ -177,9 +175,15 @@ Protocol: single client (newest connection wins), 8-byte banner
 so a client connecting mid-session would start from a blank
 reconstruction. The component caches the latest checksum-valid display
 frame per (terminal, row) (planterm's `plan_snapshot.h`) and replays the
-cache right after the banner as **seq-0 records**; live records start at
-seq 1, so gap accounting is untouched. One `EV_STATE` event follows the
-replay, so a fresh client holds the device truth immediately.
+cache as soon as the session is established, as **seq-0 records**; live
+records start at seq 1, so gap accounting is untouched. One `EV_STATE`
+event follows the replay, so a fresh client holds the device truth
+immediately.
+
+The transport session (handshake, framing, encryption) is planterm's
+`plan_cap.h`, host-tested against a real Noise initiator in
+`test/test_plan_cap.cpp` — the firmware and the Go clients implement the
+same spec, not each other's quirks.
 
 ## Injection verdict
 
@@ -201,7 +205,10 @@ frozen-shape rule again).
 The protocol state machine the ISR runs is planterm's `PlanTerminal`,
 integration-tested in this repo's host suite (`test/test_integration.cpp`)
 against a mock controller whose every frame cites live-bus behavior. The
-component itself is the hardware glue around it (FIFO checks, turnaround
-delay, DE GPIO, 9-bit transmit) plus the capture server; CI compiles it
-standalone against real ESPHome + esp-idf with the
+PLANCAP transport session is host-tested against a real noise-c initiator
+(`test/test_plan_cap.cpp`): handshake, encrypted records both ways,
+command dispatch, the wrong-key reject, plaintext mode, framing errors.
+The component itself is the hardware glue (FIFO checks, turnaround delay,
+DE GPIO, 9-bit transmit) plus the record content and backlog policy; CI
+compiles it standalone against real ESPHome + esp-idf with the
 [example YAML](../../plan-bridge-example.yaml).

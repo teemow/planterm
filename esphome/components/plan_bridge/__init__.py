@@ -1,9 +1,11 @@
+import base64
 from pathlib import Path
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import pins
 from esphome.const import CONF_ID
+from esphome.core import CORE
 
 CODEOWNERS = ["@teemow"]
 DEPENDENCIES = ["esp32"]
@@ -22,6 +24,18 @@ CONF_REPEAT = "repeat"
 CONF_REPEAT_INTERVAL_MS = "repeat_interval_ms"
 CONF_ARMED = "armed"
 CONF_ENROLL = "enroll"
+CONF_CAPTURE_KEY = "capture_key"
+
+
+def _validate_capture_key(value):
+    value = cv.string_strict(value)
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except ValueError as err:
+        raise cv.Invalid("Invalid capture_key format, expected base64") from err
+    if len(decoded) != 32:
+        raise cv.Invalid("capture_key must be base64 and 32 bytes long")
+    return value
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -52,6 +66,12 @@ CONFIG_SCHEMA = cv.Schema(
         # terminal list (P:01 config screen). Enrollment itself is passive
         # w.r.t. the heat pump -- key injection stays gated behind `armed`.
         cv.Optional(CONF_ENROLL, default=False): cv.boolean,
+        # The PLANCAP PSK (docs/capture-protocol.md section 4): base64,
+        # 32 bytes. Defaults to the device's api.encryption.key, so one key
+        # secures both channels; set it explicitly only on devices without
+        # an encrypted API. Without any key the capture socket falls back to
+        # the unauthenticated plaintext mode -- trusted networks only.
+        cv.Optional(CONF_CAPTURE_KEY): _validate_capture_key,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -71,6 +91,17 @@ def _require_esp_idf(config):
 
 
 FINAL_VALIDATE_SCHEMA = _require_esp_idf
+
+
+def _capture_psk(config):
+    """The effective PLANCAP PSK: explicit capture_key, else the device's
+    api.encryption.key (one key secures both channels), else None."""
+    if key := config.get(CONF_CAPTURE_KEY):
+        return base64.b64decode(key)
+    api_conf = CORE.config.get("api") or {}
+    if key := (api_conf.get("encryption") or {}).get("key"):
+        return base64.b64decode(key)
+    return None
 
 
 async def to_code(config):
@@ -96,3 +127,15 @@ async def to_code(config):
     cg.add(var.set_repeat_interval_ms(config[CONF_REPEAT_INTERVAL_MS]))
     cg.add(var.set_armed(config[CONF_ARMED]))
     cg.add(var.set_enroll(config[CONF_ENROLL]))
+    # PLANCAP encryption: with a key, compile the Noise responder (the same
+    # noise-c + build flags the encrypted ESPHome API uses -- pins must match
+    # the api component's, or PlatformIO sees conflicting versions). Keyless
+    # devices compile the plaintext-only session.
+    if (psk := _capture_psk(config)) is not None:
+        cg.add(var.set_capture_psk(list(psk)))
+        # A global flag, not a define in one header: every translation unit
+        # must see the same PlanCapSession (ODR).
+        cg.add_build_flag("-DPLAN_CAP_NOISE")
+        cg.add_library("esphome/noise-c", "0.1.11")
+        cg.add_build_flag("-DHAVE_WEAK_SYMBOLS=1")
+        cg.add_build_flag("-DHAVE_INLINE_ASM=1")

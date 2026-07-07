@@ -10,12 +10,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # test_plan_cap.cpp exercises the PLANCAP Noise handshake against the
+      # same noise-c the ESPHome firmware bundles, built here for the host
+      # (reference backend, OS RNG). Pinned commit; noise-c barely moves.
+      - name: Build noise-c for the host
+        run: |
+          set -e
+          git clone https://github.com/esphome/noise-c /tmp/noise-c
+          git -C /tmp/noise-c checkout a1e08809a1b8f65cd91765ba7d68a6d00648ad61
+          mkdir /tmp/noise-obj && cd /tmp/noise-obj
+          for f in /tmp/noise-c/src/protocol/*.c \
+                   /tmp/noise-c/src/backend/ref/cipher-chachapoly.c \
+                   /tmp/noise-c/src/backend/ref/dh-curve25519.c \
+                   /tmp/noise-c/src/backend/ref/hash-sha256.c \
+                   /tmp/noise-c/src/crypto/chacha/chacha.c \
+                   /tmp/noise-c/src/crypto/donna/poly1305-donna.c \
+                   /tmp/noise-c/src/crypto/sha2/sha256.c \
+                   /tmp/noise-c/src/crypto/x25519/x25519.c; do
+            cc -c -O1 -DNOISE_USE_REFERENCE_BACKEND=1 -DNOISE_USE_LIBSODIUM=0 \
+               -DNOISE_USE_CUSTOM_RAND=0 -I/tmp/noise-c/include -I/tmp/noise-c/src "$f"
+          done
       - name: Compile and run all host tests
         run: |
           set -e
           for t in test/test_*.cpp; do
             echo "== $t"
-            c++ -std=c++17 -Wall -Wextra -Werror "$t" -o /tmp/t
+            if [ "$t" = "test/test_plan_cap.cpp" ]; then
+              c++ -std=c++17 -Wall -Wextra -Werror -DPLAN_CAP_NOISE \
+                  -I/tmp/noise-c/include "$t" /tmp/noise-obj/*.o -o /tmp/t
+            else
+              c++ -std=c++17 -Wall -Wextra -Werror "$t" -o /tmp/t
+            fi
             /tmp/t
           done
 
