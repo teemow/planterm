@@ -6,17 +6,19 @@
 // hex line. It never transmits -- the transceiver is pinned to receive mode,
 // so tapping a live bus carries no risk of contention.
 //
-// Wiring (MAX3485 -> ESP32; pins below are a lolin_c3_mini, any ESP32 works
-// since the GPIO matrix routes UART1 to arbitrary pins):
+// Wiring (MAX3485 module -> ESP32; bare chip pin names in parentheses.
+// GPIOs below are a lolin_c3_mini, any ESP32 works since the GPIO matrix
+// routes UART1 to arbitrary pins):
 //
-//   pLAN bus            MAX3485        ESP32
-//   ------------------  -------------  -----------------------------
-//   RX+/TX+             A              --
-//   RX-/TX-             B              --
-//   GND                 GND            GND   (common ground, required)
-//                       RO             RX_PIN (GPIO20)
-//                       DI             TX_PIN (GPIO21, unused here)
-//                       DE+RE (tied)   DE_PIN (GPIO7, driven low = receive)
+//   pLAN bus            MAX3485 module     ESP32
+//   ------------------  -----------------  -----------------------------
+//   RX+/TX+             A                  --
+//   RX-/TX-             B                  --
+//   GND                 GND                GND   (common ground, required)
+//                       VCC                3V3
+//                       RXD (RO)           RX_PIN (GPIO20)
+//                       TXD (DI)           TX_PIN (GPIO21, unused here)
+//                       EN  (DE+RE tied)   DE_PIN (GPIO7, driven low = receive)
 //
 //   - 120 ohm termination only if the ESP is a physical bus end.
 //   - Galvanic isolation (an isolated RS-485 module) is recommended.
