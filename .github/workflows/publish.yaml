@@ -1,0 +1,32 @@
+name: publish
+
+# Publishing on release:
+# - Arduino Library Manager needs no action: once a repo is registered, its
+#   indexer picks up new tags automatically. The version check below guards
+#   the one failure mode - tagging with stale manifest versions.
+# - The PlatformIO registry needs an explicit publish, done here. Requires
+#   the PLATFORMIO_AUTH_TOKEN repo secret (mint one with `pio account token`).
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-platformio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify manifest versions match the tag
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME#v}"
+          props=$(sed -n 's/^version=//p' library.properties)
+          json=$(python3 -c "import json; print(json.load(open('library.json'))['version'])")
+          echo "tag=$tag library.properties=$props library.json=$json"
+          [ "$tag" = "$props" ] && [ "$tag" = "$json" ]
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Publish to the PlatformIO registry
+        env:
+          PLATFORMIO_AUTH_TOKEN: ${{ secrets.PLATFORMIO_AUTH_TOKEN }}
+        run: pio pkg publish --no-interactive
