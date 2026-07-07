@@ -10,4 +10,5 @@
 #include "plan_fields.h"
 #include "plan_nav.h"
 #include "plan_edit.h"
+#include "plan_cap.h"
 #include "hex_format.h"

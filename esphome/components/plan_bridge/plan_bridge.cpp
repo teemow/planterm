@@ -2,6 +2,7 @@
 #include <plan_frame.h>
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
 #include "esphome/components/network/util.h"
 
 #include <driver/gpio.h>
@@ -15,6 +16,7 @@
 #include <lwip/sockets.h>
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -32,17 +34,14 @@ static const int QUEUE_DEPTH = 8;
 // redraws are a few hundred bytes); overflow only drops *log* bytes, never
 // affects injection.
 static const size_t STREAM_BUF_SIZE = 4096;
-// Lossless capture stream: TCP server one port above the native API. The
-// ESPHome logger proved unusable as a byte transport (it drops whole lines
-// under burst load and truncates long ones -- detectable, never repairable),
-// so the raw (byte, bit9) stream goes out ONLY here; the logger carries
-// nothing but prose (state, TX, telemetry).
+// The PLANCAP server: TCP one port above the native API. The ESPHome logger
+// proved unusable as a byte transport (it drops whole lines under burst load
+// and truncates long ones -- detectable, never repairable), so the raw
+// (byte, bit9) stream goes out ONLY here; the logger carries nothing but
+// prose for humans. Protocol: docs/capture-protocol.md (banner, Noise
+// handshake / plaintext hello, record layouts); the transport session lives
+// in planterm's plan_cap.h, record kinds (EV_*) in plan_bridge.h.
 static const uint16_t CAP_PORT = 6054;
-static const char CAP_BANNER[8] = {'P', 'L', 'A', 'N', 'C', 'A', 'P', '2'};
-// PLANCAP2 record types (u8 prefix on every record; PLANCAP1 had none).
-// Event kinds (EV_*) live in plan_bridge.h -- plan_observe emits too.
-static const uint8_t CAP_REC_PAIRS = 0;  // (byte, bit9) capture record
-static const uint8_t CAP_REC_EVENT = 1;  // typed device event
 // A client that stops reading gets cut instead of stalling the bus task; the
 // records queued-but-unsent consume seq numbers, so the loss is declared as
 // a seq gap downstream, exactly like a dropped log line.
@@ -241,6 +240,13 @@ void PlanBridge::setup() {
     this->mark_failed();
     return;
   }
+  // Client command records surface from cap_sess_.feed(), i.e. from
+  // capture_poll_() on the bus task -- the same context every other
+  // capture_* runs in.
+  cap_sess_.on_command = [this](uint8_t id, uint8_t op, uint8_t arg) {
+    this->capture_command_(id, op, arg);
+  };
+
   hw_ = UART_LL_GET_HW(uart_num_);
   uart_ll_rxfifo_rst(hw_);
   uart_ll_txfifo_rst(hw_);
@@ -287,6 +293,9 @@ void PlanBridge::press_key_internal(uint8_t keycode) {
     ESP_LOGW(TAG, "key queue full, internal press 0x%02X dropped", keycode);
 }
 
+// Logger-only on purpose: it runs on the main loop task too (set_armed /
+// set_enroll), where the bus-task-owned capture backlog is off limits --
+// and the machine-readable truth is the EV_STATE event anyway.
 void PlanBridge::log_state_() {
   ESP_LOGI(TAG, "state: armed=%s enroll=%s tx_mode=%d", armed_ ? "yes" : "no",
            term_.drain_ ? "drain" : (term_.enroll_ ? "yes" : "no"),
@@ -372,7 +381,8 @@ void PlanBridge::task_main() {
         vTaskDelay(pdMS_TO_TICKS(200));  // let the controller finish processing the walk
       term_.enroll_ = false;
       term_.drain_ = false;
-      ESP_LOGI(TAG, "drain done (%s)", term_.drain_replied_ ? "renounced in roll-call" : "deadline, hard stop");
+      capture_diag_(plan::CAP_DIAG_INFO, "drain done (%s)",
+                    term_.drain_replied_ ? "renounced in roll-call" : "deadline, hard stop");
       log_state_();
       state_dirty_ = true;
     }
@@ -395,7 +405,7 @@ void PlanBridge::task_main() {
     // line's wish flag.
     if (!join_logged_ && term_.enroll_ && term_.enroll_polls_ != join_polls_base_) {
       join_logged_ = true;
-      ESP_LOGI(TAG, "enrolled: first poll answered");
+      capture_diag_(plan::CAP_DIAG_INFO, "enrolled: first poll answered");
       capture_event_(EV_JOIN, 0, 0);
     }
 
@@ -413,18 +423,18 @@ void PlanBridge::task_main() {
       // in-band, a reset would look like time travel); bus10s shows the
       // per-window delta like the other counters.
       uint32_t drop_now = cap_drop_bytes_;
-      ESP_LOGI(TAG,
-               "bus10s: ctrl=%u pgd=%u us=%u other=%u cksum_fail=%u post_tx_gap_min=%uus "
-               "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u",
-               static_cast<unsigned>(term_.tel_frames_ctrl_),
-               static_cast<unsigned>(term_.tel_frames_pgd_),
-               static_cast<unsigned>(term_.tel_frames_us_),
-               static_cast<unsigned>(term_.tel_frames_other_),
-               static_cast<unsigned>(term_.tel_cksum_fail_),
-               static_cast<unsigned>(term_.tel_post_tx_gap_min_us_),
-               static_cast<unsigned>(drop_now - drop_last_window_),
-               static_cast<unsigned>(isr_multi_drain_), static_cast<unsigned>(isr_drain_max_),
-               static_cast<unsigned>(cap_seq_));
+      capture_diag_(plan::CAP_DIAG_INFO,
+                    "bus10s: ctrl=%u pgd=%u us=%u other=%u cksum_fail=%u post_tx_gap_min=%uus "
+                    "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u",
+                    static_cast<unsigned>(term_.tel_frames_ctrl_),
+                    static_cast<unsigned>(term_.tel_frames_pgd_),
+                    static_cast<unsigned>(term_.tel_frames_us_),
+                    static_cast<unsigned>(term_.tel_frames_other_),
+                    static_cast<unsigned>(term_.tel_cksum_fail_),
+                    static_cast<unsigned>(term_.tel_post_tx_gap_min_us_),
+                    static_cast<unsigned>(drop_now - drop_last_window_),
+                    static_cast<unsigned>(isr_multi_drain_), static_cast<unsigned>(isr_drain_max_),
+                    static_cast<unsigned>(cap_seq_));
       drop_last_window_ = drop_now;
       term_.tel_frames_ctrl_ = 0;
       term_.tel_frames_pgd_ = 0;
@@ -435,21 +445,22 @@ void PlanBridge::task_main() {
       isr_multi_drain_ = 0;
       isr_drain_max_ = 0;
       if (term_.enroll_ || term_.enroll_replies_ > 0)
-        ESP_LOGI(TAG,
-                 "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "
-                 "%u ident replies, %u acks withheld (cksum fail)",
-                 plan::ENROLL_ADDR, static_cast<unsigned>(term_.enroll_replies_),
-                 static_cast<unsigned>(term_.enroll_polls_),
-                 static_cast<unsigned>(term_.session_acks_),
-                 static_cast<unsigned>(term_.ident_replies_),
-                 static_cast<unsigned>(term_.ack_ck_fail_));
+        capture_diag_(plan::CAP_DIAG_INFO,
+                      "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "
+                      "%u ident replies, %u acks withheld (cksum fail)",
+                      plan::ENROLL_ADDR, static_cast<unsigned>(term_.enroll_replies_),
+                      static_cast<unsigned>(term_.enroll_polls_),
+                      static_cast<unsigned>(term_.session_acks_),
+                      static_cast<unsigned>(term_.ident_replies_),
+                      static_cast<unsigned>(term_.ack_ck_fail_));
       if (term_.gap_n_ > 0) {
         char buf[160];
         int p = 0;
         uint32_t n = term_.gap_n_ < 16 ? term_.gap_n_ : 16;
         for (uint32_t i = 0; i < n && p < (int) sizeof(buf) - 12; i++)
           p += snprintf(buf + p, sizeof(buf) - p, "%u ", static_cast<unsigned>(term_.gap_ring_[i]));
-        ESP_LOGD(TAG, "pGD turnaround (us, last %u): %s", static_cast<unsigned>(n), buf);
+        capture_diag_(plan::CAP_DIAG_DEBUG, "pGD turnaround (us, last %u): %s",
+                      static_cast<unsigned>(n), buf);
       }
     }
 
@@ -475,10 +486,11 @@ void PlanBridge::task_main() {
       if (xQueueReceive(queue_, &req, 0) != pdTRUE)
         continue;
       if (!armed_ && !req.internal) {
-        ESP_LOGW(TAG, "key 0x%02X ignored: not armed", req.keycode);
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X ignored: not armed", req.keycode);
         continue;
       }
-      ESP_LOGI(TAG, "injecting key 0x%02X: %d poll-slot(s)", req.keycode, repeat_);
+      capture_diag_(plan::CAP_DIAG_INFO, "injecting key 0x%02X: %d poll-slot(s)", req.keycode,
+                    repeat_);
       pending_key_ = req.keycode;
       pending_frames_ = repeat_;
       hold_ = HOLD_BASE;
@@ -493,13 +505,14 @@ void PlanBridge::task_main() {
 
     if (term_.tx_fired_) {
       term_.tx_fired_ = false;
-      ESP_LOGD(TAG,
-               "TX(9bit) %02X' %02X %02X %02X %02X %02X %02X  %02X' %02X %02X %02X (stale polls: "
-               "%u, attempt %d)",
-               term_.tx_frame_[0], term_.tx_frame_[1], term_.tx_frame_[2], term_.tx_frame_[3],
-               term_.tx_frame_[4], term_.tx_frame_[5], term_.tx_frame_[6], term_.tx_frame_[7],
-               term_.tx_frame_[8], term_.tx_frame_[9], term_.tx_frame_[10],
-               static_cast<unsigned>(term_.isr_stale_), retries_);
+      capture_diag_(
+          plan::CAP_DIAG_DEBUG,
+          "TX(9bit) %02X' %02X %02X %02X %02X %02X %02X  %02X' %02X %02X %02X (stale polls: "
+          "%u, attempt %d)",
+          term_.tx_frame_[0], term_.tx_frame_[1], term_.tx_frame_[2], term_.tx_frame_[3],
+          term_.tx_frame_[4], term_.tx_frame_[5], term_.tx_frame_[6], term_.tx_frame_[7],
+          term_.tx_frame_[8], term_.tx_frame_[9], term_.tx_frame_[10],
+          static_cast<unsigned>(term_.isr_stale_), retries_);
       capture_event_(EV_TX_FIRED, pending_key_, static_cast<uint8_t>(retries_));
       // Verdict phase. Two rejection signatures exist: an immediate re-poll
       // (tx_rejected_, within ms) and the silent discard, which surfaces only
@@ -527,9 +540,9 @@ void PlanBridge::task_main() {
         term_.tx_rejected_ = false;
         term_.link_reset_ = false;
         if (++retries_ <= MAX_RETRIES) {
-          ESP_LOGW(TAG, "key 0x%02X: %s, retry %d/%d", pending_key_,
-                   was_reset ? "link reset (silent discard)" : "collision with pGD reply",
-                   retries_, MAX_RETRIES);
+          capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: %s, retry %d/%d", pending_key_,
+                        was_reset ? "link reset (silent discard)" : "collision with pGD reply",
+                        retries_, MAX_RETRIES);
           // A link reset is followed by a full-screen redraw that keeps the
           // pGD busy (slow poll replies) -- the retry lands in that window.
           vTaskDelay(pdMS_TO_TICKS(was_reset ? 400 : RETRY_SPACING_MS));
@@ -537,13 +550,15 @@ void PlanBridge::task_main() {
           arm_isr_tx_();
           continue;
         }
-        ESP_LOGW(TAG, "key 0x%02X: gave up after %d attempts", pending_key_, MAX_RETRIES);
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: gave up after %d attempts",
+                      pending_key_, MAX_RETRIES);
         pending_frames_ = 0;
         continue;
       }
       hold_ = (hold_ + 2 > 0xC8) ? 0xC8 : static_cast<uint8_t>(hold_ + 2);
       if (--pending_frames_ == 0) {
-        ESP_LOGI(TAG, "key 0x%02X: accepted (attempt %d)", pending_key_, retries_);
+        capture_diag_(plan::CAP_DIAG_INFO, "key 0x%02X: accepted (attempt %d)", pending_key_,
+                      retries_);
         capture_event_(EV_KEY_ACCEPTED, pending_key_, static_cast<uint8_t>(retries_));
       } else {
         // Space repeats at roughly the pGD's cadence, then re-arm.
@@ -554,61 +569,52 @@ void PlanBridge::task_main() {
       // No poll slot could be filled (the pGD beat us into every one).
       // That costs nothing on the bus, so retry on the same budget.
       if (++retries_ <= MAX_RETRIES) {
-        ESP_LOGW(TAG, "key 0x%02X: no clean slot, retry %d/%d", pending_key_, retries_,
-                 MAX_RETRIES);
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: no clean slot, retry %d/%d",
+                      pending_key_, retries_, MAX_RETRIES);
         inject_deadline_ms_ = now + 2000;
         continue;
       }
       term_.tx_pending_ = false;
-      ESP_LOGW(TAG, "key 0x%02X: aborted (%d slot(s) unfilled, stale polls: %u)", pending_key_,
-               pending_frames_, static_cast<unsigned>(term_.isr_stale_));
+      capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: aborted (%d slot(s) unfilled, stale polls: %u)",
+                    pending_key_, pending_frames_, static_cast<unsigned>(term_.isr_stale_));
       pending_frames_ = 0;
     }
   }
 }
 
-// --- lossless capture + event stream (TCP 6054) -----------------------------
+// --- the PLANCAP server (TCP 6054) -------------------------------------------
 //
-// After the 8-byte "PLANCAP2" banner every record starts with a u8 type;
-// all integers little-endian.
+// Wire protocol: docs/capture-protocol.md. plan::PlanCapSession handles the
+// transport (banner, mode selection, Noise NNpsk0 handshake or the keyless
+// plaintext hello, frame + record encryption); this section owns the
+// sockets, the record CONTENT (bus bytes, events, diagnostics, acks) and
+// the backlog policy.
 //
-// type 0 (CAP_REC_PAIRS) -- raw bus bytes:
-//   u32 seq   monotonic per record (client detects loss as a gap)
-//   u32 ts_ms device millis() at drain time
-//   u32 drops cumulative ISR->stream-buffer dropped BYTES (in-band, so even
-//             the one remaining loss mode is visible in the data itself)
-//   u16 n     pair count
-//   n * (byte, bit9) pairs -- the exact stream the hex log lines carry
+// A fresh client gets the screen-snapshot replay plus one EV_STATE as soon
+// as its session is established, so it starts with truth instead of waiting
+// for the 10 s periodic state event.
 //
-// type 1 (CAP_REC_EVENT) -- typed device event, the machine interface that
-// replaced regex-parsing of log prose (fixed 7 bytes after the type):
-//   u32 ts_ms device millis()
-//   u8 kind   EV_* above
-//   u8 a, b   kind-specific (STATE: a = armed|enroll<<1, b = tx_mode;
-//             TX_FIRED/KEY_ACCEPTED: a = keycode, b = attempt)
-//
-// A fresh client gets the screen-snapshot replay plus one EV_STATE right
-// after the banner, so it starts with truth instead of waiting for the
-// 10 s periodic state event.
-//
-// Single client (planscope); a second connect replaces the first. All
-// sockets are non-blocking: the bus task must never wait on the network.
+// Single client; a second connect replaces the first. All sockets are
+// non-blocking: the bus task must never wait on the network. Everything
+// here runs on the bus task ONLY (cap_backlog_/cap_rec_ are single-owner);
+// other tasks signal via state_dirty_/hold_pending_.
 
 static void cap_set_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
-
-static void cap_put_u32(std::vector<uint8_t> &v, uint32_t x) {
-  v.push_back(static_cast<uint8_t>(x));
-  v.push_back(static_cast<uint8_t>(x >> 8));
-  v.push_back(static_cast<uint8_t>(x >> 16));
-  v.push_back(static_cast<uint8_t>(x >> 24));
-}
 
 void PlanBridge::capture_close_client_() {
   if (cap_client_fd_ >= 0) {
     close(cap_client_fd_);
     cap_client_fd_ = -1;
   }
+  cap_sess_.reset();
   cap_backlog_.clear();
+}
+
+// Enqueue the record built in cap_rec_ as one framed -- and on a keyed
+// session encrypted -- unit of wire bytes. No-op until the session is
+// established (the session refuses records mid-handshake).
+bool PlanBridge::capture_out_() {
+  return cap_sess_.send_record(cap_rec_.data(), cap_rec_.size(), cap_backlog_);
 }
 
 void PlanBridge::capture_poll_() {
@@ -643,19 +649,45 @@ void PlanBridge::capture_poll_() {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     cap_client_fd_ = fd;
-    cap_backlog_.assign(CAP_BANNER, CAP_BANNER + sizeof(CAP_BANNER));
-    capture_send_snapshot_();
-    capture_event_state_();  // state truth up front, not 10 s later
-    ESP_LOGI(TAG, "capture stream client connected (screen snapshot replayed)");
+    cap_backlog_.clear();
+    // Banner out; the client's first frame selects the mode (Noise
+    // handshake on a keyed server, plaintext hello on a keyless one).
+    cap_sess_.begin(cap_has_psk_ ? cap_psk_.data() : nullptr, cap_backlog_);
+    ESP_LOGI(TAG, "capture client connected (%s)",
+             cap_has_psk_ ? "awaiting noise handshake" : "awaiting plaintext hello");
   }
-  // Detect a closed client: it never sends, so any read readiness is EOF/RST.
-  if (cap_client_fd_ >= 0) {
-    uint8_t junk[16];
-    ssize_t r = recv(cap_client_fd_, junk, sizeof(junk), MSG_DONTWAIT);
+  if (cap_client_fd_ < 0)
+    return;
+  // Drain client bytes: handshake frames and command records. EOF or a
+  // read error means the client is gone.
+  uint8_t buf[128];
+  for (;;) {
+    ssize_t r = recv(cap_client_fd_, buf, sizeof(buf), MSG_DONTWAIT);
+    if (r > 0) {
+      bool was_established = cap_sess_.established();
+      if (!cap_sess_.feed(buf, static_cast<size_t>(r), cap_backlog_)) {
+        // Fatal protocol/handshake error (spec section 7): best-effort
+        // flush of the queued explicit handshake-error frame, then close.
+        capture_flush_();
+        ESP_LOGW(TAG, "capture client rejected (handshake/protocol error), dropping");
+        capture_close_client_();
+        return;
+      }
+      if (!was_established && cap_sess_.established()) {
+        capture_send_snapshot_();
+        capture_event_state_();  // state truth up front, not 10 s later
+        ESP_LOGI(TAG, "capture client established (%s, screen snapshot replayed)",
+                 cap_sess_.keyed() ? "encrypted" : "plaintext");
+      }
+      if (r == static_cast<ssize_t>(sizeof(buf)))
+        continue;  // more may be buffered
+      return;
+    }
     if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
-      ESP_LOGI(TAG, "capture stream client gone (log lines resume)");
+      ESP_LOGI(TAG, "capture client gone");
       capture_close_client_();
     }
+    return;
   }
 }
 
@@ -666,28 +698,25 @@ void PlanBridge::capture_poll_() {
 // pGD-ack trailer appended, which the client's frame parser anchors on.
 void PlanBridge::capture_send_snapshot_() {
   snap_.visit([this](const uint8_t *bytes, size_t len, uint32_t at_ms, bool trailer) {
-    cap_backlog_.push_back(CAP_REC_PAIRS);
-    cap_put_u32(cap_backlog_, 0);
-    cap_put_u32(cap_backlog_, at_ms);
-    cap_put_u32(cap_backlog_, cap_drop_bytes_);
     size_t np = len + (trailer ? sizeof(plan::SNAP_TRAILER) : 0);
-    cap_backlog_.push_back(static_cast<uint8_t>(np));
-    cap_backlog_.push_back(static_cast<uint8_t>(np >> 8));
+    cap_rec_.clear();
+    plan::cap_rec_pairs_begin(cap_rec_, 0, at_ms, cap_drop_bytes_, static_cast<uint16_t>(np));
     for (size_t i = 0; i < len; i++) {
-      cap_backlog_.push_back(bytes[i]);
-      cap_backlog_.push_back(i == 0 ? 1 : 0);  // bit9 on the address byte
+      cap_rec_.push_back(bytes[i]);
+      cap_rec_.push_back(i == 0 ? 1 : 0);  // bit9 on the address byte
     }
     if (trailer) {
       for (size_t i = 0; i < sizeof(plan::SNAP_TRAILER); i++) {
-        cap_backlog_.push_back(plan::SNAP_TRAILER[i]);
-        cap_backlog_.push_back(i == 0 ? 1 : 0);
+        cap_rec_.push_back(plan::SNAP_TRAILER[i]);
+        cap_rec_.push_back(i == 0 ? 1 : 0);
       }
     }
+    capture_out_();
   });
 }
 
 void PlanBridge::capture_send_(const uint8_t *pairs, size_t n) {
-  if (cap_client_fd_ < 0)
+  if (!cap_sess_.established())
     return;
   size_t npairs = n / 2;
   if (npairs == 0)
@@ -698,13 +727,11 @@ void PlanBridge::capture_send_(const uint8_t *pairs, size_t n) {
     // sees an honest gap instead of silently thinned data.
     return;
   }
-  cap_backlog_.push_back(CAP_REC_PAIRS);
-  cap_put_u32(cap_backlog_, cap_seq_);
-  cap_put_u32(cap_backlog_, millis());
-  cap_put_u32(cap_backlog_, cap_drop_reported_ = cap_drop_bytes_);
-  cap_backlog_.push_back(static_cast<uint8_t>(npairs));
-  cap_backlog_.push_back(static_cast<uint8_t>(npairs >> 8));
-  cap_backlog_.insert(cap_backlog_.end(), pairs, pairs + 2 * npairs);
+  cap_rec_.clear();
+  plan::cap_rec_pairs_begin(cap_rec_, cap_seq_, millis(), cap_drop_reported_ = cap_drop_bytes_,
+                            static_cast<uint16_t>(npairs));
+  cap_rec_.insert(cap_rec_.end(), pairs, pairs + 2 * npairs);
+  capture_out_();
 }
 
 // One typed event record into the backlog. Bus task only. A backlog past
@@ -713,19 +740,96 @@ void PlanBridge::capture_send_(const uint8_t *pairs, size_t n) {
 // grow the heap without bound, so cut the client instead -- a reconnect
 // replays the snapshot plus one EV_STATE, so no state truth is lost.
 void PlanBridge::capture_event_(uint8_t kind, uint8_t a, uint8_t b) {
-  if (cap_client_fd_ < 0)
+  if (!cap_sess_.established())
     return;
   if (cap_backlog_.size() > CAP_BACKLOG_MAX) {
-    ESP_LOGW(TAG, "capture stream client stalled (backlog %u), dropping client",
+    ESP_LOGW(TAG, "capture client stalled (backlog %u), dropping client",
              static_cast<unsigned>(cap_backlog_.size()));
     capture_close_client_();
     return;
   }
-  cap_backlog_.push_back(CAP_REC_EVENT);
-  cap_put_u32(cap_backlog_, millis());
-  cap_backlog_.push_back(kind);
-  cap_backlog_.push_back(a);
-  cap_backlog_.push_back(b);
+  cap_rec_.clear();
+  plan::cap_rec_event(cap_rec_, millis(), kind, a, b);
+  capture_out_();
+}
+
+// Plan-related prose: to the logger for humans, and as a PLANCAP diagnostic
+// record for the capture client (severity plan::CAP_DIAG_*). Diagnostics are
+// advisory prose -- anything a machine must react to is an event or an ack,
+// never parsed out of this text. Bus task only (same single-owner backlog
+// rule as capture_event_, same stalled-client policy).
+void PlanBridge::capture_diag_(uint8_t severity, const char *fmt, ...) {
+  char buf[192];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n < 0)
+    return;
+  size_t len = (n < static_cast<int>(sizeof(buf))) ? static_cast<size_t>(n) : sizeof(buf) - 1;
+  switch (severity) {
+    case plan::CAP_DIAG_ERROR:
+      ESP_LOGE(TAG, "%s", buf);
+      break;
+    case plan::CAP_DIAG_WARNING:
+      ESP_LOGW(TAG, "%s", buf);
+      break;
+    case plan::CAP_DIAG_DEBUG:
+      ESP_LOGD(TAG, "%s", buf);
+      break;
+    default:
+      ESP_LOGI(TAG, "%s", buf);
+      break;
+  }
+  if (!cap_sess_.established())
+    return;
+  if (cap_backlog_.size() > CAP_BACKLOG_MAX) {
+    ESP_LOGW(TAG, "capture client stalled (backlog %u), dropping client",
+             static_cast<unsigned>(cap_backlog_.size()));
+    capture_close_client_();
+    return;
+  }
+  cap_rec_.clear();
+  plan::cap_rec_diag(cap_rec_, millis(), severity, buf, len);
+  capture_out_();
+}
+
+// A client command record: dispatch into the same internals the ESPHome
+// services call, then ack exactly once (spec section 5.5). Runs inside
+// cap_sess_.feed(), i.e. on the bus task.
+void PlanBridge::capture_command_(uint8_t id, uint8_t op, uint8_t arg) {
+  uint8_t status = plan::CAP_ACK_OK;
+  switch (op) {
+    case plan::CAP_CMD_ARM:
+      set_armed(arg != 0);
+      break;
+    case plan::CAP_CMD_ENROLL:
+      set_enroll(arg != 0);
+      break;
+    case plan::CAP_CMD_INJECT_KEY: {
+      // The same gates press_key() + task_main enforce, but with the
+      // verdict known synchronously so the ack can be honest.
+      if (!armed_) {
+        status = plan::CAP_ACK_REJECTED;
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X rejected: not armed", arg);
+        break;
+      }
+      KeyReq r{arg, false};
+      if (!ready_ || queue_ == nullptr || xQueueSend(queue_, &r, 0) != pdTRUE) {
+        status = plan::CAP_ACK_REJECTED;
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X rejected: queue full", arg);
+      }
+      break;
+    }
+    default:
+      status = plan::CAP_ACK_UNKNOWN_OP;
+      break;
+  }
+  // capture_diag_ above may have dropped a stalled client; send_record is
+  // then a no-op on the reset session.
+  cap_rec_.clear();
+  plan::cap_rec_ack(cap_rec_, millis(), id, status);
+  capture_out_();
 }
 
 bool PlanBridge::capture_flush_() {
@@ -748,11 +852,24 @@ void PlanBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "  UART%d  RX=%d  TX=%d  DE/RE(GPIO)=%d", static_cast<int>(uart_num_),
                 rx_pin_, tx_pin_, de_pin_);
   ESP_LOGCONFIG(TAG, "  %u baud, 8+bit9 (as 8E1), gap %ums", baud_rate_, gap_ms_);
-  ESP_LOGCONFIG(TAG, "  repeat %dx @ %ums, armed=%s, capture stream tcp/%u", repeat_,
-                repeat_interval_ms_, armed_ ? "yes" : "no", CAP_PORT);
+  ESP_LOGCONFIG(TAG, "  repeat %dx @ %ums, armed=%s, PLANCAP tcp/%u (%s)", repeat_,
+                repeat_interval_ms_, armed_ ? "yes" : "no", CAP_PORT,
+                cap_has_psk_ ? "encrypted" : "plaintext: no key configured");
   ESP_LOGCONFIG(TAG, "  enroll=%s (terminal 0x%02X), tx_mode=%d", term_.enroll_ ? "yes" : "no",
                 plan::ENROLL_ADDR, static_cast<int>(term_.tx_mode_));
 }
+
+#if defined(PLAN_CAP_NOISE) && !defined(USE_API_NOISE)
+// noise-c's RNG hook. The encrypted ESPHome API component provides it when
+// present; a keyed bridge on a device without an encrypted API supplies its
+// own (same implementation, HWRNG-backed).
+extern "C" void noise_rand_bytes(void *output, size_t len) {
+  if (!random_bytes(reinterpret_cast<uint8_t *>(output), len)) {
+    ESP_LOGE(TAG, "Acquiring random bytes failed; rebooting");
+    arch_restart();
+  }
+}
+#endif
 
 }  // namespace plan_bridge
 }  // namespace esphome
