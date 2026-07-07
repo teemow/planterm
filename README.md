@@ -125,6 +125,17 @@ diagnostics, and the command channel (arm, enroll, key injection).
   registry (`MacroDef` tables) is device application data.
 - `src/hex_format.h` — hex line formatting for capture logs, in the format
   planscope's offline tools parse.
+- `esphome/components/plan_bridge/` — the **ESP32 bridge firmware**: an
+  ESPHome external component that puts the library on a live bus — 9-bit
+  UART RX interrupt with in-ISR response-slot transmit, the capture-stream
+  server host tools attach to, and Home-Assistant-facing services. See its
+  [README](esphome/components/plan_bridge/README.md); consume it with
+
+```yaml
+external_components:
+  - source: github://teemow/planterm@main
+    components: [plan_bridge]
+```
 
 ## Install
 
