@@ -34,6 +34,38 @@ transport.
   designated TX bytes. How you achieve that (parity tricks, bit-banging) is
   platform-specific and out of scope for the core.
 
+## Reference hardware
+
+The library is transport-agnostic, but everything in it was developed and
+proven on one concrete rig: an **ESP32** with a **MAX3485** RS-485
+transceiver (the 3.3 V sibling of the MAX485 — ESP32 GPIOs are not
+5 V-tolerant). The reference board is a lolin_c3_mini (ESP32-C3), but any
+ESP32 works: the GPIO matrix routes UARTs to arbitrary pins, and the ESP32
+generates the 62500 baud rate exactly (80 MHz / 1280).
+
+The pin labels below are those of the common MAX3485 breakout module (bare
+chip names in parentheses):
+
+```
+pLAN bus            MAX3485 module     ESP32
+------------------  -----------------  ------------------------------
+RX+/TX+             A                  --
+RX-/TX-             B                  --
+GND                 GND                GND  (common ground, required)
+                    VCC                3V3
+                    RXD (RO)           UART RX  (reference: GPIO20)
+                    TXD (DI)           UART TX  (reference: GPIO21)
+                    EN  (DE+RE tied)   any GPIO (reference: GPIO7)
+```
+
+- 120 Ω termination only if the ESP32 sits at a physical end of the bus.
+- Galvanic isolation (an isolated RS-485 module) is recommended when tapping
+  mains-powered HVAC equipment.
+- For passive capture, drive EN low permanently — the rig then cannot
+  disturb the bus. For terminal emulation the EN pin is raised around each
+  transmit; the 9-bit requirement is met with the UART parity trick described
+  in the transport notes of [docs/protocol.md](docs/protocol.md#1-physical-layer).
+
 ## Protocol documentation
 
 [docs/protocol.md](docs/protocol.md) is a standalone reference for the pLAN
@@ -98,12 +130,13 @@ everything, or include the individual headers you need.
 ## Getting started: capture the bus
 
 [examples/BusCapture](examples/BusCapture/BusCapture.ino) is the place to
-start: a passive, transmit-never sketch that taps the RS-485 bus through a
-MAX3485, splits the byte stream into pLAN frames with the boundary oracle
-and prints them as hex — the "is my tap point right?" tool. The sketch
-header documents the wiring and the 8N2-receive caveat (passive capture
-needs no 9-bit handling; full terminal emulation does — see the transport
-notes in [docs/protocol.md](docs/protocol.md#1-physical-layer)).
+start: a passive, transmit-never sketch that taps the RS-485 bus on the
+[reference hardware](#reference-hardware) above, splits the byte stream into
+pLAN frames with the boundary oracle and prints them as hex — the "is my tap
+point right?" tool. The sketch header documents the wiring and the
+8N2-receive caveat (passive capture needs no 9-bit handling; full terminal
+emulation does — see the transport notes in
+[docs/protocol.md](docs/protocol.md#1-physical-layer)).
 
 ## Tests
 
