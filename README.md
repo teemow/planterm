@@ -75,6 +75,13 @@ reports, the display session, the captured attach sequence, multi-terminal
 behavior, and measured timings. For an otherwise undocumented protocol, the
 doc is as much the product as the code.
 
+[docs/capture-protocol.md](docs/capture-protocol.md) specifies **PLANCAP**,
+the authenticated capture-and-control protocol between a pLAN bridge device
+(a planterm-based firmware on the bus) and host tools such as
+[planscope](https://github.com/teemow/planscope): Noise-encrypted transport,
+lossless bus capture with 9th-bit fidelity, typed device events and
+diagnostics, and the command channel (arm, enroll, key injection).
+
 ## Contents
 
 - `src/plan_frame.h` — the frame grammar: byte-sum boundary oracle
