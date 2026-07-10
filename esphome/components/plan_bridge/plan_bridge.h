@@ -139,6 +139,10 @@ class PlanBridge : public Component {
   float get_setup_priority() const override { return setup_priority::HARDWARE; }
 
  protected:
+  // Defined in plan_bridge_isr.cpp, a translation unit deliberately holding
+  // ONLY the timing-critical path, so edits to the capture/session code can
+  // never shift the ISR's codegen (see the header comment there). Do not
+  // move it back into plan_bridge.cpp.
   static void uart_isr(void *arg);
   static void task_trampoline(void *arg);
   void task_main();
