@@ -198,10 +198,6 @@ class PlanBridge : public Component {
   // task.
   int cap_listen_fd_{-1};
   int cap_client_fd_{-1};
-  plan::PlanCapSession cap_sess_;
-  std::vector<uint8_t> cap_rec_;  // scratch: one plaintext record being built
-  std::array<uint8_t, 32> cap_psk_{};
-  bool cap_has_psk_{false};
   uint32_t cap_seq_{0};
   volatile uint32_t cap_drop_bytes_{0};  // bytes the ISR could not stream (buffer full)
   uint32_t cap_drop_reported_{0};        // cap_drop_bytes_ already declared in-band
@@ -257,6 +253,18 @@ class PlanBridge : public Component {
   // pre-fires the log line, which the host treats as "link live" either way.
   volatile uint32_t join_polls_base_{0};
   volatile bool join_logged_{true};
+
+  // LAYOUT RULE (live-bisected 2026-07-11): new PlanBridge members go HERE,
+  // at the END of the class -- never above. Inserting members above term_
+  // (shifting the offsets of cap_seq_..join_logged_) deterministically
+  // breaks pLAN enrollment even with byte-identical code (bisect-pad: 80 B
+  // of dead padding above cap_seq_ broke it; bisect-endpad: the same 80 B
+  // here was fine). Mechanism still unidentified -- treat the offsets of
+  // everything above this line as frozen, like the ISR's shape.
+  plan::PlanCapSession cap_sess_;
+  std::vector<uint8_t> cap_rec_;  // scratch: one plaintext record being built
+  std::array<uint8_t, 32> cap_psk_{};
+  bool cap_has_psk_{false};
 };
 
 }  // namespace plan_bridge
