@@ -11,10 +11,12 @@
 // uart_isr disassembly and IRAM address unchanged. The "frozen shape" rule
 // becomes a structural guarantee instead of a comment.
 //
-// (Honest caveat from the same disassembly work: W2 vs W3 uart_isr differed
-// only in PlanBridge member offsets, so codegen drift alone does NOT
-// explain the W3 regression. The split still removes the whole class of
-// "unrelated growth shifted the ISR" suspects from every future incident.)
+// (Resolved 2026-07-11 by live bisection: the W3 regression was triggered
+// by the member-offset shift itself -- 80 bytes of dead padding above
+// cap_seq_ reproduced it, the same padding at the end of the class did not,
+// and moving W3's members to the end fixed it. See the LAYOUT RULE comment
+// in plan_bridge.h. This split still removes "unrelated growth shifted the
+// ISR's codegen" from every future incident's suspect list.)
 //
 // The function bodies below are copied VERBATIM from pre-split
 // plan_bridge.cpp; any edit to them needs live A/B validation on the bus
