@@ -318,19 +318,25 @@ class PlanTerminal {
           // evening, live A/B tested): the established/probe map first, the
           // CLAIMS field second (address 32 = bit7 of byte 0 down to address
           // 1 = bit0 of byte 3 in each half; the pGD claims 80 00 00 00).
-          // Assert our bit in BOTH halves. Measured on the real controller:
-          // map-half only -> BIOS establishes + polls us but the app never
-          // sees us (never ident-queried/sessioned); claims-half only -> the
-          // claim accumulates in the broadcast (claims C0 00 00 00) but we
-          // are never established/polled. The pGD's replies are consistent
-          // with both-halves (its map bit is always already present, so
-          // verbatim-echo vs. echo+bit is indistinguishable in captures).
-          // While DRAINING, the task sets claim_mask_ = 0 and this same line
-          // RENOUNCES instead (bit cleared in both halves), so the controller
-          // removes us cleanly. Branch-free; see claim_mask_.
+          // Halves are SENDER-CONDITIONAL (live 2026-07-16 evening):
+          // - Controller-sent token (rc_from_ == 0x01): assert our bit in
+          //   BOTH halves -- the 07-02 A/B ground truth (map-half only ->
+          //   polled but never sessioned; claims-half only -> accumulates
+          //   but never polled) and the accepted 00:58:55 join.
+          // - Member-forwarded token: presence VERBATIM, claim CLAIMS-half
+          //   only -- the pGD's own observed cold join (19:39:02: presence
+          //   80 echoed untouched, claims 40->C0). Asserting ourselves into
+          //   the presence half of a member-forwarded token made the
+          //   controller link-fault on every reply (2 s silence -> FF-walk,
+          //   43 resets in 3 min) even with the reply returned to 0x01: the
+          //   forwarding chain owns presence accounting, a joiner may only
+          //   add its claim.
+          // While DRAINING, the task sets claim_mask_ = 0 and these lines
+          // RENOUNCE instead. Branch shape kept minimal; see claim_mask_.
           uint8_t m = claim_mask_;
-          act.frame[3 + OWN_BYTE_I] =
-              static_cast<uint8_t>((act.frame[3 + OWN_BYTE_I] & ~OWN_BIT) | m);
+          if (rc_from_ == 0x01)
+            act.frame[3 + OWN_BYTE_I] =
+                static_cast<uint8_t>((act.frame[3 + OWN_BYTE_I] & ~OWN_BIT) | m);
           act.frame[3 + 4 + OWN_BYTE_I] =
               static_cast<uint8_t>((act.frame[3 + 4 + OWN_BYTE_I] & ~OWN_BIT) | m);
           uint8_t rs = 0;
