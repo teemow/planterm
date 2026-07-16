@@ -114,8 +114,14 @@ async def to_code(config):
     # pick both up with one `external_components` ref. Components building on
     # top of this one (stream listener / press_key_internal consumers) must
     # NOT add their own planterm pin -- one shared library instance per build.
+    # Registered as a local ESP-IDF component (<repo>/planterm/CMakeLists.txt
+    # exposes ../src as a header-only include dir) rather than a PlatformIO
+    # library: the `symlink://` lib URI was PlatformIO-only and ESPHome
+    # 2026.7's native esp-idf toolchain git-clones library repository URIs.
+    from esphome.components.esp32 import add_idf_component
+
     repo_root = Path(__file__).resolve().parents[3]
-    cg.add_library("planterm", None, f"symlink://{repo_root}")
+    add_idf_component(name="planterm", path=str(repo_root / "planterm"))
     cg.add(var.set_rx_pin(config[CONF_RX_PIN]))
     cg.add(var.set_tx_pin(config[CONF_TX_PIN]))
     cg.add(var.set_de_pin(config[CONF_DE_PIN]))
