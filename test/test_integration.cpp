@@ -360,9 +360,10 @@ int main() {
     assert(!bus.term.drain_replied_);
 
     // Roll-call while draining: echo with our bit CLEARED in both halves
-    // (ctl's map/claims carry our bit from the enrollment above).
+    // (ctl's map/claims carry our bit from the enrollment above). The mock
+    // map has the pGD@32 live, so the token forwards to 0x20.
     Bytes renounce = bus.feed(ctl.emit_rollcall(ENROLL_ADDR));
-    assert(renounce.size() == 12 && renounce[0].v == 0x01 && renounce[0].bit9 == 1 &&
+    assert(renounce.size() == 12 && renounce[0].v == 0x20 && renounce[0].bit9 == 1 &&
            renounce[1].v == 0x02 && renounce[2].v == ENROLL_ADDR);
     assert((renounce[3 + OWN_BYTE_I].v & OWN_BIT) == 0);  // map half renounced
     assert((renounce[7 + OWN_BYTE_I].v & OWN_BIT) == 0);  // claims half renounced
@@ -394,10 +395,7 @@ int main() {
     assert(r[3].v == 0x20 && r[7].v == (0x20 | OWN_BIT));
     assert(sum8v(r, 0, 12) == 0xFF);
 
-    // FF-walk recovery token from a member: presence assumes-all-alive
-    // (bit7 set for the EMPTY address 32). The reply must STILL return to
-    // 0x01 -- blind-forwarding to 32 looped the live bus (84 consecutive
-    // FF-walks, 2026-07-16 20:15).
+    // Presence-bit7 token in a STEADY walk (pGD@32 live): forward to 0x20.
     Bytes token32{{0x1F, 1}, {0x02, 0}, {0x1E, 0}, {0xE0, 0}, {0x00, 0}, {0x00, 0},
                   {0x01, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0xFF, 0}};
     uint8_t s = 0;
@@ -405,9 +403,21 @@ int main() {
       s += token32[i].v;
     token32[11].v = static_cast<uint8_t>(0xFF - s);
     r = bus.feed(token32);
-    assert(r.size() == 12 && r[0].v == 0x01 && r[0].bit9 == 1);
+    assert(r.size() == 12 && r[0].v == 0x20 && r[0].bit9 == 1);
     assert(r[3].v == 0xE0 && r[7].v == OWN_BIT);  // presence verbatim, claims-only
     assert(sum8v(r, 0, 12) == 0xFF);
+
+    // Same token within 3 s of an FF-walk marker: recovery lockout, the
+    // token returns to the controller (presence is assume-all-alive there;
+    // blind-forwarding into an empty 32 looped the live bus 2026-07-16).
+    Bytes ffmark{{0x02, 1}, {0x02, 0}, {0x01, 0}, {0xFF, 0}, {0xFF, 0}, {0xFF, 0},
+                 {0xFF, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0xFB, 0}};
+    bus.feed(ffmark);
+    r = bus.feed(token32);
+    assert(r.size() == 12 && r[0].v == 0x01);
+    bus.now += 4'000'000;  // lockout expired: steady walks forward again
+    r = bus.feed(token32);
+    assert(r.size() == 12 && r[0].v == 0x20);
 
     // Corrupted token (checksum no longer matches the sender byte): silence.
     Bytes bad = token;
