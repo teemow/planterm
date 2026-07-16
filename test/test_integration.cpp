@@ -415,6 +415,36 @@ int main() {
     assert(bus.feed(bad).empty());
   }
 
+  // --- Poll token ring (ground truth 2026-07-16 21:21:17): with two
+  // --- established terminals the polls chain member-to-member too ---
+  {
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+
+    // The exact captured frame: pGD@1E hands us the poll token (ck C1).
+    Bytes poll1e{{0x1F, 1}, {0x01, 0}, {0x1E, 0}, {0xC1, 0}};
+    Bytes r = bus.feed(poll1e);
+    assert(r.size() == 4 && r[0].v == 0x01 && r[0].bit9 == 1 && r[1].v == 0x01 &&
+           r[2].v == ENROLL_ADDR);  // link reply, returned to the controller
+
+    // A pending key report rides a member-forwarded poll token like any poll.
+    bus.term.tx_frame_[0] = 0x01;
+    bus.term.tx_frame_[1] = 0x1E;
+    bus.term.tx_frame_[2] = 0x07;
+    bus.term.tx_frame_[3] = 0x20;
+    bus.term.tx_frame_[4] = 0x10;
+    bus.term.tx_frame_[5] = 0x01;
+    bus.term.tx_frame_[6] = 0xA8;
+    bus.term.tx_pending_ = true;
+    r = bus.feed(poll1e);
+    assert(r.size() == REPLY9_LEN && r[3].v == ENROLL_ADDR);  // report, addr rewritten
+
+    // Garbled sender byte (checksum mismatch): ignored.
+    Bytes badp{{0x1F, 1}, {0x01, 0}, {0x1D, 0}, {0xC1, 0}};
+    assert(bus.feed(badp).empty());
+  }
+
   std::printf("ok\n");
   return 0;
 }
