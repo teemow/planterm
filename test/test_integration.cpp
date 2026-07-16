@@ -360,9 +360,10 @@ int main() {
     assert(!bus.term.drain_replied_);
 
     // Roll-call while draining: echo with our bit CLEARED in both halves
-    // (ctl's map/claims carry our bit from the enrollment above).
+    // (ctl's map/claims carry our bit from the enrollment above). The mock
+    // map has the pGD@32 bit, so the ring-forward goes to 0x20.
     Bytes renounce = bus.feed(ctl.emit_rollcall(ENROLL_ADDR));
-    assert(renounce.size() == 12 && renounce[0].v == 0x01 && renounce[0].bit9 == 1 &&
+    assert(renounce.size() == 12 && renounce[0].v == 0x20 && renounce[0].bit9 == 1 &&
            renounce[1].v == 0x02 && renounce[2].v == ENROLL_ADDR);
     assert((renounce[3 + OWN_BYTE_I].v & OWN_BIT) == 0);  // map half renounced
     assert((renounce[7 + OWN_BYTE_I].v & OWN_BIT) == 0);  // claims half renounced
@@ -373,6 +374,41 @@ int main() {
     bus.term.enroll_ = false;
     bus.term.drain_ = false;
     assert(bus.feed(ctl.emit_poll(ENROLL_ADDR)).empty());
+  }
+
+  // --- Roll-call token ring (ground truth 2026-07-16): tokens arrive from
+  // --- ANY ring member, and the reply forwards to the next live member ---
+  {
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+
+    // Token forwarded by a pGD at 0x1E (exact live frame, ck 0x7F): presence
+    // has only {30}+ctrl, so we are the last live member -> return to 0x01,
+    // with our bit (0x40) claimed in both halves.
+    Bytes token{{0x1F, 1}, {0x02, 0}, {0x1E, 0}, {0x20, 0}, {0x00, 0}, {0x00, 0},
+                {0x01, 0}, {0x20, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x7F, 0}};
+    Bytes r = bus.feed(token);
+    assert(r.size() == 12 && r[0].v == 0x01 && r[0].bit9 == 1 && r[1].v == 0x02 &&
+           r[2].v == ENROLL_ADDR);
+    assert(r[3].v == (0x20 | OWN_BIT) && r[7].v == (0x20 | OWN_BIT));
+    assert(sum8v(r, 0, 12) == 0xFF);
+
+    // Same token but with the pGD@32 present in the map: forward to 0x20.
+    Bytes token32{{0x1F, 1}, {0x02, 0}, {0x1E, 0}, {0xA0, 0}, {0x00, 0}, {0x00, 0},
+                  {0x01, 0}, {0x20, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0xFF, 0}};
+    uint8_t s = 0;
+    for (size_t i = 0; i < 11; i++)
+      s += token32[i].v;
+    token32[11].v = static_cast<uint8_t>(0xFF - s);
+    r = bus.feed(token32);
+    assert(r.size() == 12 && r[0].v == 0x20 && r[0].bit9 == 1);
+    assert(sum8v(r, 0, 12) == 0xFF);
+
+    // Corrupted token (checksum no longer matches the sender byte): silence.
+    Bytes bad = token;
+    bad[2].v = 0x1D;  // sender byte garbled, ck now wrong
+    assert(bus.feed(bad).empty());
   }
 
   std::printf("ok\n");

@@ -268,31 +268,42 @@ class PlanTerminal {
         reset_win_[6] == 0x00 && reset_win_[7] == 0x00)
       link_reset_ = true;
 
-    // Terminal enrollment (uncontested-slot path): the controller roll-calls
-    // every pLAN address with AA' 02 01 <8-byte payload> CK. Ground truth:
-    // the pGD answers its roll-call by ECHOING the payload back as
-    // 01' 02 <own-addr> <payload> CK (sum-to-0xFF) with its own membership
-    // bit claimed. Do the same for ENROLL_ADDR via a small frame-capture
-    // state machine (payload varies, so it is captured, not matched).
+    // Terminal enrollment: the roll-call is a TOKEN RING, not a
+    // controller-polls-everyone sweep (ground truth 2026-07-16, live ring
+    // with a pGD at 0x1E: 1E' 02 01 -> 1F' 02 1E -> 20' 02 1E -> 01' 02 1E).
+    // Frame format <to>' 02 <from> <8-byte payload> CK: each live member
+    // receives the token, claims its bit, and FORWARDS it to the next ring
+    // member -- back to the controller (0x01) only when nothing live sits
+    // above it. The old matcher required <from> == 0x01 and so dropped every
+    // token forwarded by another terminal (83 ignored invitations in one
+    // 15-min capture = the un-rejoinable "zombie" state); the old reply
+    // always terminated the ring at us, cutting members above us (the pGD
+    // at 0x20) out of every walk. Accept any sender, forward per the map.
     if (enroll_) {
       if (bit9 != 0) {
         rc_state_ = (b == ENROLL_ADDR) ? 1 : 0;
       } else if (rc_state_ == 1) {
         rc_state_ = (b == 0x02) ? 2 : 0;
       } else if (rc_state_ == 2) {
-        rc_state_ = (b == 0x01) ? 3 : 0;
+        rc_from_ = b;  // token sender: the controller or any ring member
+        rc_state_ = 3;
       } else if (rc_state_ >= 3 && rc_state_ <= 10) {
         rc_payload_[rc_state_ - 3] = b;
         rc_state_ = rc_state_ + 1;
       } else if (rc_state_ == 11) {
         rc_state_ = 0;
-        uint8_t s = static_cast<uint8_t>(ENROLL_ADDR + 0x02 + 0x01);
+        uint8_t s = static_cast<uint8_t>(ENROLL_ADDR + 0x02 + rc_from_);
         for (int i = 0; i < 8; i++)
           s += rc_payload_[i];
         if (static_cast<uint8_t>(s + b) == 0xFF) {
           act.kind = TxAction::ROLLCALL_REPLY;
           act.len = 12;
-          act.frame[0] = 0x01;
+          // Forward the token to the next live member above us -- from 0x1F
+          // the only address above is 0x20 (presence half, bit7 of byte 0);
+          // otherwise we are the last live member and return it to the
+          // controller. (Timeout-and-skip for a mapped-but-dead next hop
+          // stays the controller's job, as observed live.)
+          act.frame[0] = (rc_payload_[0] & 0x80) ? 0x20 : 0x01;
           act.frame[1] = 0x02;
           act.frame[2] = ENROLL_ADDR;
           for (int i = 0; i < 8; i++)
@@ -557,6 +568,7 @@ class PlanTerminal {
   // Layout rule (W3 regression, 2026-07-10): new members go at the CLASS END
   // only -- inserting above shifts member offsets and has broken the ISR.
   volatile uint8_t tel_type_{0};       // frame type byte of the current run
+  volatile uint8_t rc_from_{0};        // roll-call token sender (ring member or 0x01)
 };
 
 }  // namespace plan
