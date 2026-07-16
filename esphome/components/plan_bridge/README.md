@@ -116,9 +116,10 @@ plan_bridge:
 | `enroll` | `false` | join the pLAN as a second terminal at boot (address 31 must be in the controller's terminal list) |
 | `capture_key` | `api.encryption.key` | the PLANCAP PSK (base64, 32 bytes). Defaults to the device's API key so one key secures both channels; set it explicitly only on devices without an encrypted API. **No key at all = unauthenticated plaintext mode: trusted networks only.** |
 
-The component pulls the planterm library from its own checkout — pinning
+The component pulls the planterm library from its own checkout (registered
+as a local ESP-IDF component via the repo's `planterm/` dir) — pinning
 the `external_components` ref pins library and component together. Do not
-add a second planterm `lib_deps` entry.
+add a second planterm `lib_deps` entry or IDF component.
 
 Public methods for YAML lambdas: `press_key(uint8_t keycode)`,
 `set_armed(bool)`, `set_enroll(bool)`, `set_tx_mode(int)`,

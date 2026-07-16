@@ -64,16 +64,18 @@ jobs:
   # Full firmware build of the plan_bridge component against real ESPHome +
   # esp-idf: catches include/namespace/codegen breakage without hardware. The
   # example YAML uses a local source, so the checkout under test is what
-  # compiles (the component symlinks this repo in as the planterm library).
+  # compiles (the component registers this repo as the planterm IDF
+  # component). 2026.7's native esp-idf toolchain caches the IDF install
+  # under ~/.cache/esphome, not ~/.platformio.
   esphome-compile:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/cache@v6
         with:
-          path: ~/.platformio
-          key: pio-esphome-${{ runner.os }}-2026.6.4
+          path: ~/.cache/esphome
+          key: esphome-idf-${{ runner.os }}-2026.7.0
       - name: Install ESPHome
-        run: pip install "esphome==2026.6.4"
+        run: pip install "esphome==2026.7.0"
       - name: Compile plan_bridge example
         run: esphome compile esphome/plan-bridge-example.yaml
