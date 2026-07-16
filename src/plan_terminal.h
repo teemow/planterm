@@ -166,9 +166,10 @@ class PlanTerminal {
   volatile uint32_t gap_n_{0};
 
   // --- Phase 0 telemetry (ISR increments, task reads + resets per report) ---
-  // A frame is one bit9-delimited run of bytes. Every multi-byte pLAN frame
-  // byte-sums to 0xFF (single-byte acks carry no checksum), so a failing sum
-  // means corruption on the wire -- the objective "garble" detector. Frames
+  // A frame is one bit9-delimited run of bytes. Classic multi-byte pLAN
+  // frames byte-sum to 0xFF (single-byte acks carry no checksum; CRC-16
+  // types 0x64/65/66 are exempt -- see on_byte), so a failing sum means
+  // corruption on the wire -- the objective "garble" detector. Frames
   // are classified by their leading address byte: controller (0x01), the pGD
   // (0x20), our enrolled address, everything else.
   volatile uint32_t tel_frames_ctrl_{0};
@@ -208,15 +209,21 @@ class PlanTerminal {
 
     // Phase 0 telemetry -- frame accounting. Frames are delimited by the
     // bit9/address byte: a new one closes the previous run, which is then
-    // classified by destination address and checksum-validated (every
-    // multi-byte pLAN run byte-sums to 0xFF; the keypad reply too, since the
+    // classified by destination address and checksum-validated (classic
+    // multi-byte pLAN runs byte-sum to 0xFF; the keypad reply too, since the
     // leading 01' plus the sum-to-0xFE report gives 0xFF; the single-byte 01'
-    // ack carries no checksum). A failing sum = corruption on the wire, the
-    // objective "garble" detector. Our own TX never reaches this path (RE is
-    // muted while we drive DE), so these counters see only the others.
+    // ack carries no checksum). Graphic/session types 0x64/65/66 carry a
+    // CRC-16 trailer instead and never sum to 0xFF -- they are skipped here,
+    // NOT counted as garble (proven 2026-07-16: 331 phantom "failures" on a
+    // host-verified 0-failure bus, all repaint traffic; the ack gate below
+    // has always known both grammars). A failing sum on the remaining types =
+    // corruption on the wire, the objective "garble" detector. Our own TX
+    // never reaches this path (RE is muted while we drive DE), so these
+    // counters see only the others.
     if (bit9 != 0) {
       if (tel_active_) {
-        if (tel_len_ > 1 && tel_sum_ != 0xFF)
+        if (tel_len_ > 1 && tel_sum_ != 0xFF && tel_type_ != GRAPHIC_TYPE &&
+            tel_type_ != SESSION_INIT_TYPE && tel_type_ != SESSION_CTL_TYPE)
           tel_cksum_fail_ = tel_cksum_fail_ + 1;
         if (tel_addr_ == 0x01)
           tel_frames_ctrl_ = tel_frames_ctrl_ + 1;
@@ -232,6 +239,8 @@ class PlanTerminal {
       tel_sum_ = b;
       tel_len_ = 1;
     } else if (tel_active_) {
+      if (tel_len_ == 1)
+        tel_type_ = b;  // frame type = first byte after the address byte
       tel_sum_ = static_cast<uint8_t>(tel_sum_ + b);
       tel_len_ = tel_len_ + 1;
     }
@@ -545,6 +554,9 @@ class PlanTerminal {
   volatile uint8_t tel_sum_{0};        // running byte sum (mod 256)
   volatile uint32_t tel_len_{0};       // bytes in the run so far
   volatile int64_t tel_last_tx_us_{0}; // pending post-TX-gap measurement
+  // Layout rule (W3 regression, 2026-07-10): new members go at the CLASS END
+  // only -- inserting above shifts member offsets and has broken the ISR.
+  volatile uint8_t tel_type_{0};       // frame type byte of the current run
 };
 
 }  // namespace plan

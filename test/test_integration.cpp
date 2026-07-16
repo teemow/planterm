@@ -296,6 +296,27 @@ int main() {
     bus.feed(ctl.emit_ack());
     assert(bus.term.tel_frames_other_ == 1);
     assert(bus.term.tel_cksum_fail_ == 1);
+
+    // CRC-16-trailer types (0x64/65/66) never byte-sum to 0xFF and must NOT
+    // be flagged (live 2026-07-16: 331 phantom failures on a host-verified
+    // 0-failure bus, all repaint traffic). Real session-init frame from that
+    // capture: 20' 65 0F 01 01 00*8 9C 46.
+    Bytes init{{0x20, 1}, {0x65, 0}, {0x0F, 0}, {0x01, 0}, {0x01, 0},
+               {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0},
+               {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x9C, 0}, {0x46, 0}};
+    assert(sum8v(init, 0, init.size()) != 0xFF);  // would false-positive
+    bus.feed(init);
+    bus.feed(ctl.emit_ack());  // closes the run
+    assert(bus.term.tel_frames_pgd_ == 12);
+    assert(bus.term.tel_cksum_fail_ == 1);  // unchanged: not garble
+
+    // A garbled CLASSIC frame after a CRC-type run still counts (tel_type_
+    // is re-captured per run, no stale exemption).
+    Bytes bad2 = ctl.emit_poll(0x20);
+    bad2[2].v ^= 0x04;
+    bus.feed(bad2);
+    bus.feed(ctl.emit_ack());
+    assert(bus.term.tel_cksum_fail_ == 2);
   }
   {
     // Post-TX gap: armed after our own transmission, measured on the next RX
