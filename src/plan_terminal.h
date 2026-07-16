@@ -429,11 +429,21 @@ class PlanTerminal {
       }
     }
 
-    // Poll service for the enrolled address: ENROLL_ADDR' 01 01 CK. Answer
-    // with the pending keypad report (body from tx_frame_, terminal-address
-    // byte rewritten to ours) plus our link reply, or the bare link reply.
-    if (enroll_ && isr_win_[1] == ENROLL_ADDR && isr_win_[2] == 0x01 && isr_win_[3] == 0x01 &&
-        isr_win_[4] == static_cast<uint8_t>(0xFF - 0x02 - ENROLL_ADDR)) {
+    // Poll service for the enrolled address: ENROLL_ADDR' 01 <from> CK.
+    // The poll is a member-chained token exactly like the roll-call (ground
+    // truth 2026-07-16 21:21:17: with two established terminals the pGD@1E
+    // handed us the poll token as 1F' 01 1E C1, THREE retries, and our
+    // from-01-only matcher ignored every one -- the controller then declared
+    // us dead and consolidated the focus; that WAS dual-terminal operation
+    // being offered). Accept the token from the controller (0x01) or any
+    // ring member (address-range-checked, checksum computed with the real
+    // sender). Answer with the pending keypad report plus our link reply,
+    // or the bare link reply -- returned to the controller, per the
+    // no-blind-forward rule (nothing live sits above us; see ROLLCALL_REPLY).
+    if (enroll_ && isr_win_[1] == ENROLL_ADDR && isr_win_[2] == 0x01 && isr_win_[3] >= 0x01 &&
+        isr_win_[3] <= 0x20 &&
+        isr_win_[4] ==
+            static_cast<uint8_t>(0xFF - ENROLL_ADDR - 0x01 - isr_win_[3])) {
       const uint8_t lr[4] = {0x01, 0x01, ENROLL_ADDR, static_cast<uint8_t>(0xFD - ENROLL_ADDR)};
       if (tx_pending_ && tx_mode_ == 2) {
         act.kind = TxAction::ENROLL_KEY_REPLY;
