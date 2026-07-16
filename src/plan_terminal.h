@@ -265,8 +265,10 @@ class PlanTerminal {
     reset_win_[7] = b;
     if (reset_win_[0] == 0x02 && reset_win_[1] == 0x01 && reset_win_[2] == 0xFF &&
         reset_win_[3] == 0xFF && reset_win_[4] == 0xFF && reset_win_[5] == 0xFF &&
-        reset_win_[6] == 0x00 && reset_win_[7] == 0x00)
+        reset_win_[6] == 0x00 && reset_win_[7] == 0x00) {
       link_reset_ = true;
+      t_link_reset_us_ = now_us;  // ring-forwarding lockout window
+    }
 
     // Terminal enrollment: the roll-call is a TOKEN RING, not a
     // controller-polls-everyone sweep (ground truth 2026-07-16, live ring
@@ -298,18 +300,18 @@ class PlanTerminal {
         if (static_cast<uint8_t>(s + b) == 0xFF) {
           act.kind = TxAction::ROLLCALL_REPLY;
           act.len = 12;
-          // Return the token to the controller (0x01) -- NEVER forward to
-          // 0x20 blind. Forwarding per the presence map looped the bus live
-          // (2026-07-16 20:15-26): FF-walk recovery initializes presence to
-          // assume-all-alive, so bit7 pointed at the EMPTY address 32; a
-          // ring member that forwards must also timeout-and-skip a silent
-          // next hop (the pGD does), which this byte-driven ISR cannot do
-          // without a timer. The token dying at 32 link-faulted the
-          // controller into 84 consecutive FF-walks with polls stopped for
-          // everyone. Returning to 0x01 is correct while nothing live sits
-          // between us and 0x20; if a terminal ever moves back above us,
-          // implement the timeout on the bus task before forwarding.
-          act.frame[0] = 0x01;
+          // Forward the token to a LIVE member above us (a pGD at 0x20),
+          // else return it to the controller (0x01). Two guards against the
+          // 2026-07-16 blind-forward loop (84 consecutive FF-walks after
+          // forwarding into the EMPTY 32 -- FF-walk recovery presents
+          // presence as assume-all-alive): (a) presence bit7 must be set in
+          // the received payload, and (b) never within 3 s of an FF-walk
+          // marker -- during recovery the controller drives every address
+          // itself and presence is aspirational, in steady walks presence
+          // reflects reality (drop detection is ~3 missed polls / <100 ms).
+          bool recovery = t_link_reset_us_ != 0 &&
+                          static_cast<uint64_t>(now_us - t_link_reset_us_) < 3'000'000ull;
+          act.frame[0] = ((rc_payload_[0] & 0x80) && !recovery) ? 0x20 : 0x01;
           act.frame[1] = 0x02;
           act.frame[2] = ENROLL_ADDR;
           for (int i = 0; i < 8; i++)
@@ -601,6 +603,7 @@ class PlanTerminal {
   // only -- inserting above shifts member offsets and has broken the ISR.
   volatile uint8_t tel_type_{0};       // frame type byte of the current run
   volatile uint8_t rc_from_{0};        // roll-call token sender (ring member or 0x01)
+  volatile int64_t t_link_reset_us_{0}; // last FF-walk marker (forwarding lockout)
 };
 
 }  // namespace plan
