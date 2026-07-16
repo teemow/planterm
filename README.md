@@ -128,7 +128,11 @@ diagnostics, and the command channel (arm, enroll, key injection).
 - `esphome/components/plan_bridge/` — the **ESP32 bridge firmware**: an
   ESPHome external component that puts the library on a live bus — 9-bit
   UART RX interrupt with in-ISR response-slot transmit, the capture-stream
-  server host tools attach to, and Home-Assistant-facing services. See its
+  server host tools attach to, and Home-Assistant-facing services.
+  **Strictly optional**: the library itself has zero ESPHome dependency, the
+  PlatformIO registry package excludes this directory entirely, and Arduino
+  builds never compile it — it is used only when you consume the repo as an
+  ESPHome external component. See its
   [README](esphome/components/plan_bridge/README.md); consume it with
 
 ```yaml
