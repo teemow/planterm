@@ -225,6 +225,11 @@ class PlanTerminal {
         if (tel_len_ > 1 && tel_sum_ != 0xFF && tel_type_ != GRAPHIC_TYPE &&
             tel_type_ != SESSION_INIT_TYPE && tel_type_ != SESSION_CTL_TYPE)
           tel_cksum_fail_ = tel_cksum_fail_ + 1;
+        // pGD-liveness probe: any terminal->controller frame from 0x20
+        // (link reply 01 01 20 DD, ring reply 01 02 20 .., ack 01 03 20 DB)
+        // proves the pGD@32 transmitted -- gates the ring-token forward.
+        if (tel_addr_ == 0x01 && tel_len_ >= 4 && tel_b3_ == 0x20)
+          t_pgd_alive_us_ = now_us;
         if (tel_addr_ == 0x01)
           tel_frames_ctrl_ = tel_frames_ctrl_ + 1;
         else if (tel_addr_ == 0x20)
@@ -241,6 +246,8 @@ class PlanTerminal {
     } else if (tel_active_) {
       if (tel_len_ == 1)
         tel_type_ = b;  // frame type = first byte after the address byte
+      else if (tel_len_ == 2)
+        tel_b3_ = b;  // third byte: the sender in terminal->controller frames
       tel_sum_ = static_cast<uint8_t>(tel_sum_ + b);
       tel_len_ = tel_len_ + 1;
     }
@@ -301,17 +308,18 @@ class PlanTerminal {
           act.kind = TxAction::ROLLCALL_REPLY;
           act.len = 12;
           // Forward the token to a LIVE member above us (a pGD at 0x20),
-          // else return it to the controller (0x01). Two guards against the
-          // 2026-07-16 blind-forward loop (84 consecutive FF-walks after
-          // forwarding into the EMPTY 32 -- FF-walk recovery presents
-          // presence as assume-all-alive): (a) presence bit7 must be set in
-          // the received payload, and (b) never within 3 s of an FF-walk
-          // marker -- during recovery the controller drives every address
-          // itself and presence is aspirational, in steady walks presence
-          // reflects reality (drop detection is ~3 missed polls / <100 ms).
-          bool recovery = t_link_reset_us_ != 0 &&
-                          static_cast<uint64_t>(now_us - t_link_reset_us_) < 3'000'000ull;
-          act.frame[0] = ((rc_payload_[0] & 0x80) && !recovery) ? 0x20 : 0x01;
+          // else return it to the controller (0x01). The gate is TRUE
+          // liveness -- the pGD transmitted within 15 s (t_pgd_alive_us_,
+          // fed by the telemetry probe) -- not walk type: an FF-walk-based
+          // lockout dead-locked the live-32 topology (2026-07-17 00:48:
+          // recovery walks NEED the forward when 32 is real; returning to
+          // 0x01 reports a cut ring, the controller faults and FF-walks
+          // forever, the lockout never expires). An EMPTY 32 never
+          // transmits, so the blind-forward loop of 2026-07-16 stays
+          // impossible.
+          bool pgd_live = t_pgd_alive_us_ != 0 &&
+                          static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull;
+          act.frame[0] = ((rc_payload_[0] & 0x80) && pgd_live) ? 0x20 : 0x01;
           act.frame[1] = 0x02;
           act.frame[2] = ENROLL_ADDR;
           for (int i = 0; i < 8; i++)
@@ -603,7 +611,9 @@ class PlanTerminal {
   // only -- inserting above shifts member offsets and has broken the ISR.
   volatile uint8_t tel_type_{0};       // frame type byte of the current run
   volatile uint8_t rc_from_{0};        // roll-call token sender (ring member or 0x01)
-  volatile int64_t t_link_reset_us_{0}; // last FF-walk marker (forwarding lockout)
+  volatile int64_t t_link_reset_us_{0}; // last FF-walk marker (telemetry)
+  volatile uint8_t tel_b3_{0};          // third byte of the current run
+  volatile int64_t t_pgd_alive_us_{0};  // last transmission seen FROM the pGD@32
 };
 
 }  // namespace plan
