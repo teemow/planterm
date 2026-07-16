@@ -298,12 +298,18 @@ class PlanTerminal {
         if (static_cast<uint8_t>(s + b) == 0xFF) {
           act.kind = TxAction::ROLLCALL_REPLY;
           act.len = 12;
-          // Forward the token to the next live member above us -- from 0x1F
-          // the only address above is 0x20 (presence half, bit7 of byte 0);
-          // otherwise we are the last live member and return it to the
-          // controller. (Timeout-and-skip for a mapped-but-dead next hop
-          // stays the controller's job, as observed live.)
-          act.frame[0] = (rc_payload_[0] & 0x80) ? 0x20 : 0x01;
+          // Return the token to the controller (0x01) -- NEVER forward to
+          // 0x20 blind. Forwarding per the presence map looped the bus live
+          // (2026-07-16 20:15-26): FF-walk recovery initializes presence to
+          // assume-all-alive, so bit7 pointed at the EMPTY address 32; a
+          // ring member that forwards must also timeout-and-skip a silent
+          // next hop (the pGD does), which this byte-driven ISR cannot do
+          // without a timer. The token dying at 32 link-faulted the
+          // controller into 84 consecutive FF-walks with polls stopped for
+          // everyone. Returning to 0x01 is correct while nothing live sits
+          // between us and 0x20; if a terminal ever moves back above us,
+          // implement the timeout on the bus task before forwarding.
+          act.frame[0] = 0x01;
           act.frame[1] = 0x02;
           act.frame[2] = ENROLL_ADDR;
           for (int i = 0; i < 8; i++)

@@ -187,11 +187,10 @@ class MockController {
   // the bit in both halves -- e.g. enrolling 31 turned the map 80 00 00 01
   // into C0 00 00 01 on the live bus.
   bool handle_rollcall_reply(uint8_t addr, const Bytes &r) {
-    // Ring semantics: the terminal forwards the token to the next live
-    // member above it (from 0x1F that is 0x20 iff the presence map has
-    // bit7), else returns it to the controller (0x01).
-    uint8_t dest = (addr < 0x20 && (map_[0] & 0x80)) ? 0x20 : 0x01;
-    if (r.size() != 12 || r[0].v != dest || r[0].bit9 != 1 || r[1].v != 0x02 || r[2].v != addr)
+    // Ring semantics: the terminal always returns the token to the
+    // controller (0x01) -- blind-forwarding to a possibly-dead 0x20 looped
+    // the live bus (see ROLLCALL_REPLY in plan_terminal.h).
+    if (r.size() != 12 || r[0].v != 0x01 || r[0].bit9 != 1 || r[1].v != 0x02 || r[2].v != addr)
       return false;
     if (sum8v(r, 0, 12) != 0xFF)  // sum-to-0xFF over the whole 12-byte frame
       return false;
