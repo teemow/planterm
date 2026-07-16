@@ -383,14 +383,15 @@ int main() {
     bus.term.enroll_ = true;
 
     // Token forwarded by a pGD at 0x1E (exact live frame, ck 0x7F): presence
-    // has only {30}+ctrl, so we are the last live member -> return to 0x01,
-    // with our bit (0x40) claimed in both halves.
+    // echoed VERBATIM (the forwarding chain owns it -- the pGD's own cold
+    // join behaves this way), our bit claimed in the CLAIMS half only,
+    // token returned to 0x01.
     Bytes token{{0x1F, 1}, {0x02, 0}, {0x1E, 0}, {0x20, 0}, {0x00, 0}, {0x00, 0},
                 {0x01, 0}, {0x20, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x7F, 0}};
     Bytes r = bus.feed(token);
     assert(r.size() == 12 && r[0].v == 0x01 && r[0].bit9 == 1 && r[1].v == 0x02 &&
            r[2].v == ENROLL_ADDR);
-    assert(r[3].v == (0x20 | OWN_BIT) && r[7].v == (0x20 | OWN_BIT));
+    assert(r[3].v == 0x20 && r[7].v == (0x20 | OWN_BIT));
     assert(sum8v(r, 0, 12) == 0xFF);
 
     // FF-walk recovery token from a member: presence assumes-all-alive
@@ -405,6 +406,7 @@ int main() {
     token32[11].v = static_cast<uint8_t>(0xFF - s);
     r = bus.feed(token32);
     assert(r.size() == 12 && r[0].v == 0x01 && r[0].bit9 == 1);
+    assert(r[3].v == 0xE0 && r[7].v == OWN_BIT);  // presence verbatim, claims-only
     assert(sum8v(r, 0, 12) == 0xFF);
 
     // Corrupted token (checksum no longer matches the sender byte): silence.
