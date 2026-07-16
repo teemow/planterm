@@ -413,10 +413,14 @@ int main() {
     token32[11].v = static_cast<uint8_t>(0xFF - s);
     r = bus.feed(token32);
     assert(r.size() == 12 && r[0].v == 0x01);
+    // Honest skip: the dead 32's presence bit is CLEARED in the return
+    // (E0 -> 60), exactly like the pGD's own skip frames -- returning it
+    // intact link-faulted the controller (01:04 loop).
+    assert(r[3].v == 0x60 && r[7].v == OWN_BIT);
+    assert(sum8v(r, 0, 12) == 0xFF);
 
     // The pGD transmits (link reply from 0x20) -> liveness armed -> the
-    // same token now FORWARDS to 0x20, in any walk type (an FF-walk-based
-    // lockout dead-locked the live-32 topology, 2026-07-17 00:48).
+    // same token now FORWARDS to 0x20, presence verbatim.
     Bytes beacon{{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}};
     bus.feed(beacon);
     r = bus.feed(token32);
@@ -424,10 +428,10 @@ int main() {
     assert(r[3].v == 0xE0 && r[7].v == OWN_BIT);  // presence verbatim, claims-only
     assert(sum8v(r, 0, 12) == 0xFF);
 
-    // Liveness expires (15 s without a pGD transmission): back to 0x01.
+    // Liveness expires (15 s without a pGD transmission): return + clear.
     bus.now += 16'000'000;
     r = bus.feed(token32);
-    assert(r.size() == 12 && r[0].v == 0x01);
+    assert(r.size() == 12 && r[0].v == 0x01 && r[3].v == 0x60);
 
     // Corrupted token (checksum no longer matches the sender byte): silence.
     Bytes bad = token;
