@@ -148,15 +148,35 @@ class PlanBridge : public Component {
   void task_main();
   void arm_isr_tx_();    // encode pending_key_/hold_ into tx_frame_ and hand it to the ISR
   void log_state_();     // one "state: armed=... enroll=..." line (human prose)
-  // The PLANCAP server (TCP 6054, docs/capture-protocol.md): accept the
-  // single client, run the session (handshake, record framing/encryption
-  // via plan::PlanCapSession), flush non-blocking. All bus task only.
+  // One PLANCAP client slot: its socket, its own transport session
+  // (handshake state + cipher states) and its own send backlog, so a slow
+  // client stalls only itself. Bus task only, like everything capture_*.
+  struct CapClient {
+    int fd{-1};
+    uint32_t opened_ms{0};  // accept time: evict-oldest when all slots are taken
+    // Stalled (backlog past the cap): close is deferred to capture_poll_.
+    // Never close inline -- the fan-out can run inside this very client's
+    // sess.feed() (command -> diag), and resetting a session mid-feed is UB.
+    bool kick{false};
+    plan::PlanCapSession sess;
+    std::vector<uint8_t> backlog;  // encoded wire bytes awaiting send
+  };
+
+  // The PLANCAP server (TCP 6054, docs/capture-protocol.md): accept up to
+  // CAP_MAX_CLIENTS concurrent clients, run each one's session (handshake,
+  // record framing/encryption via plan::PlanCapSession), fan records out to
+  // every established client, flush non-blocking. All bus task only.
   void capture_poll_();                                  // listen/accept/read/handshake
-  void capture_send_(const uint8_t *pairs, size_t n);    // one bus-bytes record
-  bool capture_flush_();                                 // false = client died
-  void capture_close_client_();
-  void capture_send_snapshot_();  // replay the screen cache as seq-0 records
-  bool capture_out_();  // enqueue cap_rec_ as one framed (encrypted) record
+  void capture_send_(const uint8_t *pairs, size_t n);    // one bus-bytes record, fanned out
+  void capture_flush_();                                 // drain every client's backlog
+  bool capture_flush_client_(CapClient &c);              // false = client died
+  void capture_close_client_(CapClient &c);
+  void capture_send_snapshot_(CapClient &c);  // replay the screen cache as seq-0 records
+  bool capture_out_(CapClient &c);  // enqueue cap_rec_ as one framed (encrypted) record
+  bool capture_established_() const;  // any client past its handshake?
+  // cap_rec_ (one typed record) to every established client; a client past
+  // its backlog cap is kicked instead of dropping typed records (spec 6.3).
+  void capture_fanout_typed_();
   // Typed event records (PLANCAP type 0x01). Bus task only.
   void capture_event_(uint8_t kind, uint8_t a, uint8_t b);
   void capture_event_state_();  // EV_STATE from the current armed/enroll/tx_mode
@@ -166,8 +186,9 @@ class PlanBridge : public Component {
   // Severity = plan::CAP_DIAG_* (mapped to the matching log level).
   void capture_diag_(uint8_t severity, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
   // A client command record (type 0x03): dispatch into the same internals
-  // the ESPHome services call, then ack (type 0x04).
-  void capture_command_(uint8_t id, uint8_t op, uint8_t arg);
+  // the ESPHome services call, then ack (type 0x04) -- to slot `ci` only,
+  // the client that sent the command.
+  void capture_command_(size_t ci, uint8_t id, uint8_t op, uint8_t arg);
 
   int tx_pin_{-1};
   int rx_pin_{-1};
@@ -187,22 +208,24 @@ class PlanBridge : public Component {
   uart_dev_t *hw_{nullptr};
   bool ready_{false};
 
-  // The PLANCAP server: a single-client TCP server (port 6054), the ONLY
-  // transport for the raw (byte, bit9) stream -- the logger carries prose,
-  // never bytes. Every drained chunk goes out as one record with a sequence
-  // number and the in-band ISR-drop count: TCP is reliable, so the only
-  // loss modes left (stream-buffer overflow, a stalled client cut off) are
-  // declared in the data instead of vanishing. Wire bytes (framed, and on a
-  // keyed session Noise-encrypted, by cap_sess_) queue in cap_backlog_ and
-  // are flushed non-blocking so a stalled client can never stall the bus
-  // task.
+  // The PLANCAP server: a TCP server (port 6054), the ONLY transport for
+  // the raw (byte, bit9) stream -- the logger carries prose, never bytes.
+  // Every drained chunk goes out as one record with a sequence number and
+  // the in-band ISR-drop count: TCP is reliable, so the only loss modes
+  // left (stream-buffer overflow, a stalled client cut off) are declared in
+  // the data instead of vanishing. Per-client wire bytes (framed, and on a
+  // keyed session Noise-encrypted) queue in each slot's backlog and are
+  // flushed non-blocking so a stalled client can never stall the bus task.
+  // The client slots live at the END of the class (layout rule below);
+  // cap_client_fd_/cap_backlog_ are DEAD since multi-client but stay
+  // declared to freeze the offsets of the members below them.
   int cap_listen_fd_{-1};
-  int cap_client_fd_{-1};
-  uint32_t cap_seq_{0};
+  int cap_client_fd_{-1};  // dead (layout-frozen); the live fds are in cap_clients_
+  uint32_t cap_seq_{0};    // global: every client sees the same numbering
   volatile uint32_t cap_drop_bytes_{0};  // bytes the ISR could not stream (buffer full)
   uint32_t cap_drop_reported_{0};        // cap_drop_bytes_ already declared in-band
   uint32_t drop_last_window_{0};         // cap_drop_bytes_ at the last bus10s report
-  std::vector<uint8_t> cap_backlog_;     // encoded records awaiting send
+  std::vector<uint8_t> cap_backlog_;     // dead (layout-frozen); see cap_clients_
   // bit9-attribution instrumentation: the entry-status parity flag is only
   // exact while each ISR pass finds exactly one byte queued (see uart_isr).
   // These count loop iterations that found a >=2-byte backlog (attribution
@@ -261,7 +284,14 @@ class PlanBridge : public Component {
   // of dead padding above cap_seq_ broke it; bisect-endpad: the same 80 B
   // here was fine). Mechanism still unidentified -- treat the offsets of
   // everything above this line as frozen, like the ISR's shape.
-  plan::PlanCapSession cap_sess_;
+  // PLANCAP client slots (docs/capture-protocol.md section 1): a small
+  // fixed set so the ekobeescope TUI and a one-shot command can be
+  // connected at the same time. All slots taken -> the oldest client is
+  // evicted, so the port can never be locked up by a wedged client. RAM
+  // bound: each backlog grows only while ITS client stalls, capped at
+  // CAP_BACKLOG_MAX and returned on close (shrink_to_fit).
+  static constexpr size_t CAP_MAX_CLIENTS = 3;
+  std::array<CapClient, CAP_MAX_CLIENTS> cap_clients_;
   std::vector<uint8_t> cap_rec_;  // scratch: one plaintext record being built
   std::array<uint8_t, 32> cap_psk_{};
   bool cap_has_psk_{false};
