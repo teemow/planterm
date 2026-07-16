@@ -39,15 +39,21 @@ TCP. The server never initiates a connection.
 - A standalone (non-ESPHome) bridge may serve any port; 6054 is the
   convention.
 
-**Single client, newest wins.** The server serves exactly one client. A
-new TCP connection immediately replaces the current one: the old socket
-is closed without notice. A client whose *established* stream drops
-should assume it was taken over by another client (or the device
-rebooted) and must not silently retry-loop into a takeover fight —
+**Concurrent clients, bounded slots.** The server serves a small fixed
+number of clients at once (implementation-defined; the reference server
+has 3 slots — an interactive TUI plus a one-shot command, with one to
+spare). Every server→client record (§5) fans out to all established
+clients; each connection runs its own handshake (§3–4), gets its own
+snapshot replay (§6.1) and has its own backlog (§6.3), so one slow
+client never stalls the others. When all slots are taken, a new
+connection evicts the **oldest** client: that socket is closed without
+notice, so a wedged client can never lock up the port. A client whose
+*established* stream drops should assume it was evicted (or the device
+rebooted) and must not silently retry-loop into an eviction fight —
 surface it.
 
 The server must never block on the network: a slow client gets a bounded
-backlog (see §6), never a stalled bus task.
+per-client backlog (see §6), never a stalled bus task.
 
 ## 2. Banner
 
@@ -181,10 +187,13 @@ not frame boundaries**. Clients reassemble pLAN frames from the bit9
 address marks (see protocol.md §3) across record boundaries.
 
 `seq` starts at 1 when the server boots and increments by one for every
-live record — **including records skipped because the client stalled**
+live record — **including records skipped because a client stalled**
 (§6.3), so a gap in `seq` is an exact count of lost records, never
-silently thinned data. `seq` is not reset per connection; a `seq` at or
-below the last one seen (across a reconnect) means the device rebooted.
+silently thinned data. `seq` is shared by all clients: the same record
+carries the same `seq` to everyone, and a stalled client's skipped
+records are gaps in its own stream only. `seq` is not reset per
+connection; a `seq` at or below the last one seen (across a reconnect)
+means the device rebooted.
 
 `drops` is monotonic over the device's uptime. A change between
 consecutive records means bus bytes vanished device-side at that point
@@ -261,7 +270,19 @@ tool needs **no other channel** for its live features.
 
 `id` is an opaque echo token. Clients that want to correlate acks use
 distinct ids for in-flight commands (a wrapping counter is fine);
-uniqueness is not the server's concern.
+uniqueness is not the server's concern. Ids are scoped per connection:
+the ack for a command goes **only to the client that sent it**.
+
+**Concurrent commanders.** There is one control plane; commands from all
+clients dispatch on the device's single control task in socket-read
+order, with no locking or per-client ownership. `arm`/`enroll` are
+last-writer-wins — the resulting state event broadcasts to every client,
+so all of them learn the new truth, whoever set it. Key injections from
+all clients funnel into the device's one bounded press queue and execute
+serially in arrival order; a full queue is an honest `rejected` ack.
+Clients that drive the shared terminal session concurrently will
+interleave on the shared screen — coordinating *that* is the operator's
+problem, not the protocol's.
 
 ### 5.5 Type 0x04 — command ack
 
@@ -319,14 +340,15 @@ delivers it.
 
 ### 6.3 Backlog and the stalled client
 
-The server buffers unsent output in a bounded backlog (implementation-
-defined; the reference server uses 32 KiB) and writes it out
-non-blocking. When the backlog is full:
+The server buffers each client's unsent output in its own bounded
+backlog (implementation-defined; the reference server uses 32 KiB per
+client) and writes it out non-blocking. When a client's backlog is full:
 
-- new **bus-bytes records are skipped** but `seq` keeps counting, so the
-  client later sees an honest gap (§5.1);
+- new **bus-bytes records are skipped for that client** but `seq` keeps
+  counting, so it later sees an honest gap (§5.1) — the other clients
+  keep receiving everything;
 - if the backlog is still full when an **event, diagnostic or ack** must
-  go out, the server **disconnects the client** instead of dropping
+  go out, the server **disconnects that client** instead of dropping
   typed records or growing without bound. A reconnect replays the
   snapshot and state (§6.1), so no state truth is lost.
 

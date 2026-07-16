@@ -37,9 +37,11 @@ static const size_t STREAM_BUF_SIZE = 4096;
 // handshake / plaintext hello, record layouts); the transport session lives
 // in planterm's plan_cap.h, record kinds (EV_*) in plan_bridge.h.
 static const uint16_t CAP_PORT = 6054;
-// A client that stops reading gets cut instead of stalling the bus task; the
-// records queued-but-unsent consume seq numbers, so the loss is declared as
-// a seq gap downstream, exactly like a dropped log line.
+// Per-client backlog cap: a client that stops reading gets cut instead of
+// stalling the bus task (or the other clients); the records queued-but-
+// unsent consume seq numbers, so the loss is declared as a seq gap
+// downstream, exactly like a dropped log line. Worst-case capture RAM is
+// CAP_MAX_CLIENTS x this, and only while every client stalls at once.
 static const size_t CAP_BACKLOG_MAX = 32 * 1024;
 // Hold counter of a "fresh" press. Ground truth (capture 2026-07-02): a real
 // pGD tap is exactly ONE keypad report with NN=0x01; NN only ramps while a
@@ -103,12 +105,14 @@ void PlanBridge::setup() {
     this->mark_failed();
     return;
   }
-  // Client command records surface from cap_sess_.feed(), i.e. from
+  // Client command records surface from each slot's sess.feed(), i.e. from
   // capture_poll_() on the bus task -- the same context every other
-  // capture_* runs in.
-  cap_sess_.on_command = [this](uint8_t id, uint8_t op, uint8_t arg) {
-    this->capture_command_(id, op, arg);
-  };
+  // capture_* runs in. The slot index routes the ack back to the sender.
+  for (size_t i = 0; i < CAP_MAX_CLIENTS; i++) {
+    cap_clients_[i].sess.on_command = [this, i](uint8_t id, uint8_t op, uint8_t arg) {
+      this->capture_command_(i, id, op, arg);
+    };
+  }
 
   hw_ = UART_LL_GET_HW(uart_num_);
   uart_ll_rxfifo_rst(hw_);
@@ -457,27 +461,60 @@ void PlanBridge::task_main() {
 // as its session is established, so it starts with truth instead of waiting
 // for the 10 s periodic state event.
 //
-// Single client; a second connect replaces the first. All sockets are
-// non-blocking: the bus task must never wait on the network. Everything
-// here runs on the bus task ONLY (cap_backlog_/cap_rec_ are single-owner);
-// other tasks signal via state_dirty_/hold_pending_.
+// Up to CAP_MAX_CLIENTS concurrent clients (the ekobeescope TUI plus a
+// one-shot command, with a slot to spare), each with its own handshake,
+// snapshot replay and backlog; records fan out to all of them. All slots
+// taken -> the oldest client is evicted (the old single-client "newest
+// wins" recovery property, per slot). All sockets are non-blocking: the bus
+// task must never wait on the network. Everything here runs on the bus task
+// ONLY (the client slots and cap_rec_ are single-owner); other tasks signal
+// via state_dirty_/hold_pending_.
 
 static void cap_set_nonblock(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); }
 
-void PlanBridge::capture_close_client_() {
-  if (cap_client_fd_ >= 0) {
-    close(cap_client_fd_);
-    cap_client_fd_ = -1;
+void PlanBridge::capture_close_client_(CapClient &c) {
+  if (c.fd >= 0) {
+    close(c.fd);
+    c.fd = -1;
   }
-  cap_sess_.reset();
-  cap_backlog_.clear();
+  c.kick = false;
+  c.sess.reset();
+  c.backlog.clear();
+  c.backlog.shrink_to_fit();  // a stall grows this to ~32 KiB; give it back
+}
+
+bool PlanBridge::capture_established_() const {
+  for (const auto &c : cap_clients_)
+    if (c.fd >= 0 && !c.kick && c.sess.established())
+      return true;
+  return false;
 }
 
 // Enqueue the record built in cap_rec_ as one framed -- and on a keyed
-// session encrypted -- unit of wire bytes. No-op until the session is
-// established (the session refuses records mid-handshake).
-bool PlanBridge::capture_out_() {
-  return cap_sess_.send_record(cap_rec_.data(), cap_rec_.size(), cap_backlog_);
+// session encrypted -- unit of wire bytes for one client. No-op until that
+// session is established (the session refuses records mid-handshake).
+bool PlanBridge::capture_out_(CapClient &c) {
+  return c.sess.send_record(cap_rec_.data(), cap_rec_.size(), c.backlog);
+}
+
+// cap_rec_ (one typed record: event, diagnostic or ack) to every
+// established client. Typed records are never dropped (spec 6.3): a client
+// whose backlog is past the cap is kicked instead -- deferred to
+// capture_poll_, because this fan-out can run inside a client's own
+// sess.feed() (command -> diag) where an inline close would reset the
+// session mid-parse.
+void PlanBridge::capture_fanout_typed_() {
+  for (auto &c : cap_clients_) {
+    if (c.fd < 0 || c.kick || !c.sess.established())
+      continue;
+    if (c.backlog.size() > CAP_BACKLOG_MAX) {
+      ESP_LOGW(TAG, "capture client stalled (backlog %u), dropping client",
+               static_cast<unsigned>(c.backlog.size()));
+      c.kick = true;
+      continue;
+    }
+    capture_out_(c);
+  }
 }
 
 void PlanBridge::capture_poll_() {
@@ -497,7 +534,7 @@ void PlanBridge::capture_poll_() {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(CAP_PORT);
     if (bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0 ||
-        listen(fd, 1) < 0) {
+        listen(fd, 2) < 0) {
       close(fd);
       return;
     }
@@ -505,52 +542,79 @@ void PlanBridge::capture_poll_() {
     cap_listen_fd_ = fd;
     ESP_LOGI(TAG, "capture stream listening on tcp/%u", CAP_PORT);
   }
+  // Deferred closes first: kicks set by the typed fan-out, possibly from
+  // inside a client's own feed() last round.
+  for (auto &c : cap_clients_) {
+    if (c.kick)
+      capture_close_client_(c);
+  }
   int fd = accept(cap_listen_fd_, nullptr, nullptr);
   if (fd >= 0) {
-    capture_close_client_();  // single client: newest wins
+    // A free slot, or evict the oldest client when all are taken -- a
+    // wedged client can never lock up the port.
+    CapClient *slot = nullptr;
+    for (auto &c : cap_clients_) {
+      if (c.fd < 0) {
+        slot = &c;
+        break;
+      }
+    }
+    if (slot == nullptr) {
+      slot = &cap_clients_[0];
+      for (auto &c : cap_clients_) {
+        if (static_cast<int32_t>(c.opened_ms - slot->opened_ms) < 0)
+          slot = &c;
+      }
+      ESP_LOGW(TAG, "capture slots full, evicting the oldest client");
+      capture_close_client_(*slot);
+    }
     cap_set_nonblock(fd);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    cap_client_fd_ = fd;
-    cap_backlog_.clear();
+    slot->fd = fd;
+    slot->opened_ms = millis();
     // Banner out; the client's first frame selects the mode (Noise
     // handshake on a keyed server, plaintext hello on a keyless one).
-    cap_sess_.begin(cap_has_psk_ ? cap_psk_.data() : nullptr, cap_backlog_);
+    slot->sess.begin(cap_has_psk_ ? cap_psk_.data() : nullptr, slot->backlog);
     ESP_LOGI(TAG, "capture client connected (%s)",
              cap_has_psk_ ? "awaiting noise handshake" : "awaiting plaintext hello");
   }
-  if (cap_client_fd_ < 0)
-    return;
-  // Drain client bytes: handshake frames and command records. EOF or a
-  // read error means the client is gone.
+  // Drain each client's bytes: handshake frames and command records. EOF or
+  // a read error means that client is gone.
   uint8_t buf[128];
-  for (;;) {
-    ssize_t r = recv(cap_client_fd_, buf, sizeof(buf), MSG_DONTWAIT);
-    if (r > 0) {
-      bool was_established = cap_sess_.established();
-      if (!cap_sess_.feed(buf, static_cast<size_t>(r), cap_backlog_)) {
-        // Fatal protocol/handshake error (spec section 7): best-effort
-        // flush of the queued explicit handshake-error frame, then close.
-        capture_flush_();
-        ESP_LOGW(TAG, "capture client rejected (handshake/protocol error), dropping");
-        capture_close_client_();
-        return;
+  for (auto &c : cap_clients_) {
+    if (c.fd < 0)
+      continue;
+    for (;;) {
+      ssize_t r = recv(c.fd, buf, sizeof(buf), MSG_DONTWAIT);
+      if (r > 0) {
+        bool was_established = c.sess.established();
+        if (!c.sess.feed(buf, static_cast<size_t>(r), c.backlog)) {
+          // Fatal protocol/handshake error (spec section 7): best-effort
+          // flush of the queued explicit handshake-error frame, then close.
+          capture_flush_client_(c);
+          ESP_LOGW(TAG, "capture client rejected (handshake/protocol error), dropping");
+          capture_close_client_(c);
+          break;
+        }
+        if (!was_established && c.sess.established()) {
+          capture_send_snapshot_(c);
+          // State truth up front, not 10 s later. Broadcast: the other
+          // clients just see one extra periodic-style state event.
+          capture_event_state_();
+          ESP_LOGI(TAG, "capture client established (%s, screen snapshot replayed)",
+                   c.sess.keyed() ? "encrypted" : "plaintext");
+        }
+        if (r == static_cast<ssize_t>(sizeof(buf)))
+          continue;  // more may be buffered
+        break;
       }
-      if (!was_established && cap_sess_.established()) {
-        capture_send_snapshot_();
-        capture_event_state_();  // state truth up front, not 10 s later
-        ESP_LOGI(TAG, "capture client established (%s, screen snapshot replayed)",
-                 cap_sess_.keyed() ? "encrypted" : "plaintext");
+      if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
+        ESP_LOGI(TAG, "capture client gone");
+        capture_close_client_(c);
       }
-      if (r == static_cast<ssize_t>(sizeof(buf)))
-        continue;  // more may be buffered
-      return;
+      break;
     }
-    if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
-      ESP_LOGI(TAG, "capture client gone");
-      capture_close_client_();
-    }
-    return;
   }
 }
 
@@ -559,8 +623,8 @@ void PlanBridge::capture_poll_() {
 // seq starts at 1, so the client's gap accounting is untouched). ts_ms
 // carries when the frame was actually seen. 0x20 frames get the constant
 // pGD-ack trailer appended, which the client's frame parser anchors on.
-void PlanBridge::capture_send_snapshot_() {
-  snap_.visit([this](const uint8_t *bytes, size_t len, uint32_t at_ms, bool trailer) {
+void PlanBridge::capture_send_snapshot_(CapClient &c) {
+  snap_.visit([this, &c](const uint8_t *bytes, size_t len, uint32_t at_ms, bool trailer) {
     size_t np = len + (trailer ? sizeof(plan::SNAP_TRAILER) : 0);
     cap_rec_.clear();
     plan::cap_rec_pairs_begin(cap_rec_, 0, at_ms, cap_drop_bytes_, static_cast<uint16_t>(np));
@@ -574,52 +638,51 @@ void PlanBridge::capture_send_snapshot_() {
         cap_rec_.push_back(i == 0 ? 1 : 0);
       }
     }
-    capture_out_();
+    capture_out_(c);
   });
 }
 
 void PlanBridge::capture_send_(const uint8_t *pairs, size_t n) {
-  if (!cap_sess_.established())
+  if (!capture_established_())
     return;
   size_t npairs = n / 2;
   if (npairs == 0)
     return;
-  cap_seq_++;
-  if (cap_backlog_.size() > CAP_BACKLOG_MAX) {
-    // Client stalled: skip the record but keep counting seq, so the client
-    // sees an honest gap instead of silently thinned data.
-    return;
-  }
+  cap_seq_++;  // one number per record, shared by every client
   cap_rec_.clear();
   plan::cap_rec_pairs_begin(cap_rec_, cap_seq_, millis(), cap_drop_reported_ = cap_drop_bytes_,
                             static_cast<uint16_t>(npairs));
   cap_rec_.insert(cap_rec_.end(), pairs, pairs + 2 * npairs);
-  capture_out_();
+  for (auto &c : cap_clients_) {
+    if (c.fd < 0 || c.kick || !c.sess.established())
+      continue;
+    if (c.backlog.size() > CAP_BACKLOG_MAX) {
+      // This client stalled: skip its copy but seq counted the record, so
+      // it sees an honest gap instead of silently thinned data. The other
+      // clients keep receiving -- one slow reader stalls only itself.
+      continue;
+    }
+    capture_out_(c);
+  }
 }
 
-// One typed event record into the backlog. Bus task only. A backlog past
-// the cap means the client stalled long ago (pair records stopped at the
-// cap); with the device scraping 24/7 the per-keypress events would then
-// grow the heap without bound, so cut the client instead -- a reconnect
-// replays the snapshot plus one EV_STATE, so no state truth is lost.
+// One typed event record, fanned out. Bus task only. A backlog past the cap
+// means that client stalled long ago (pair records stopped at the cap);
+// with the device scraping 24/7 the per-keypress events would then grow the
+// heap without bound, so cut the client instead -- a reconnect replays the
+// snapshot plus one EV_STATE, so no state truth is lost.
 void PlanBridge::capture_event_(uint8_t kind, uint8_t a, uint8_t b) {
-  if (!cap_sess_.established())
+  if (!capture_established_())
     return;
-  if (cap_backlog_.size() > CAP_BACKLOG_MAX) {
-    ESP_LOGW(TAG, "capture client stalled (backlog %u), dropping client",
-             static_cast<unsigned>(cap_backlog_.size()));
-    capture_close_client_();
-    return;
-  }
   cap_rec_.clear();
   plan::cap_rec_event(cap_rec_, millis(), kind, a, b);
-  capture_out_();
+  capture_fanout_typed_();
 }
 
 // Plan-related prose: to the logger for humans, and as a PLANCAP diagnostic
-// record for the capture client (severity plan::CAP_DIAG_*). Diagnostics are
-// advisory prose -- anything a machine must react to is an event or an ack,
-// never parsed out of this text. Bus task only (same single-owner backlog
+// record for every capture client (severity plan::CAP_DIAG_*). Diagnostics
+// are advisory prose -- anything a machine must react to is an event or an
+// ack, never parsed out of this text. Bus task only (same single-owner
 // rule as capture_event_, same stalled-client policy).
 void PlanBridge::capture_diag_(uint8_t severity, const char *fmt, ...) {
   char buf[192];
@@ -644,23 +707,22 @@ void PlanBridge::capture_diag_(uint8_t severity, const char *fmt, ...) {
       ESP_LOGI(TAG, "%s", buf);
       break;
   }
-  if (!cap_sess_.established())
+  if (!capture_established_())
     return;
-  if (cap_backlog_.size() > CAP_BACKLOG_MAX) {
-    ESP_LOGW(TAG, "capture client stalled (backlog %u), dropping client",
-             static_cast<unsigned>(cap_backlog_.size()));
-    capture_close_client_();
-    return;
-  }
   cap_rec_.clear();
   plan::cap_rec_diag(cap_rec_, millis(), severity, buf, len);
-  capture_out_();
+  capture_fanout_typed_();
 }
 
 // A client command record: dispatch into the same internals the ESPHome
-// services call, then ack exactly once (spec section 5.5). Runs inside
-// cap_sess_.feed(), i.e. on the bus task.
-void PlanBridge::capture_command_(uint8_t id, uint8_t op, uint8_t arg) {
+// services call, then ack exactly once (spec section 5.5) -- to the issuing
+// client only. Runs inside that client's sess.feed(), i.e. on the bus task.
+// Commands from concurrent clients need no extra serialization: they all
+// arrive on the one bus task in socket-read order, arm/enroll are
+// last-writer-wins with the resulting EV_STATE broadcast to everyone, and
+// key injections funnel into the existing bounded FreeRTOS queue (a full
+// queue is an honest rejected ack).
+void PlanBridge::capture_command_(size_t ci, uint8_t id, uint8_t op, uint8_t arg) {
   uint8_t status = plan::CAP_ACK_OK;
   switch (op) {
     case plan::CAP_CMD_ARM:
@@ -688,26 +750,36 @@ void PlanBridge::capture_command_(uint8_t id, uint8_t op, uint8_t arg) {
       status = plan::CAP_ACK_UNKNOWN_OP;
       break;
   }
-  // capture_diag_ above may have dropped a stalled client; send_record is
-  // then a no-op on the reset session.
+  // capture_diag_ above may have kicked the issuing client (stalled); the
+  // ack is then moot -- the client is about to be dropped.
+  CapClient &c = cap_clients_[ci];
+  if (c.kick)
+    return;
   cap_rec_.clear();
   plan::cap_rec_ack(cap_rec_, millis(), id, status);
-  capture_out_();
+  capture_out_(c);
 }
 
-bool PlanBridge::capture_flush_() {
-  if (cap_client_fd_ < 0 || cap_backlog_.empty())
+bool PlanBridge::capture_flush_client_(CapClient &c) {
+  if (c.fd < 0 || c.backlog.empty())
     return true;
-  ssize_t w = send(cap_client_fd_, cap_backlog_.data(), cap_backlog_.size(), MSG_DONTWAIT);
+  ssize_t w = send(c.fd, c.backlog.data(), c.backlog.size(), MSG_DONTWAIT);
   if (w > 0) {
-    cap_backlog_.erase(cap_backlog_.begin(), cap_backlog_.begin() + w);
+    c.backlog.erase(c.backlog.begin(), c.backlog.begin() + w);
     return true;
   }
   if (w < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
     return true;
   ESP_LOGW(TAG, "capture stream send failed (errno %d), dropping client", errno);
-  capture_close_client_();
+  capture_close_client_(c);
   return false;
+}
+
+void PlanBridge::capture_flush_() {
+  for (auto &c : cap_clients_) {
+    if (!c.kick)  // a kicked client is closed on the next capture_poll_
+      capture_flush_client_(c);
+  }
 }
 
 void PlanBridge::dump_config() {
