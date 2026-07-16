@@ -444,7 +444,17 @@ class PlanTerminal {
         isr_win_[3] <= 0x20 &&
         isr_win_[4] ==
             static_cast<uint8_t>(0xFF - ENROLL_ADDR - 0x01 - isr_win_[3])) {
-      const uint8_t lr[4] = {0x01, 0x01, ENROLL_ADDR, static_cast<uint8_t>(0xFD - ENROLL_ADDR)};
+      // The link reply returns ALONG THE CHAIN: to the controller for a
+      // direct poll (byte-identical legacy), back to the FORWARDING member
+      // for a chained poll token -- the forwarder aggregates and produces
+      // its own return, which is what paces the controller. Live evidence
+      // 2026-07-17 00:04: replying to 0x01 while the pGD@1E forwarded us
+      // the token left the pGD without closure (0 replies from it) and the
+      // controller re-polled instantly -- a ~500 frames/s storm; the cycle
+      // ran but never completed.
+      const uint8_t ret = isr_win_[3];
+      const uint8_t lr[4] = {ret, 0x01, ENROLL_ADDR,
+                             static_cast<uint8_t>(0xFF - ret - 0x01 - ENROLL_ADDR)};
       if (tx_pending_ && tx_mode_ == 2) {
         act.kind = TxAction::ENROLL_KEY_REPLY;
         act.len = REPLY9_LEN;

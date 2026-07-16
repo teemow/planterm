@@ -423,10 +423,13 @@ int main() {
     bus.term.enroll_ = true;
 
     // The exact captured frame: pGD@1E hands us the poll token (ck C1).
+    // The reply returns ALONG THE CHAIN -- back to the forwarder (0x1E),
+    // which aggregates and produces its own return to the controller.
     Bytes poll1e{{0x1F, 1}, {0x01, 0}, {0x1E, 0}, {0xC1, 0}};
     Bytes r = bus.feed(poll1e);
-    assert(r.size() == 4 && r[0].v == 0x01 && r[0].bit9 == 1 && r[1].v == 0x01 &&
-           r[2].v == ENROLL_ADDR);  // link reply, returned to the controller
+    assert(r.size() == 4 && r[0].v == 0x1E && r[0].bit9 == 1 && r[1].v == 0x01 &&
+           r[2].v == ENROLL_ADDR);
+    assert(r[3].v == 0xC1);  // 0xFF - 1E - 01 - 1F (sum-symmetric with the token)
 
     // A pending key report rides a member-forwarded poll token like any poll.
     bus.term.tx_frame_[0] = 0x01;
@@ -439,6 +442,7 @@ int main() {
     bus.term.tx_pending_ = true;
     r = bus.feed(poll1e);
     assert(r.size() == REPLY9_LEN && r[3].v == ENROLL_ADDR);  // report, addr rewritten
+    assert(r[7].v == 0x1E);  // appended link reply also returns via the forwarder
 
     // Garbled sender byte (checksum mismatch): ignored.
     Bytes badp{{0x1F, 1}, {0x01, 0}, {0x1D, 0}, {0xC1, 0}};
