@@ -62,6 +62,18 @@ static const ScrapeStep ROUTE[] = {
 };
 static constexpr size_t ROUTE_N = sizeof(ROUTE) / sizeof(ROUTE[0]);
 
+// A PIN-gated route: into the Service menu, band-seek onto the PW1-gated
+// entry, Enter (pin = 1: the gate may show -- type PW1 -- or pass through
+// when the session already passed it), verify + emit the target page.
+static const ScrapeStep PIN_ROUTE[] = {
+    {KEY_PRG, 0, false, NEXP_MENU, 0, nullptr, &MAIN_MENU, false, 0},
+    {0, 0, false, NEXP_NONE, 0, "G.Service", &MAIN_MENU, false, 0},
+    {KEY_ENTER, 0, false, NEXP_NONE, 0, nullptr, nullptr, false, 0},
+    {0, SEEK_SPAN, true, NEXP_NONE, 0, "Service settings", nullptr, false, 0},
+    {KEY_ENTER, 0, false, NEXP_PAGE, 0, "Gfc11", nullptr, true, 0, 1},
+};
+static constexpr size_t PIN_ROUTE_N = sizeof(PIN_ROUTE) / sizeof(PIN_ROUTE[0]);
+
 // --- fake device --------------------------------------------------------------
 
 // PlanNav only READS a PlanScreen; the fake paints it directly through the
@@ -95,13 +107,19 @@ struct TestScreen : PlanScreen {
 // difference from a fast repaint).
 struct FakePump {
   TestScreen scr;
-  enum P { STATUS, ALARM, MENU, DPAGE, SERVICE, D14P } page = STATUS;
+  enum P { STATUS, ALARM, MENU, DPAGE, SERVICE, D14P, PW_GATE, GFC11P } page = STATUS;
   int menu_cur = 5;  // last-used main-menu cursor (1-based), like the real device
   int dnum = 1;      // D01..d_max
   int d_max = 10;    // last D page ID (10 idle; 6 with the unit running)
   int d10_scroll = 0;  // rows scrolled within the last D page (ID unchanged)
   int svc = 5;       // service sub-menu entry index (0-based)
   bool alarm_broken = false;  // failure-path test: Alarm key does nothing
+
+  // PW1 gate in front of e.Service settings (same live-recorded model as
+  // test_plan_edit.cpp's fake: digit stages typed by Ups, Enters advance)
+  bool pw1_passed = false;
+  int gate_val = 0, gate_enters = 0, gate_stage = 0;
+  std::vector<uint8_t> gate_keys;  // every key the gate saw
 
   // The last D page's scrolling output list (ground truth: 06 sits below
   // the landing view's fold; there is no 05 row).
@@ -117,7 +135,26 @@ struct FakePump {
       "e.Service settings", "f.Manual managem.",  "g.Var.log",
   };
 
+  void gate_key(uint8_t k) {
+    gate_keys.push_back(k);
+    if (k == KEY_ESC) { page = SERVICE; return; }
+    if (k == KEY_UP && gate_enters > 0) {
+      static const int W[3] = {100, 10, 1};
+      gate_val += W[gate_stage];
+      return;
+    }
+    if (k == KEY_ENTER) {
+      gate_enters++;
+      if (gate_enters == 1) { gate_stage = 0; return; }
+      if (gate_stage < 2) { gate_stage++; return; }
+      // the Enter leaving the units digit confirms (0815 recording)
+      if (gate_val == 815) { pw1_passed = true; page = GFC11P; }
+      else { gate_val = 0; gate_enters = 0; gate_stage = 0; }
+    }
+  }
+
   void press(uint8_t k, uint32_t now) {
+    if (page == PW_GATE) { gate_key(k); paint(now); return; }
     switch (k) {
       case KEY_ESC:
         if (page == ALARM || page == MENU)
@@ -126,7 +163,7 @@ struct FakePump {
           page = MENU, menu_cur = 4;
         else if (page == SERVICE)
           page = MENU, menu_cur = 7;
-        else if (page == D14P)
+        else if (page == D14P || page == GFC11P)
           page = SERVICE;
         break;
       case KEY_ALARM:
@@ -160,6 +197,10 @@ struct FakePump {
           page = SERVICE;
         else if (page == SERVICE && std::strstr(svc_labels[svc], "Expansion valve"))
           page = D14P;
+        else if (page == SERVICE && std::strstr(svc_labels[svc], "Service settings")) {
+          if (pw1_passed) { page = GFC11P; }
+          else { page = PW_GATE; gate_val = 0; gate_enters = 0; gate_stage = 0; }
+        }
         break;
     }
     paint(now);
@@ -198,6 +239,14 @@ struct FakePump {
         break;
       case D14P:
         scr.put_row(SCR_TERM_ESP, 0, " Valve             D14", now);
+        break;
+      case PW_GATE:
+        scr.put_row(SCR_TERM_ESP, 0, "Service Password", now);
+        std::snprintf(buf, sizeof buf, "password (PW1):   %04d", gate_val);
+        scr.put_row(SCR_TERM_ESP, 5, buf, now);
+        break;
+      case GFC11P:
+        scr.put_row(SCR_TERM_ESP, 0, " Termoreg.       Gfc11", now);
         break;
     }
   }
@@ -333,6 +382,95 @@ int main() {
     // full route on the good cycle: status, alarm, the D01 landing + the
     // walk budget's D views, D14
     assert(emits == 1 + 1 + (4 + WALK_DOWNS));
+  }
+
+  {  // PIN-gated step: the gate gets exactly the live-recorded 0815 key
+     // sequence, the cycle verifies + emits the gated page, and the next
+     // cycle passes through the remembered gate without a re-prompt
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.paint(now);
+    PlanNav nav(pump.scr, PIN_ROUTE, PIN_ROUTE_N);
+    std::vector<std::string> emitted;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] {
+      const char *rows[FIELDS_ROWS];
+      for (size_t r = 0; r < FIELDS_ROWS; r++)
+        rows[r] = pump.scr.row(SCR_TERM_ESP, r);
+      char p[FIELDS_PAGE_MAX];
+      page_of(rows, p);
+      emitted.push_back(p);
+    });
+    nav.set_pin(1, 815);
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(pump.pw1_passed);
+    assert(emitted == std::vector<std::string>{"Gfc11"});
+    assert(pump.page == FakePump::STATUS);  // ended back on the anchor
+    std::vector<uint8_t> want = {KEY_ENTER};
+    for (int i = 0; i < 8; i++) want.push_back(KEY_UP);
+    want.push_back(KEY_ENTER);
+    want.push_back(KEY_UP);
+    want.push_back(KEY_ENTER);
+    for (int i = 0; i < 5; i++) want.push_back(KEY_UP);
+    want.push_back(KEY_ENTER);
+    if (pump.gate_keys != want) {
+      std::printf("FAIL PW1 keys:");
+      for (uint8_t k : pump.gate_keys)
+        std::printf(" %02X", k);
+      std::printf("\n");
+      return 1;
+    }
+    // second cycle: the device remembers the gate -> pass-through, the
+    // gate sees no further keys, the page still emits
+    run_until(nav, now, [&] { return nav.cycles() == 2 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(pump.gate_keys == want);
+    assert(emitted == (std::vector<std::string>{"Gfc11", "Gfc11"}));
+  }
+
+  {  // PIN-gated step with no gate at all (already passed before the route
+     // ran): pass-through after the 1 s window, cycle green
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.pw1_passed = true;
+    pump.paint(now);
+    PlanNav nav(pump.scr, PIN_ROUTE, PIN_ROUTE_N);
+    int emits = 0;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] { emits++; });
+    nav.set_pin(1, 815);
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(emits == 1);
+    assert(pump.gate_keys.empty());  // the gate never showed, nothing typed
+    assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // visible gate with an unconfigured pin: FAIL the cycle -- never type
+     // a wrong PIN -- recover to the anchor and back off
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.paint(now);
+    PlanNav nav(pump.scr, PIN_ROUTE, PIN_ROUTE_N);
+    int emits = 0;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] { emits++; });
+    // no set_pin: PW1 unconfigured
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 1);
+    assert(emits == 0);
+    assert(!pump.pw1_passed);
+    for (uint8_t k : pump.gate_keys)  // recovery Esc only; no digit typed
+      assert(k == KEY_ESC);
+    assert(pump.page == FakePump::STATUS);        // recovery reached the anchor
+    assert(nav.next_run_ms() == now + 2 * 60000); // backoff doubled
   }
 
   {  // no cycle starts while not enrolled

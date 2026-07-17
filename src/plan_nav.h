@@ -45,6 +45,37 @@ static constexpr uint32_t NAV_SEEK_CHECK_MS = 500;   // seekSelected per-positio
 // escAnchor press budget: the deepest pages observed sit 4 Escs down.
 static constexpr int NAV_ESC_MAX = 6;
 static constexpr int NAV_BACKOFF_CAP = 4;  // interval << min(fails, 4)
+// The password gate gets 1 s to show after a PIN-flagged step (macro.go);
+// a session that already passed the PIN lands straight on the target page.
+static constexpr uint32_t EDIT_PIN_GATE_MS = 1000;
+
+// pwGateRe: `(?i)^(service|manufacturer) password` on row 0.
+inline bool edit_pw_gate(const char *row0) {
+  auto ci_prefix = [](const char *s, const char *pfx) {
+    for (; *pfx != '\0'; s++, pfx++) {
+      char c = (*s >= 'A' && *s <= 'Z') ? static_cast<char>(*s + 32) : *s;
+      if (c != *pfx)
+        return false;
+    }
+    return true;
+  };
+  return ci_prefix(row0, "service password") || ci_prefix(row0, "manufacturer password");
+}
+
+// The gate's value display: `password\s*(PW\d):\s*NNNN` on row 5 -- port as
+// "the 4 digits right after the row's colon" (the only colon the gate
+// paints on that row).
+inline bool edit_pw_shows(const char *row5, int shown) {
+  const char *c = std::strchr(row5, ':');
+  if (c == nullptr)
+    return false;
+  const char *p = c + 1;
+  while (*p == ' ')
+    p++;
+  char want[8];
+  std::snprintf(want, sizeof want, "%04d", shown);
+  return std::strncmp(p, want, 4) == 0;
+}
 
 // One cursor-driven menu screen (planscope menuDef): its row-0 header prefix
 // with the cursor position ("Main menu N/8", "Service menu N/7"), the /total
@@ -124,6 +155,11 @@ struct MacroStep {
 // the step into a fixed budget -- (press + verify + emit) repeated walk
 // times (e.g. a Down walk across pages whose numbering shifts with the
 // device state, so no page ID is a reliable endpoint).
+// pin != 0 marks a press step whose landing may be a password gate
+// (1 = PW1/service, 2 = PW2/manufacturer): after the press the gate gets
+// 1 s to show; an absent gate passes through, a visible one is typed with
+// the owner-configured PIN (NavEngine::set_pin) before the verify. The
+// field trails the struct so existing tables zero-fill it (no gate).
 struct ScrapeStep {
   uint8_t key;
   uint8_t span;         // band_seek: seek span (span Downs, then 2x span Ups)
@@ -134,6 +170,7 @@ struct ScrapeStep {
   const NavMenu *menu;  // key 0: select target; else the NEXP_MENU menu
   bool emit;
   uint8_t walk;
+  uint8_t pin{0};       // 0 = no gate expected; 1 = PW1; 2 = PW2
 };
 
 // NavEngine: the verified navigation primitives shared by the scrape machine
@@ -148,6 +185,15 @@ class NavEngine {
 
   void set_press(std::function<void(uint8_t)> f) { press_ = std::move(f); }
   void set_log(std::function<void(bool err, const char *msg)> f) { log_ = std::move(f); }
+
+  // PW pins from the owner's config (which: 1 = PW1/service, 2 = PW2/
+  // manufacturer); 0 = not configured -- a gated step FAILs at a visible
+  // gate instead of typing a wrong PIN.
+  void set_pin(uint8_t which, int pin) {
+    if (which >= 1 && which <= 2)
+      pins_[which - 1] = pin;
+  }
+  int pin_of(uint8_t which) const { return which >= 1 && which <= 2 ? pins_[which - 1] : 0; }
 
  protected:
   enum class Act : uint8_t { RUN, OK, FAIL };
@@ -354,6 +400,57 @@ class NavEngine {
     return Act::RUN;
   }
 
+  // --- PIN entry (macro.go enterPIN, live-recorded for PW1) ------------------
+
+  // Stage order cycles hundreds -> tens -> units -> thousands; the
+  // thousands stage is skipped when its digit is 0 (the units Enter already
+  // confirmed). Every Up is paced by the settle wait -- an Up fired into
+  // the gate's repaint is accepted but not counted -- and read back against
+  // the gate's own value display. The caller owns which pin to type
+  // (pins_[which - 1]) and resets pphase_ before the first tick.
+  Act pin_tick_(int pin, uint32_t now) {
+    // positional divisors in stage order; also the per-Up display weights
+    static const int WEIGHTS[4] = {100, 10, 1, 1000};
+    switch (pphase_) {
+      case 0:  // Enter focuses the hundreds digit
+        if (step_(KEY_ENTER, [] { return true; }, 0, now) == Act::OK) {
+          pin_stage_ = 0;
+          pin_shown_ = 0;
+          pin_left_ = (pin / 100) % 10;
+          pphase_ = 1;
+        }
+        return Act::RUN;
+      case 1: {  // the stage's Ups, each read back against the display
+        if (pin_left_ == 0) {
+          pphase_ = 2;
+          return Act::RUN;
+        }
+        int want = pin_shown_ + WEIGHTS[pin_stage_];
+        Act a = step_(KEY_UP, [this, want] { return edit_pw_shows(row_(5), want); },
+                      NAV_VERIFY_MS, now);
+        if (a == Act::FAIL)
+          return Act::FAIL;  // gate never showed the digit
+        if (a == Act::OK) {
+          pin_shown_ = want;
+          pin_left_--;
+        }
+        return Act::RUN;
+      }
+      default: {  // Enter advances to the next stage / confirms
+        if (step_(KEY_ENTER, [] { return true; }, 0, now) != Act::OK)
+          return Act::RUN;
+        pin_stage_++;
+        // the thousands stage is skipped when its digit is 0: the units
+        // Enter already confirmed (the live-recorded model)
+        if (pin_stage_ >= 4 || (pin_stage_ == 3 && (pin / 1000) % 10 == 0))
+          return Act::OK;
+        pin_left_ = (pin / WEIGHTS[pin_stage_]) % 10;
+        pphase_ = 1;
+        return Act::RUN;
+      }
+    }
+  }
+
   void reset_nav_() {
     aphase_ = 0;
     esc_i_ = 0;
@@ -361,6 +458,7 @@ class NavEngine {
     sphase_ = 0;
     scheck_ = true;
     seek_i_ = 0;
+    pphase_ = 0;
   }
 
   const PlanScreen &scr_;
@@ -379,6 +477,12 @@ class NavEngine {
   int seek_i_{0};
 
   char buf_[96];
+
+  // PIN entry (pin_tick_) sub-state + the owner-configured pins
+  // (pins_[0] = PW1, pins_[1] = PW2; 0 = not configured)
+  uint8_t pphase_{0};
+  int pin_stage_{0}, pin_shown_{0}, pin_left_{0};
+  int pins_[2]{0, 0};
 };
 
 // PlanNav runs a consumer-supplied scrape route on a schedule: Esc to the
@@ -460,6 +564,8 @@ class PlanNav : public NavEngine {
         a = seek_selected_(s.arg, s.span, now);
       } else if (s.key == 0 && s.exp == NEXP_NONE) {
         a = Act::OK;  // emit-only step: nothing to press or verify
+      } else if (s.pin != 0) {
+        a = gate_step_(s, now);
       } else {
         a = step_(s.key, [this, &s] { return expect_(s.exp, s.row, s.arg, s.menu); },
                   s.exp == NEXP_NONE ? 0 : NAV_VERIFY_MS, now);
@@ -491,11 +597,54 @@ class PlanNav : public NavEngine {
     }
   }
 
+  // A PIN-gated press step (pin != 0), mirroring PlanEdit's rphase_ 1/2/3:
+  // press + settle, give the password gate 1 s to show; an absent gate is a
+  // pass-through (the session already passed this PIN); a visible gate is
+  // typed with the configured PIN -- unconfigured (0) FAILs the cycle
+  // instead of typing a wrong one.
+  Act gate_step_(const ScrapeStep &s, uint32_t now) {
+    switch (gphase_) {
+      case 0: {  // the press, settle-paced, no verify yet
+        if (step_(s.key, [] { return true; }, 0, now) == Act::OK)
+          gphase_ = 1;
+        return Act::RUN;
+      }
+      case 1: {  // gate check (a missing gate is not an error)
+        Act a = step_(0, [this] { return edit_pw_gate(row0_()); }, EDIT_PIN_GATE_MS, now, false);
+        if (a == Act::OK) {
+          if (pin_of(s.pin) == 0)
+            return Act::FAIL;  // gated step without a configured PIN
+          pphase_ = 0;
+          gphase_ = 2;
+        } else if (a == Act::FAIL) {
+          gphase_ = 3;  // no gate showed: pass through
+        }
+        return Act::RUN;
+      }
+      case 2: {  // type the PIN
+        Act a = pin_tick_(pin_of(s.pin), now);
+        if (a == Act::FAIL)
+          return Act::FAIL;
+        if (a == Act::OK)
+          gphase_ = 3;
+        return Act::RUN;
+      }
+      default: {  // verify the step's expectation (navTimeout)
+        Act a = step_(0, [this, &s] { return expect_(s.exp, s.row, s.arg, s.menu); },
+                      s.exp == NEXP_NONE ? 0 : NAV_VERIFY_MS, now, false);
+        if (a != Act::RUN)
+          gphase_ = 0;
+        return a;
+      }
+    }
+  }
+
   void reset_sub_() {
     reset_nav_();
     step_i_ = 0;
     ephase_ = 0;
     walk_i_ = 0;
+    gphase_ = 0;
   }
 
   void fail_(const char *what) {
@@ -540,6 +689,7 @@ class PlanNav : public NavEngine {
   size_t step_i_{0};
   uint8_t ephase_{0};  // 0 = the move, 1 = the emit
   int walk_i_{0};      // iterations done within a walk step
+  uint8_t gphase_{0};  // gate_step_ sub-phase (pin != 0 steps)
 };
 
 }  // namespace plan
