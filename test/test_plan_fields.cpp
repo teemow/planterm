@@ -203,6 +203,11 @@ int main() {
   assert(page({" Power+ Custom   H1c14"}) == "H1c14");
   assert(page({" Data logger       E35"}) == "E35");
   assert(page({" EVD Config.     Haa01"}) == "Haa01");
+  // glued header: the long title consumes the gap before the ID cell,
+  // page identity falls back to the token's page-ID suffix
+  assert(page({" Compressor conf.H1a05"}) == "H1a05");
+  assert(page({" Compressor conf.H1a06"}) == "H1a06");
+  assert(page({"02:18 03/07/26 Ekobee1"}) == "status");  // no accidental tail
   // ...without over-matching menu/status headers
   assert(page({"P.Plus Menu' config   "}) == "");
   assert(page({" Manufacturer         "}) == "");
