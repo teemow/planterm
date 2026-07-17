@@ -69,9 +69,8 @@ static constexpr int EDIT_MAX_PRESS = 600;
 // navigate retries the whole route on a transient failure (the controller's
 // net rebuild can bounce the session back to the anchor mid-route).
 static constexpr int EDIT_NAV_ATTEMPTS = 3;
-// The password gate gets 1 s to show after a PIN-flagged step (macro.go);
-// a session that already passed PW1 lands straight on the target page.
-static constexpr uint32_t EDIT_PIN_GATE_MS = 1000;
+// EDIT_PIN_GATE_MS, edit_pw_gate, edit_pw_shows, and pin_tick_ live in
+// plan_nav.h (NavEngine) -- shared with PlanNav's PIN-gated scrape steps.
 
 // One named configuration value (macro.go macroDef): the verified route
 // from the status anchor to its page (every step verified against the
@@ -125,34 +124,6 @@ inline bool edit_eq(const char *a, const char *b) {
   return la == lb && std::strncmp(a, b, la) == 0;
 }
 
-// pwGateRe: `(?i)^(service|manufacturer) password` on row 0.
-inline bool edit_pw_gate(const char *row0) {
-  auto ci_prefix = [](const char *s, const char *pfx) {
-    for (; *pfx != '\0'; s++, pfx++) {
-      char c = (*s >= 'A' && *s <= 'Z') ? static_cast<char>(*s + 32) : *s;
-      if (c != *pfx)
-        return false;
-    }
-    return true;
-  };
-  return ci_prefix(row0, "service password") || ci_prefix(row0, "manufacturer password");
-}
-
-// The gate's value display: `password\s*(PW\d):\s*NNNN` on row 5 -- port as
-// "the 4 digits right after the row's colon" (the only colon the gate
-// paints on that row).
-inline bool edit_pw_shows(const char *row5, int shown) {
-  const char *c = std::strchr(row5, ':');
-  if (c == nullptr)
-    return false;
-  const char *p = c + 1;
-  while (*p == ' ')
-    p++;
-  char want[8];
-  std::snprintf(want, sizeof want, "%04d", shown);
-  return std::strncmp(p, want, 4) == 0;
-}
-
 // PlanEdit executes one request at a time. The owner (typically through the
 // EditArbiter below) starts a request while the scrape is idle and ticks
 // the machine; the result arrives through the done callback.
@@ -181,9 +152,10 @@ class PlanEdit : public NavEngine {
     nspecs_ = n;
   }
   // PW1 from the owner's config; 0 = no PIN available (a gated route fails
-  // at the gate instead of typing a wrong one).
-  void set_pin(int pin) { pin_ = pin; }
-  int pin() const { return pin_; }
+  // at the gate instead of typing a wrong one). A shim over the engine's
+  // parameterized pins (NavEngine::set_pin), kept for the existing callers.
+  void set_pin(int pin) { NavEngine::set_pin(1, pin); }
+  int pin() const { return pin_of(1); }
   // "The target page settled and its value row verified" -- fired right
   // after READ succeeds, before any edit focus opens. The owner hooks a
   // full-page force extraction here, which turns a queued get into a page
@@ -662,7 +634,7 @@ class PlanEdit : public NavEngine {
         // straight on the target page, so a missing gate is not an error.
         Act a = step_(0, [this] { return edit_pw_gate(row0_()); }, EDIT_PIN_GATE_MS, now, false);
         if (a == Act::OK) {
-          if (pin_ == 0)
+          if (pin() == 0)
             return Act::FAIL;  // gated route without a configured PIN
           pphase_ = 0;
           rphase_ = 2;
@@ -671,8 +643,8 @@ class PlanEdit : public NavEngine {
         }
         return Act::RUN;
       }
-      case 2: {  // type the PIN
-        Act a = pin_tick_(now);
+      case 2: {  // type the PIN (NavEngine::pin_tick_, hoisted)
+        Act a = pin_tick_(pin(), now);
         if (a == Act::FAIL)
           return Act::FAIL;
         if (a == Act::OK)
@@ -682,56 +654,6 @@ class PlanEdit : public NavEngine {
       default:  // verify the step's expectation (navTimeout)
         return step_(0, [this, &s] { return expect_(s.exp, s.row, s.arg, s.menu); },
                      NAV_VERIFY_MS, now, false);
-    }
-  }
-
-  // --- PIN entry (macro.go enterPIN, live-recorded for PW1) ------------------
-
-  // Stage order cycles hundreds -> tens -> units -> thousands; the
-  // thousands stage is skipped when its digit is 0 (the units Enter already
-  // confirmed). Every Up is paced by the settle wait -- an Up fired into
-  // the gate's repaint is accepted but not counted -- and read back against
-  // the gate's own value display.
-  Act pin_tick_(uint32_t now) {
-    // positional divisors in stage order; also the per-Up display weights
-    static const int WEIGHTS[4] = {100, 10, 1, 1000};
-    switch (pphase_) {
-      case 0:  // Enter focuses the hundreds digit
-        if (step_(KEY_ENTER, [] { return true; }, 0, now) == Act::OK) {
-          pin_stage_ = 0;
-          pin_shown_ = 0;
-          pin_left_ = (pin_ / 100) % 10;
-          pphase_ = 1;
-        }
-        return Act::RUN;
-      case 1: {  // the stage's Ups, each read back against the display
-        if (pin_left_ == 0) {
-          pphase_ = 2;
-          return Act::RUN;
-        }
-        int want = pin_shown_ + WEIGHTS[pin_stage_];
-        Act a = step_(KEY_UP, [this, want] { return edit_pw_shows(row_(5), want); },
-                      NAV_VERIFY_MS, now);
-        if (a == Act::FAIL)
-          return Act::FAIL;  // gate never showed the digit
-        if (a == Act::OK) {
-          pin_shown_ = want;
-          pin_left_--;
-        }
-        return Act::RUN;
-      }
-      default: {  // Enter advances to the next stage / confirms
-        if (step_(KEY_ENTER, [] { return true; }, 0, now) != Act::OK)
-          return Act::RUN;
-        pin_stage_++;
-        // the thousands stage is skipped when its digit is 0: the units
-        // Enter already confirmed (the live-recorded model)
-        if (pin_stage_ >= 4 || (pin_stage_ == 3 && (pin_ / 1000) % 10 == 0))
-          return Act::OK;
-        pin_left_ = (pin_ / WEIGHTS[pin_stage_]) % 10;
-        pphase_ = 1;
-        return Act::RUN;
-      }
     }
   }
 
@@ -802,7 +724,6 @@ class PlanEdit : public NavEngine {
   const char *name_{""};
   const FieldSpec *specs_{nullptr};
   size_t nspecs_{0};
-  int pin_{0};
   std::function<void(bool, const char *, const char *)> done_;
   std::function<void()> emit_;
   std::function<void(const char *)> sweep_emit_;
@@ -813,9 +734,6 @@ class PlanEdit : public NavEngine {
   int step_i_{0};
   uint8_t rphase_{0};
   int press_i_{0};
-  // PIN entry
-  uint8_t pphase_{0};
-  int pin_stage_{0}, pin_shown_{0}, pin_left_{0};
   // request: the ordered sub-edits of one page visit (1 for a macro
   // get/set, up to OPS_MAX for set_ops), and read_sweep's selector walk
   EditOp ops_[OPS_MAX];
