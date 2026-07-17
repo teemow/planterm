@@ -562,6 +562,7 @@ class PlanTerminal {
 
   // The caller actually put the action's frame on the wire.
   void PLAN_IRAM tx_sent(const TxAction &act, int64_t now_us) {
+    txlog_push_(act, now_us, 1);
     tel_last_tx_us_ = now_us;  // arms the post-TX-gap measurement
     switch (act.kind) {
       case TxAction::ROLLCALL_REPLY:
@@ -598,6 +599,7 @@ class PlanTerminal {
   // The caller skipped the action (RX FIFO was not empty: the match is stale,
   // the controller has moved on). Only the slot-race path counts these.
   void PLAN_IRAM tx_not_sent(const TxAction &act) {
+    txlog_push_(act, 0, 0);
     if (act.kind == TxAction::RACE_KEY_REPLY)
       isr_stale_ = isr_stale_ + 1;
   }
@@ -629,6 +631,41 @@ class PlanTerminal {
   volatile int64_t t_link_reset_us_{0}; // last FF-walk marker (telemetry)
   volatile uint8_t tel_b3_{0};          // third byte of the current run
   volatile int64_t t_pgd_alive_us_{0};  // last transmission seen FROM the pGD@32
+
+  // --- TX capture ring (heatpump-firmware#14 T1b) ------------------------
+  // Every transmit decision the ISR made, sent AND skipped, for the task to
+  // surface into the PLANCAP stream: our own frames never reach the RX path
+  // (DE/RE tied mute the receiver during TX), so without this half of every
+  // exchange is invisible and "we didn't transmit" is never provable.
+  // Single writer (ISR), single reader (bus task): the reader chases
+  // txlog_w_ with its own index and treats lag > TXLOG_N as overwritten
+  // entries. Entries are plain storage; on the single-core C3 the volatile
+  // index publish orders the accesses -- same idiom as tx_frame_/tx_pending_.
+ public:
+  static constexpr uint32_t TXLOG_N = 16;  // power of two
+  struct TxLog {
+    int64_t us;     // esp_timer at tx_sent; 0 for a skipped action
+    uint8_t sent;   // 1 = frame went on the wire, 0 = slot skipped (stale)
+    uint8_t kind;   // TxAction::Kind
+    uint8_t len;
+    uint8_t frame[12];
+    uint16_t bit9;  // bit i set => frame[i] carried the 9th/address bit
+  };
+  TxLog txlog_[TXLOG_N]{};
+  volatile uint32_t txlog_w_{0};
+
+ protected:
+  void PLAN_IRAM txlog_push_(const TxAction &act, int64_t us, uint8_t sent) {
+    TxLog &e = txlog_[txlog_w_ & (TXLOG_N - 1)];
+    e.us = us;
+    e.sent = sent;
+    e.kind = static_cast<uint8_t>(act.kind);
+    e.len = act.len;
+    e.bit9 = act.bit9_mask;
+    for (uint8_t i = 0; i < act.len && i < sizeof(e.frame); i++)
+      e.frame[i] = act.frame[i];
+    txlog_w_ = txlog_w_ + 1;  // publish last
+  }
 };
 
 }  // namespace plan

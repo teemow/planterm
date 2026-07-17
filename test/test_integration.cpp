@@ -69,6 +69,38 @@ int main() {
     assert(bus.feed(ctl.emit_ack()).empty());
   }
 
+  // --- TX log ring: every sent/skipped action is recorded verbatim ---
+  {
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+    assert(bus.term.txlog_w_ == 0);
+    Bytes reply = bus.feed(ctl.emit_rollcall(0x1F));
+    assert(!reply.empty());
+    assert(bus.term.txlog_w_ == 1);
+    const PlanTerminal::TxLog &e = bus.term.txlog_[0];
+    assert(e.sent == 1);
+    assert(e.kind == TxAction::ROLLCALL_REPLY);
+    assert(e.us != 0);
+    assert(e.len == reply.size());
+    for (size_t i = 0; i < reply.size(); i++) {
+      assert(e.frame[i] == reply[i].v);
+      assert(((e.bit9 >> i) & 1) == reply[i].bit9);
+    }
+    // A skipped action lands too, flagged unsent.
+    TxAction skipped;
+    skipped.kind = TxAction::RACE_KEY_REPLY;
+    skipped.len = 2;
+    skipped.frame[0] = 0x01;
+    skipped.frame[1] = 0x02;
+    skipped.bit9_mask = 0x1;
+    bus.term.tx_not_sent(skipped);
+    assert(bus.term.txlog_w_ == 2);
+    assert(bus.term.txlog_[1].sent == 0);
+    assert(bus.term.txlog_[1].us == 0);
+    assert(bus.term.txlog_[1].kind == TxAction::RACE_KEY_REPLY);
+  }
+
   // --- enrollment, link maintenance, key injection, session ack ---
   {
     Bus bus;
