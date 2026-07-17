@@ -108,16 +108,42 @@ int main() {
     bus.term.enroll_ = true;
     bus.term.fwd_polls_ = 1;
 
-    // pGD not live yet: polls get the normal link reply, no forward.
+    // pGD not live yet: the FIRST poll becomes a bootstrap PROBE forward
+    // (liveness resets on every reboot and an unpolled pGD never transmits;
+    // waiting for liveness deadlocked into the 2026-07-17 permanent NO LINK).
     Bytes r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4);
+    assert(r[0].v == 0x20 && r[0].bit9 == 1 && r[1].v == 0x01 && r[2].v == ENROLL_ADDR);
+    assert(r[3].v == static_cast<uint8_t>(0xFF - 0x20 - 0x01 - ENROLL_ADDR));
+
+    // Nobody answers the probe: the controller's re-poll takes the existing
+    // failure path -- normal link reply, fwd_fail_, 1 s backoff.
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);
+    assert(bus.term.fwd_fail_ == 1);
+
+    // Probe pacing: past the fail backoff but inside the 2 s probe window,
+    // polls still get the normal direct reply (no probe storm).
+    bus.now += 1'100'000;
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);
+    assert(bus.term.fwd_fail_ == 1);  // no new attempt, so no new failure
+
+    // Probe window elapsed: the next poll probes again.
+    bus.now += 1'500'000;
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4 && r[0].v == 0x20);
+    // This time the pGD answers the token as itself -> completion counted
+    // AND the reply arms the liveness probe (closed by the next poll's
+    // address byte): the deadlock is broken without any direct pGD poll.
+    bus.feed({{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}});
+    assert(bus.term.fwd_ok_ == 1);
+    // The controller re-polls us: ours to answer directly (alternation).
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
     assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);
 
-    // Arm the liveness probe: a pGD session ack (01' 03 20 DB) + a closing
-    // address byte (frame classification happens on the next bit9 byte).
-    bus.feed({{0x01, 1}, {0x03, 0}, {0x20, 0}, {0xDB, 0}});
-    bus.feed(ctl.emit_ack());
-
-    // Now the poll token is handed on to the pGD: 20' 01 1F BF.
+    // Liveness is armed now: forwarding continues on the normal alternating
+    // path (no probe pacing in the way).
     r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
     assert(r.size() == 4);
     assert(r[0].v == 0x20 && r[0].bit9 == 1 && r[1].v == 0x01 && r[2].v == ENROLL_ADDR);
@@ -126,7 +152,7 @@ int main() {
     // Completion: the pGD answers the token as itself (01' 01 20 DD -- the
     // live-verified variant, fwd-experiment-0937.txt).
     bus.feed({{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}});
-    assert(bus.term.fwd_ok_ == 1);
+    assert(bus.term.fwd_ok_ == 2);
 
     // Alternation: the controller re-polls right after the pGD's reply and
     // that one is ours to answer directly -- never two forwards in a row.
@@ -136,10 +162,11 @@ int main() {
     assert(r[0].v == 0x20);  // forwarded again
 
     // No completion this time -> the re-poll gets the normal link reply and
-    // the failure backs forwarding off for 1 s.
+    // the failure backs forwarding off for 1 s. Liveness is still armed, so
+    // the backoff -- not probe pacing -- is what holds forwards back.
     r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
     assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);  // normal reply
-    assert(bus.term.fwd_fail_ == 1);
+    assert(bus.term.fwd_fail_ == 2);
     r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
     assert(r[0].v == 0x01);  // still backing off
 
@@ -154,7 +181,7 @@ int main() {
                   {0x20, 0},
                   {static_cast<uint8_t>(0xFF - ENROLL_ADDR - 0x01 - 0x20), 0}});
     assert(r.size() == 4 && r[0].v == 0x01 && r[1].v == 0x01 && r[2].v == ENROLL_ADDR);
-    assert(bus.term.fwd_ok_ == 2);
+    assert(bus.term.fwd_ok_ == 3);
   }
 
   // --- enrollment, link maintenance, key injection, session ack ---

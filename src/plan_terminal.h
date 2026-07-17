@@ -509,8 +509,7 @@ class PlanTerminal {
           fwd_fail_ = fwd_fail_ + 1;
           fwd_backoff_until_us_ = now_us + 1'000'000;
         } else if (fwd_polls_ != 0 && !fwd_just_ && !tx_pending_ &&
-                   now_us >= fwd_backoff_until_us_ && t_pgd_alive_us_ != 0 &&
-                   static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull) {
+                   now_us >= fwd_backoff_until_us_) {
           // ALTERNATE, never forward twice in a row: the controller wants
           // OUR reply for its poll regardless -- after the pGD answers the
           // forwarded token it re-polls us within ~3.5 ms, and that one is
@@ -518,14 +517,37 @@ class PlanTerminal {
           // 00:04 ~500 f/s storm (the pGD-as-focus made exactly that
           // mistake toward us). One forward, one direct reply, repeat:
           // both terminals answer every ~28 ms macro-cycle.
-          act.kind = TxAction::FORWARD_POLL;
-          act.len = 4;
-          act.frame[0] = 0x20;
-          act.frame[1] = 0x01;
-          act.frame[2] = ENROLL_ADDR;
-          act.frame[3] = static_cast<uint8_t>(0xFF - 0x20 - 0x01 - ENROLL_ADDR);
-          act.bit9_mask = 0x01;
-          return act;
+          //
+          // BOOTSTRAP PROBE (2026-07-17 NO LINK #3): liveness resets to 0 on
+          // every reboot, and an unpolled pGD transmits NOTHING -- gating the
+          // forward on liveness alone deadlocks after any boot where the pGD
+          // missed the OTA focus window (worse: the roll-call honest skip
+          // then reports 32 dead and the controller drops it entirely --
+          // bus10s pgd=0, fwd enabled, ok=0 fail=0, forever). So when
+          // liveness is unarmed/stale, PROBE: forward the poll token anyway,
+          // at most once per 2 s. A present pGD answers a forwarded token
+          // exactly like a direct poll (07-16: first poll out of weeks-deep
+          // NO LINK answered in 86 ms) -- its reply arms t_pgd_alive_us_ and
+          // normal alternation resumes. An absent pGD fails the probe down
+          // the EXISTING benign path (controller re-polls us ~ms later,
+          // fwd_fail_ + 1 s backoff). Ring-token forwarding stays strictly
+          // liveness-gated -- that is where the 07-16 FF-walk loops lived.
+          const bool pgd_live =
+              t_pgd_alive_us_ != 0 &&
+              static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull;
+          const bool probe_due = !pgd_live && now_us >= fwd_probe_next_us_;
+          if (pgd_live || probe_due) {
+            if (probe_due)
+              fwd_probe_next_us_ = now_us + 2'000'000;
+            act.kind = TxAction::FORWARD_POLL;
+            act.len = 4;
+            act.frame[0] = 0x20;
+            act.frame[1] = 0x01;
+            act.frame[2] = ENROLL_ADDR;
+            act.frame[3] = static_cast<uint8_t>(0xFF - 0x20 - 0x01 - ENROLL_ADDR);
+            act.bit9_mask = 0x01;
+            return act;
+          }
         }
       } else if (from > ENROLL_ADDR && fwd_awaiting_) {
         fwd_awaiting_ = false;
@@ -738,6 +760,7 @@ class PlanTerminal {
  protected:
   volatile bool fwd_awaiting_{false};    // forward sent, completion not yet heard
   volatile int64_t fwd_backoff_until_us_{0};  // no forwards until then after a fail
+  volatile int64_t fwd_probe_next_us_{0};     // liveness-unarmed bootstrap probe pacing
   volatile bool fwd_just_{false};        // last poll was forwarded: alternate
 };
 
