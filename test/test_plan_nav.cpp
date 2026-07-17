@@ -27,7 +27,10 @@ static const char *const MENU_LABELS[MENU_N] = {
     "A.On/Off Unit", "B.Setpoint", "C.Clock/Scheduler", "D.Input/Output",
     "E.Data logger", "F.Information", "G.Service", "H.Manufacturer",
 };
-static const NavMenu MAIN_MENU{"Main menu", 8, MENU_LABELS, MENU_N};
+static const NavMenu MAIN_MENU{"Main menu", 8, MENU_LABELS, MENU_N, false};
+// The real main-menu cursor wraps (07-03 transcript: Up from 1/8 -> 8/8);
+// a wraps menu def lets menu_select_in_ take the shortest modular path.
+static const NavMenu MAIN_MENU_W{"Main menu", 8, MENU_LABELS, MENU_N, true};
 
 // The D-walk is a fixed budget of Downs, NOT a walk to a target page ID:
 // the reference controller renumbers the D pages with the unit state, and
@@ -84,6 +87,13 @@ static const ScrapeStep DROUTE[] = {
     {KEY_DOWN, 0, false, NEXP_PAGE_GLOB, 0, "D##", nullptr, true, WALK_DOWNS},
 };
 static constexpr size_t DROUTE_N = sizeof(DROUTE) / sizeof(DROUTE[0]);
+
+// Wraps-select route: from the menu, pin the cursor onto the first entry.
+static const ScrapeStep WROUTE[] = {
+    {KEY_PRG, 0, false, NEXP_MENU, 0, nullptr, &MAIN_MENU_W, false, 0},
+    {0, 0, false, NEXP_NONE, 0, "A.On/Off Unit", &MAIN_MENU_W, false, 0},
+};
+static constexpr size_t WROUTE_N = sizeof(WROUTE) / sizeof(WROUTE[0]);
 
 // --- fake device --------------------------------------------------------------
 
@@ -597,6 +607,29 @@ int main() {
       assert(k == KEY_ESC);
     assert(pump.page == FakePump::STATUS);        // recovery reached the anchor
     assert(nav.next_run_ms() == now + 2 * 60000); // backoff doubled
+  }
+
+  {  // wraps-select takes the shortest modular path: cursor on H (8/8),
+     // target A -> one wrapping Down instead of seven Ups
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.menu_cur = MENU_N;  // last-used position: the bottom entry
+    pump.paint(now);
+    PlanNav nav(pump.scr, WROUTE, WROUTE_N);
+    int downs = 0, ups = 0;
+    nav.set_press([&](uint8_t k) {
+      if (k == KEY_DOWN)
+        downs++;
+      else if (k == KEY_UP)
+        ups++;
+      pump.press(k, now);
+    });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(downs == 1 && ups == 0);  // 8 -> 1 in a single wrapping Down
+    assert(pump.page == FakePump::STATUS);
   }
 
   {  // no cycle starts while not enrolled

@@ -86,6 +86,10 @@ struct NavMenu {
   int total;
   const char *const *labels;
   int n;
+  // The cursor wraps at the ends (Down from n lands on 1, Up from 1 on n);
+  // menu_select_in_ then takes the shortest modular path. Trailing member
+  // with a default: existing aggregate tables stay valid (no wrap).
+  bool wraps = false;
 };
 
 // Cursor position from the menu header (planscope menuCursor); 0 = not this
@@ -361,11 +365,20 @@ class NavEngine {
           return Act::RUN;
         }
         int dir = menu_pos_ < menu_target_ ? 1 : -1;
-        const char *next = menu.labels[menu_pos_ + dir - 1];
+        if (menu.wraps) {  // shortest modular path (e.g. 8 -> 1 = one Down)
+          int fwd = (menu_target_ - menu_pos_ + menu.n) % menu.n;
+          dir = 2 * fwd <= menu.n ? 1 : -1;
+        }
+        int next_pos = menu_pos_ + dir;
+        if (next_pos > menu.n)
+          next_pos = 1;
+        else if (next_pos < 1)
+          next_pos = menu.n;
+        const char *next = menu.labels[next_pos - 1];
         Act a = step_(dir > 0 ? KEY_DOWN : KEY_UP,
                       [this, next] { return selected_(next); }, NAV_VERIFY_MS, now, false);
         if (a == Act::OK)
-          menu_pos_ += dir;
+          menu_pos_ = next_pos;
         else if (a == Act::FAIL) {
           mphase_ = 0;
           return Act::FAIL;
