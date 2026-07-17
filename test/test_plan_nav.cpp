@@ -250,10 +250,17 @@ int main() {
     });
     nav.set_interval_ms(60000);
     nav.enable(now);
+    uint32_t t_start = now;
     run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
 
     assert(nav.fails() == 0);
     assert(saw_emergency);
+    // A keyless emit settles on an already-quiet screen instead of
+    // re-serving the full NAV_QUIET_MS wait: measured on this fake, the
+    // cycle runs 32.4 s single-settle vs 41.3 s with the old double-settle
+    // (17 emits x ~520 ms). The bound sits between the two, so a regression
+    // re-adding the second wait fails here.
+    assert(now - t_start < 37000);
     std::vector<std::string> want = {"status", "alarm"};
     for (int d = 1; d <= 10; d++) {
       char b[8];

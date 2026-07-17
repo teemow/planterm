@@ -209,6 +209,10 @@ class NavEngine {
   // One verifiable move (macro.go runStep): optionally press, wait for the
   // repaint to settle (quiet >= 600 ms since press AND since the last frame,
   // capped at 6 s like waitSettle), then poll pred until verify_ms expires.
+  // A keyless settle (key == 0, e.g. the emit after a verified move) has no
+  // press to outwait, so it counts quiet from the last frame alone: a screen
+  // that has already been silent >= 600 ms settles immediately instead of
+  // re-serving the full wait (~600 ms x every emit of a scrape cycle).
   // Uses the shared aphase_/at0_ sub-state; exactly one step_ runs at a time.
   template<typename Pred>
   Act step_(uint8_t key, Pred pred, uint32_t verify_ms, uint32_t now, bool settle = true) {
@@ -221,7 +225,8 @@ class NavEngine {
     }
     if (aphase_ == 1) {
       uint32_t p = scr_.painted_ms(SCR_TERM_ESP);
-      bool quiet = now - at0_ >= NAV_QUIET_MS && (p == 0 || now - p >= NAV_QUIET_MS);
+      bool quiet = (key == 0 || now - at0_ >= NAV_QUIET_MS) &&
+                   (p == 0 || now - p >= NAV_QUIET_MS);
       if (!quiet && now - at0_ < NAV_SETTLE_CAP_MS)
         return Act::RUN;
       at0_ = now;
