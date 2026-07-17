@@ -367,10 +367,9 @@ int main() {
     assert(!bus.term.drain_replied_);
 
     // Roll-call while draining: echo with our bit CLEARED in both halves
-    // (ctl's map/claims carry our bit from the enrollment above). The mock
-    // map has the pGD@32 live, so the token forwards to 0x20.
+    // (ctl's map/claims carry our bit from the enrollment above).
     Bytes renounce = bus.feed(ctl.emit_rollcall(ENROLL_ADDR));
-    assert(renounce.size() == 12 && renounce[0].v == 0x20 && renounce[0].bit9 == 1 &&
+    assert(renounce.size() == 12 && renounce[0].v == 0x01 && renounce[0].bit9 == 1 &&
            renounce[1].v == 0x02 && renounce[2].v == ENROLL_ADDR);
     assert((renounce[3 + OWN_BYTE_I].v & OWN_BIT) == 0);  // map half renounced
     assert((renounce[7 + OWN_BYTE_I].v & OWN_BIT) == 0);  // claims half renounced
@@ -420,12 +419,14 @@ int main() {
     assert(sum8v(r, 0, 12) == 0xFF);
 
     // The pGD transmits (link reply from 0x20) -> liveness armed -> the
-    // same token now FORWARDS to 0x20, presence verbatim.
+    // token STILL returns to 0x01 (a real terminal ignores member-forwarded
+    // tokens; forwarding throws the claim away -- ground truth 07:43), but
+    // the LIVE 32 keeps its presence bit intact.
     Bytes beacon{{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}};
     bus.feed(beacon);
     r = bus.feed(token32);
-    assert(r.size() == 12 && r[0].v == 0x20 && r[0].bit9 == 1);
-    assert(r[3].v == 0xE0 && r[7].v == OWN_BIT);  // presence verbatim, claims-only
+    assert(r.size() == 12 && r[0].v == 0x01 && r[0].bit9 == 1);
+    assert(r[3].v == 0xE0 && r[7].v == OWN_BIT);  // presence intact, claims-only
     assert(sum8v(r, 0, 12) == 0xFF);
 
     // Liveness expires (15 s without a pGD transmission): return + clear.

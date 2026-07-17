@@ -317,18 +317,23 @@ class PlanTerminal {
           // forever, the lockout never expires). An EMPTY 32 never
           // transmits, so the blind-forward loop of 2026-07-16 stays
           // impossible.
+          // GROUND TRUTH 2026-07-17 07:43 (real pGD downstream of a forward,
+          // first ever observation): a real terminal IGNORES member-forwarded
+          // tokens -- it ignored our 20' 02 1F and answered the controller's
+          // own 20' 02 01 eight ms later. Forwarding a controller token
+          // therefore THROWS OUR CLAIM AWAY (the controller never hears it,
+          // re-walks 20 itself, adopts the pGD, drops us). Tokens ALWAYS
+          // return to their sender's side: controller tokens to 0x01 (the
+          // proven 21:21:05 join), member tokens to 0x01 as before.
           bool pgd_live = t_pgd_alive_us_ != 0 &&
                           static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull;
-          bool fwd = (rc_payload_[0] & 0x80) && pgd_live;
-          act.frame[0] = fwd ? 0x20 : 0x01;
-          // Honest skip (the pGD's own observed behavior, 2026-07-16 20:15:
-          // its onward frames cleared each silent member's presence bit,
-          // E0->A0->20): when we return the token with 32 unresolved-but-
-          // dead, CLEAR bit7 -- returning it intact leaves the controller
-          // with an unreconcilable "32 assumed alive but never walked" and
-          // it link-faults (the 2026-07-17 01:04 loop: the walk ends at our
-          // return, 0x20 is never offered, 2 s fault, FF-walk, forever).
-          if (!fwd)
+          act.frame[0] = 0x01;
+          // Honest skip stays, but ONLY for a liveness-DEAD 32 (its onward
+          // bit cleared, like the pGD's own skip frames E0->A0->20; the
+          // intact-return of a dead 32 was the 01:04 FF-walk loop). A LIVE
+          // 32 keeps its presence bit -- the controller walks it itself
+          // right after our return (observed 07:43:04.012).
+          if (!pgd_live)
             rc_payload_[0] = static_cast<uint8_t>(rc_payload_[0] & ~0x80);
           act.frame[1] = 0x02;
           act.frame[2] = ENROLL_ADDR;
