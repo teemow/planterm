@@ -86,6 +86,10 @@ struct NavMenu {
   int total;
   const char *const *labels;
   int n;
+  // The cursor wraps at the ends (Down from n lands on 1, Up from 1 on n);
+  // menu_select_in_ then takes the shortest modular path. Trailing member
+  // with a default: existing aggregate tables stay valid (no wrap).
+  bool wraps = false;
 };
 
 // Cursor position from the menu header (planscope menuCursor); 0 = not this
@@ -152,9 +156,14 @@ struct MacroStep {
 //   band_seek                    -> seek_selected_(arg, span)
 //   otherwise                    -> press key (0 = none), settle, verify exp
 // emit publishes the settled page after the move verifies; walk > 0 turns
-// the step into a fixed budget -- (press + verify + emit) repeated walk
-// times (e.g. a Down walk across pages whose numbering shifts with the
-// device state, so no page ID is a reliable endpoint).
+// the step into a budgeted walk -- (press + verify + emit) repeated up to
+// walk times (e.g. a Down walk across pages whose numbering shifts with
+// the device state, so no page ID is a reliable endpoint). An emitting
+// walk also wrap-stops: when the settled body repeats a view already seen
+// this walk (or the landing view), the walk ends early WITHOUT emitting,
+// so every distinct view is published exactly once per cycle; the budget
+// stays the safety cap (live-updating rows defeat the hash -- then the
+// walk just runs to budget as before).
 // pin != 0 marks a press step whose landing may be a password gate
 // (1 = PW1/service, 2 = PW2/manufacturer): after the press the gate gets
 // 1 s to show; an absent gate passes through, a visible one is typed with
@@ -211,6 +220,23 @@ class NavEngine {
     char p[FIELDS_PAGE_MAX];
     page_(p);
     return std::strcmp(p, id) == 0;
+  }
+
+  // FNV-1a over the body rows 1..7 (row 0 excluded: page headers lag the
+  // body repaint and renumber with the device state) -- the wrap-stop
+  // identity of a settled view. A separator byte per row keeps shifted row
+  // contents from hashing alike.
+  uint32_t body_hash_() const {
+    uint32_t h = 2166136261u;
+    for (int r = 1; r < static_cast<int>(SCR_ROWS); r++) {
+      for (const char *p = row_(r); *p != '\0'; p++) {
+        h ^= static_cast<uint8_t>(*p);
+        h *= 16777619u;
+      }
+      h ^= 0xFFu;  // row separator
+      h *= 16777619u;
+    }
+    return h;
   }
 
   // The step expectation check (shared by both machines' route runners).
@@ -339,11 +365,20 @@ class NavEngine {
           return Act::RUN;
         }
         int dir = menu_pos_ < menu_target_ ? 1 : -1;
-        const char *next = menu.labels[menu_pos_ + dir - 1];
+        if (menu.wraps) {  // shortest modular path (e.g. 8 -> 1 = one Down)
+          int fwd = (menu_target_ - menu_pos_ + menu.n) % menu.n;
+          dir = 2 * fwd <= menu.n ? 1 : -1;
+        }
+        int next_pos = menu_pos_ + dir;
+        if (next_pos > menu.n)
+          next_pos = 1;
+        else if (next_pos < 1)
+          next_pos = menu.n;
+        const char *next = menu.labels[next_pos - 1];
         Act a = step_(dir > 0 ? KEY_DOWN : KEY_UP,
                       [this, next] { return selected_(next); }, NAV_VERIFY_MS, now, false);
         if (a == Act::OK)
-          menu_pos_ += dir;
+          menu_pos_ = next_pos;
         else if (a == Act::FAIL) {
           mphase_ = 0;
           return Act::FAIL;
@@ -496,6 +531,16 @@ class PlanNav : public NavEngine {
   void set_emit(std::function<void()> f) { emit_ = std::move(f); }
   void set_interval_ms(uint32_t ms) { interval_ms_ = ms; }
 
+  // Swap the route table. Only while no cycle runs (mid-cycle the step index
+  // and the old table's lifetime are live); returns false when refused.
+  bool set_route(const ScrapeStep *route, size_t route_n) {
+    if (st_ != St::IDLE)
+      return false;
+    route_ = route;
+    route_n_ = route_n;
+    return true;
+  }
+
   // Start the scheduler; the first cycle runs at first_run_ms.
   void enable(uint32_t first_run_ms) {
     enabled_ = true;
@@ -581,20 +626,44 @@ class PlanNav : public NavEngine {
       ephase_ = 1;
     }
     // emitScrapePage: wait for the page to settle, then publish one snapshot.
+    // An emitting walk dedupes on the settled body: the seen-list seeds with
+    // the landing view's hash (the previous emit) and a repeated body ends
+    // the walk WITHOUT emitting -- every view published exactly once.
+    bool wrap_stop = false;
     if (s.emit) {
       if (step_(0, [] { return true; }, 0, now) != Act::OK)
         return;
-      if (emit_)
-        emit_();
+      uint32_t h = body_hash_();
+      if (s.walk > 1) {
+        if (walk_i_ == 0) {  // seed with the landing view
+          walk_seen_n_ = 0;
+          walk_seen_[walk_seen_n_++] = last_emit_hash_;
+        }
+        wrap_stop = walk_seen_has_(h);
+        if (!wrap_stop && walk_seen_n_ < WALK_SEEN_MAX)
+          walk_seen_[walk_seen_n_++] = h;
+      }
+      if (!wrap_stop) {
+        last_emit_hash_ = h;
+        if (emit_)
+          emit_();
+      }
     }
     ephase_ = 0;
     walk_i_++;
-    if (walk_i_ >= (s.walk == 0 ? 1 : static_cast<int>(s.walk))) {
+    if (wrap_stop || walk_i_ >= (s.walk == 0 ? 1 : static_cast<int>(s.walk))) {
       walk_i_ = 0;
       step_i_++;
       if (step_i_ >= route_n_)
         st_ = St::ANCHOR_END;
     }
+  }
+
+  bool walk_seen_has_(uint32_t h) const {
+    for (uint8_t i = 0; i < walk_seen_n_; i++)
+      if (walk_seen_[i] == h)
+        return true;
+    return false;
   }
 
   // A PIN-gated press step (pin != 0), mirroring PlanEdit's rphase_ 1/2/3:
@@ -645,6 +714,8 @@ class PlanNav : public NavEngine {
     ephase_ = 0;
     walk_i_ = 0;
     gphase_ = 0;
+    walk_seen_n_ = 0;
+    last_emit_hash_ = 0;  // no stale cross-cycle landing seed
   }
 
   void fail_(const char *what) {
@@ -690,6 +761,12 @@ class PlanNav : public NavEngine {
   uint8_t ephase_{0};  // 0 = the move, 1 = the emit
   int walk_i_{0};      // iterations done within a walk step
   uint8_t gphase_{0};  // gate_step_ sub-phase (pin != 0 steps)
+
+  // Wrap-stop dedupe state (new members at class END -- see W3 offset rule).
+  static constexpr uint8_t WALK_SEEN_MAX = 16;
+  uint32_t walk_seen_[WALK_SEEN_MAX]{};  // settled-body hashes this walk
+  uint8_t walk_seen_n_{0};
+  uint32_t last_emit_hash_{0};  // the last published view (a walk's landing)
 };
 
 }  // namespace plan

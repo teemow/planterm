@@ -2,11 +2,12 @@
 // fake heat pump (screens and key semantics per the reference device's
 // ground truth) driven purely through PlanNav's tick(), over a scrape route
 // expressed as pure ScrapeStep data -- the same shape a consumer supplies.
-// Asserts the full verified route (anchor -> alarm -> D01 -> fixed-budget
-// Down walk across the D pages -> service-menu seek -> D14 -> anchor), the
-// emitted page sequence including the scrolled last-page views, the
-// running-state D-list variant that sticks early, and the failure path
-// (recovery to the anchor + exponential backoff).
+// Asserts the full verified route (anchor -> alarm -> D01 -> budgeted Down
+// walk across the D pages with wrap-stop dedupe -> service-menu seek -> D14
+// -> anchor), the emitted page sequence including the scrolled last-page
+// views, the running-state D-list variant that sticks early, the wrap-stop
+// walk endings (wrapping / stalled / live-row lists), idle-only set_route,
+// and the failure path (recovery to the anchor + exponential backoff).
 //   c++ -std=c++17 test/test_plan_nav.cpp -o /tmp/t && /tmp/t
 
 #include "../src/plan_nav.h"
@@ -26,7 +27,10 @@ static const char *const MENU_LABELS[MENU_N] = {
     "A.On/Off Unit", "B.Setpoint", "C.Clock/Scheduler", "D.Input/Output",
     "E.Data logger", "F.Information", "G.Service", "H.Manufacturer",
 };
-static const NavMenu MAIN_MENU{"Main menu", 8, MENU_LABELS, MENU_N};
+static const NavMenu MAIN_MENU{"Main menu", 8, MENU_LABELS, MENU_N, false};
+// The real main-menu cursor wraps (07-03 transcript: Up from 1/8 -> 8/8);
+// a wraps menu def lets menu_select_in_ take the shortest modular path.
+static const NavMenu MAIN_MENU_W{"Main menu", 8, MENU_LABELS, MENU_N, true};
 
 // The D-walk is a fixed budget of Downs, NOT a walk to a target page ID:
 // the reference controller renumbers the D pages with the unit state, and
@@ -74,6 +78,23 @@ static const ScrapeStep PIN_ROUTE[] = {
 };
 static constexpr size_t PIN_ROUTE_N = sizeof(PIN_ROUTE) / sizeof(PIN_ROUTE[0]);
 
+// A minimal D-walk route for the wrap-stop tests: Prg -> select D -> D01
+// (emit, the walk's landing view) -> budgeted emitting Down walk.
+static const ScrapeStep DROUTE[] = {
+    {KEY_PRG, 0, false, NEXP_MENU, 0, nullptr, &MAIN_MENU, false, 0},
+    {0, 0, false, NEXP_NONE, 0, "D.Input/Output", &MAIN_MENU, false, 0},
+    {KEY_ENTER, 0, false, NEXP_PAGE, 0, "D01", nullptr, true, 0},
+    {KEY_DOWN, 0, false, NEXP_PAGE_GLOB, 0, "D##", nullptr, true, WALK_DOWNS},
+};
+static constexpr size_t DROUTE_N = sizeof(DROUTE) / sizeof(DROUTE[0]);
+
+// Wraps-select route: from the menu, pin the cursor onto the first entry.
+static const ScrapeStep WROUTE[] = {
+    {KEY_PRG, 0, false, NEXP_MENU, 0, nullptr, &MAIN_MENU_W, false, 0},
+    {0, 0, false, NEXP_NONE, 0, "A.On/Off Unit", &MAIN_MENU_W, false, 0},
+};
+static constexpr size_t WROUTE_N = sizeof(WROUTE) / sizeof(WROUTE[0]);
+
 // --- fake device --------------------------------------------------------------
 
 // PlanNav only READS a PlanScreen; the fake paints it directly through the
@@ -114,6 +135,10 @@ struct FakePump {
   int d10_scroll = 0;  // rows scrolled within the last D page (ID unchanged)
   int svc = 5;       // service sub-menu entry index (0-based)
   bool alarm_broken = false;  // failure-path test: Alarm key does nothing
+  bool d_wrap = false;   // Down past the last D page wraps to D01
+  bool d_stuck = false;  // Down on a D page does nothing (stalled list)
+  bool d_live = false;   // a D-page body row changes every repaint
+  int live_ = 0;
 
   // PW1 gate in front of e.Service settings (same live-recorded model as
   // test_plan_edit.cpp's fake: digit stages typed by Ups, Enters advance)
@@ -175,18 +200,22 @@ struct FakePump {
           page = MENU;  // lands at the LAST-USED cursor position
         break;
       case KEY_DOWN:
-        if (page == MENU && menu_cur < MENU_N)
-          menu_cur++;
+        if (page == MENU)  // the main-menu cursor wraps (07-03 transcript)
+          menu_cur = menu_cur == MENU_N ? 1 : menu_cur + 1;
+        else if (page == DPAGE && d_stuck)
+          ;  // stalled list: the key does nothing
         else if (page == DPAGE && dnum < d_max)
           dnum++;
+        else if (page == DPAGE && d_wrap)
+          dnum = 1, d10_scroll = 0;  // the list wraps back to the first page
         else if (page == DPAGE && d10_scroll < D10_N - 4)
           d10_scroll++;  // the last D page scrolls; the ID never advances
         else if (page == SERVICE && svc < SVC_N - 1)
           svc++;
         break;
       case KEY_UP:
-        if (page == MENU && menu_cur > 1)
-          menu_cur--;
+        if (page == MENU)
+          menu_cur = menu_cur == 1 ? MENU_N : menu_cur - 1;
         else if (page == SERVICE && svc > 0)
           svc--;
         break;
@@ -225,6 +254,14 @@ struct FakePump {
       case DPAGE:
         std::snprintf(buf, sizeof buf, " Input/Output      D%02d", dnum);
         scr.put_row(SCR_TERM_ESP, 0, buf, now);
+        // Each page's body is distinct (real D pages carry their own fields);
+        // the wrap-stop hash keys on the body, never the header.
+        std::snprintf(buf, sizeof buf, "Input %02d:        23.4", dnum);
+        scr.put_row(SCR_TERM_ESP, 2, buf, now);
+        if (d_live) {  // a live-updating row: repaints differ every press
+          std::snprintf(buf, sizeof buf, "Flow: %06d l/h", live_++);
+          scr.put_row(SCR_TERM_ESP, 5, buf, now);
+        }
         if (dnum == d_max) {  // a 4-row window over the scrolling output list
           scr.put_row(SCR_TERM_ESP, 1, "Digital outputs", now);
           const int rows[4] = {3, 4, 6, 7};
@@ -316,9 +353,10 @@ int main() {
       std::snprintf(b, sizeof b, "D%02d", d);
       want.push_back(b);
     }
-    // the budget's remaining Downs scroll within D10; the ID stays put
-    for (int i = 0; i < WALK_DOWNS - 9; i++)
-      want.push_back("D10");
+    // D10 scrolls once more (a new body view, emitted), then the next Down
+    // repeats the settled body and the walk wrap-stops WITHOUT emitting --
+    // the budget's remaining Downs are never pressed.
+    want.push_back("D10");
     want.push_back("D14");
     if (emitted != want) {
       std::printf("FAIL route: emitted");
@@ -350,8 +388,9 @@ int main() {
     nav.enable(now);
     run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
     assert(nav.fails() == 0);
-    // status + alarm + D landing + walk budget + D14
-    assert(emits == 4 + WALK_DOWNS);  // full route despite the short list
+    // status + alarm + D landing + D02..D06 + one D06 scroll view + D14:
+    // the wrap-stop ends the short list early instead of burning the budget
+    assert(emits == 4 + 6);  // full route despite the short list
     assert(pump.page == FakePump::STATUS);
   }
 
@@ -379,9 +418,106 @@ int main() {
     pump.alarm_broken = false;                          // device heals
     run_until(nav, now, [&] { return nav.cycles() == 3 && nav.idle(); });
     assert(nav.fails() == 0);                           // streak reset
-    // full route on the good cycle: status, alarm, the D01 landing + the
-    // walk budget's D views, D14
-    assert(emits == 1 + 1 + (4 + WALK_DOWNS));
+    // full route on the good cycle: status, alarm, the D01 landing, the
+    // walk's D02..D10 + one D10 scroll view (then wrap-stop), D14
+    assert(emits == 1 + 1 + 14);
+  }
+
+  {  // wrapping list: the walk lands back on the first page; the landing-view
+     // seed catches it and the walk ends early, every view emitted once
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.d_wrap = true;
+    pump.d_max = 3;
+    pump.paint(now);
+    PlanNav nav(pump.scr, DROUTE, DROUTE_N);
+    std::vector<std::string> emitted;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] {
+      const char *rows[FIELDS_ROWS];
+      for (size_t r = 0; r < FIELDS_ROWS; r++)
+        rows[r] = pump.scr.row(SCR_TERM_ESP, r);
+      char p[FIELDS_PAGE_MAX];
+      page_of(rows, p);
+      emitted.push_back(p);
+    });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    std::vector<std::string> want = {"D01", "D02", "D03"};
+    assert(emitted == want);  // D03's Down wraps to D01 = the seed: no re-emit
+    assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // stalled list: the first Down changes nothing; the settled body equals
+     // the landing seed and the walk stops with zero walk emits
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.d_stuck = true;
+    pump.paint(now);
+    PlanNav nav(pump.scr, DROUTE, DROUTE_N);
+    int emits = 0;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] { emits++; });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(emits == 1);  // only the D01 landing
+    assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // live-updating row: every repaint hashes differently, so the wrap-stop
+     // never fires and the budget stays the cap -- the walk runs in full
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.d_stuck = true;  // the page never advances...
+    pump.d_live = true;   // ...but a body row changes every press
+    pump.paint(now);
+    PlanNav nav(pump.scr, DROUTE, DROUTE_N);
+    int emits = 0;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] { emits++; });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(emits == 1 + WALK_DOWNS);  // landing + the full budget
+    assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // set_route: rejected while a cycle runs, applied while idle
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.paint(now);
+    PlanNav nav(pump.scr, ROUTE, ROUTE_N);
+    std::vector<std::string> emitted;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] {
+      const char *rows[FIELDS_ROWS];
+      for (size_t r = 0; r < FIELDS_ROWS; r++)
+        rows[r] = pump.scr.row(SCR_TERM_ESP, r);
+      char p[FIELDS_PAGE_MAX];
+      page_of(rows, p);
+      emitted.push_back(p);
+    });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    nav.tick(now, true);  // the cycle starts
+    assert(!nav.idle());
+    assert(!nav.set_route(DROUTE, DROUTE_N));  // mid-cycle: refused
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(emitted.front() == "status");  // cycle 1 still walked the old route
+    assert(nav.set_route(DROUTE, DROUTE_N));  // idle: accepted
+    emitted.clear();
+    run_until(nav, now, [&] { return nav.cycles() == 2 && nav.idle(); });
+    assert(nav.fails() == 0);
+    // the new route: D01 landing + D02..D10 + one D10 scroll view, no
+    // status/alarm/D14 steps anywhere
+    assert(emitted.size() == 11 && emitted.front() == "D01");
+    for (auto &e : emitted)
+      assert(e[0] == 'D');
   }
 
   {  // PIN-gated step: the gate gets exactly the live-recorded 0815 key
@@ -471,6 +607,29 @@ int main() {
       assert(k == KEY_ESC);
     assert(pump.page == FakePump::STATUS);        // recovery reached the anchor
     assert(nav.next_run_ms() == now + 2 * 60000); // backoff doubled
+  }
+
+  {  // wraps-select takes the shortest modular path: cursor on H (8/8),
+     // target A -> one wrapping Down instead of seven Ups
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.menu_cur = MENU_N;  // last-used position: the bottom entry
+    pump.paint(now);
+    PlanNav nav(pump.scr, WROUTE, WROUTE_N);
+    int downs = 0, ups = 0;
+    nav.set_press([&](uint8_t k) {
+      if (k == KEY_DOWN)
+        downs++;
+      else if (k == KEY_UP)
+        ups++;
+      pump.press(k, now);
+    });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(downs == 1 && ups == 0);  // 8 -> 1 in a single wrapping Down
+    assert(pump.page == FakePump::STATUS);
   }
 
   {  // no cycle starts while not enrolled
