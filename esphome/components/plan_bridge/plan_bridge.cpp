@@ -24,8 +24,9 @@ static const char *const TAG = "plan_bridge";
 
 // TxAction::Kind names for the tx diag lines (order matches the enum).
 static const char *txkind_name(uint8_t k) {
-  static const char *const NAMES[] = {"none", "rollcall",     "session_ack", "ident",
-                                      "link", "key",          "burst_report", "race_key"};
+  static const char *const NAMES[] = {"none", "rollcall",     "session_ack",  "ident",
+                                      "link", "key",          "burst_report", "race_key",
+                                      "fwd_poll"};
   return k < sizeof(NAMES) / sizeof(NAMES[0]) ? NAMES[k] : "?";
 }
 
@@ -321,12 +322,14 @@ void PlanBridge::task_main() {
       if (term_.enroll_ || term_.enroll_replies_ > 0)
         capture_diag_(plan::CAP_DIAG_INFO,
                       "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "
-                      "%u ident replies, %u acks withheld (cksum fail)",
+                      "%u ident replies, %u acks withheld (cksum fail), fwd=%d ok=%u fail=%u",
                       plan::ENROLL_ADDR, static_cast<unsigned>(term_.enroll_replies_),
                       static_cast<unsigned>(term_.enroll_polls_),
                       static_cast<unsigned>(term_.session_acks_),
                       static_cast<unsigned>(term_.ident_replies_),
-                      static_cast<unsigned>(term_.ack_ck_fail_));
+                      static_cast<unsigned>(term_.ack_ck_fail_),
+                      static_cast<int>(term_.fwd_polls_), static_cast<unsigned>(term_.fwd_ok_),
+                      static_cast<unsigned>(term_.fwd_fail_));
       if (term_.gap_n_ > 0) {
         char buf[160];
         int p = 0;

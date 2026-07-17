@@ -101,6 +101,59 @@ int main() {
     assert(bus.term.txlog_[1].kind == TxAction::RACE_KEY_REPLY);
   }
 
+  // --- poll-token chain forwarding (dual-terminal, heatpump-firmware#14) ---
+  {
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+    bus.term.fwd_polls_ = 1;
+
+    // pGD not live yet: polls get the normal link reply, no forward.
+    Bytes r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);
+
+    // Arm the liveness probe: a pGD session ack (01' 03 20 DB) + a closing
+    // address byte (frame classification happens on the next bit9 byte).
+    bus.feed({{0x01, 1}, {0x03, 0}, {0x20, 0}, {0xDB, 0}});
+    bus.feed(ctl.emit_ack());
+
+    // Now the poll token is handed on to the pGD: 20' 01 1F BF.
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4);
+    assert(r[0].v == 0x20 && r[0].bit9 == 1 && r[1].v == 0x01 && r[2].v == ENROLL_ADDR);
+    assert(r[3].v == static_cast<uint8_t>(0xFF - 0x20 - 0x01 - ENROLL_ADDR));
+
+    // Completion variant (a): the pGD mirrors the original poll to 0x01.
+    bus.feed({{0x01, 1},
+              {0x01, 0},
+              {ENROLL_ADDR, 0},
+              {static_cast<uint8_t>(0xFF - 0x01 - 0x01 - ENROLL_ADDR), 0}});
+    assert(bus.term.fwd_ok_ == 1);
+
+    // Forward again; no completion this time -> the controller re-polls and
+    // gets the normal link reply; the failure backs forwarding off.
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r[0].v == 0x20);  // forwarded
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);  // normal reply
+    assert(bus.term.fwd_fail_ == 1);
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r[0].v == 0x01);  // still backing off
+
+    // Backoff expires -> forwards resume; completion variant (b): the pGD
+    // returns the token to US (1F' 01 20 CK) and we produce the controller's
+    // completion, the mirror of its original poll.
+    bus.now += 2'000'000;
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r[0].v == 0x20);  // forwarded
+    r = bus.feed({{ENROLL_ADDR, 1},
+                  {0x01, 0},
+                  {0x20, 0},
+                  {static_cast<uint8_t>(0xFF - ENROLL_ADDR - 0x01 - 0x20), 0}});
+    assert(r.size() == 4 && r[0].v == 0x01 && r[1].v == 0x01 && r[2].v == ENROLL_ADDR);
+    assert(bus.term.fwd_ok_ == 2);
+  }
+
   // --- enrollment, link maintenance, key injection, session ack ---
   {
     Bus bus;
