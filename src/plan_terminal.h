@@ -101,6 +101,7 @@ struct TxAction {
     ENROLL_KEY_REPLY,  // enrollment: keypad report + link reply in our slot
     AFTER_BURST_REPORT,// tx_mode 1: standalone report after the pGD's burst
     RACE_KEY_REPLY,    // tx_mode 0: race the pGD for the 0x20 response slot
+    FORWARD_POLL,      // dual-terminal: hand our poll token on to the pGD@32
   };
   Kind kind;
   uint8_t len;
@@ -258,6 +259,20 @@ class PlanTerminal {
     isr_win_[2] = isr_win_[3];
     isr_win_[3] = isr_win_[4];
     isr_win_[4] = b;
+
+    // Poll-chain completion, variant (a): after our FORWARD_POLL, the pGD
+    // completes the cycle straight to the controller with the mirror of the
+    // ORIGINAL poll (01' 01 1F DE -- from = the focus, not the responder;
+    // the 00:04 dual-poll storm was our from-31 reply to the pGD@1E's
+    // forwarded token being re-poll-rejected every cycle). Byte-pattern
+    // match like the other window matchers; only armed for the ~one poll
+    // cycle after a forward, so paint-data false positives are irrelevant.
+    if (fwd_awaiting_ && isr_win_[1] == 0x01 && isr_win_[2] == 0x01 &&
+        isr_win_[3] == ENROLL_ADDR &&
+        isr_win_[4] == static_cast<uint8_t>(0xFF - 0x01 - 0x01 - ENROLL_ADDR)) {
+      fwd_awaiting_ = false;
+      fwd_ok_ = fwd_ok_ + 1;
+    }
 
     // Link-reset detector: the first frame of the controller's recovery walk
     // is SS' 02 01 FF FF FF FF 00 00 00 00 CC. Eight bytes of context make a
@@ -477,7 +492,41 @@ class PlanTerminal {
       // the token left the pGD without closure (0 replies from it) and the
       // controller re-polled instantly -- a ~500 frames/s storm; the cycle
       // ran but never completed.
-      const uint8_t ret = isr_win_[3];
+      // Chain DIRECTION (2026-07-17): a token from BELOW us is the outbound
+      // leg (the focus forwarding upward, 1F' 01 1E C1) -- return to the
+      // forwarder. A token from ABOVE us (0x20 answering OUR forward) is
+      // the RETURN leg -- produce the controller's completion, the mirror
+      // of its original poll (from = the focus = us).
+      const uint8_t from = isr_win_[3];
+      const uint8_t ret = (from > ENROLL_ADDR) ? 0x01 : from;
+      if (from == 0x01) {
+        if (fwd_awaiting_) {
+          // Our forward never completed and the controller re-polls us
+          // directly: count it, back off, answer this one normally.
+          fwd_awaiting_ = false;
+          fwd_fail_ = fwd_fail_ + 1;
+          fwd_backoff_until_us_ = now_us + 1'000'000;
+        } else if (fwd_polls_ != 0 && !tx_pending_ && now_us >= fwd_backoff_until_us_ &&
+                   t_pgd_alive_us_ != 0 &&
+                   static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull) {
+          // Dual-terminal poll chaining: hand the poll token on to the live
+          // pGD@32 exactly the way the pGD@1E handed it to us (21:21:17.709
+          // `1F' 01 1E C1`). tx_sent arms fwd_awaiting_; the completion is
+          // either the pGD's direct mirror to 0x01 (window matcher above)
+          // or its return to us (from > ENROLL_ADDR path here).
+          act.kind = TxAction::FORWARD_POLL;
+          act.len = 4;
+          act.frame[0] = 0x20;
+          act.frame[1] = 0x01;
+          act.frame[2] = ENROLL_ADDR;
+          act.frame[3] = static_cast<uint8_t>(0xFF - 0x20 - 0x01 - ENROLL_ADDR);
+          act.bit9_mask = 0x01;
+          return act;
+        }
+      } else if (from > ENROLL_ADDR && fwd_awaiting_) {
+        fwd_awaiting_ = false;
+        fwd_ok_ = fwd_ok_ + 1;  // completion variant (b): returned via us
+      }
       const uint8_t lr[4] = {ret, 0x01, ENROLL_ADDR,
                              static_cast<uint8_t>(0xFF - ret - 0x01 - ENROLL_ADDR)};
       if (tx_pending_ && tx_mode_ == 2) {
@@ -591,6 +640,9 @@ class PlanTerminal {
         tx_done_us_ = now_us;
         tx_fired_ = true;
         break;
+      case TxAction::FORWARD_POLL:
+        fwd_awaiting_ = true;  // completion tracked by the window matcher
+        break;
       default:
         break;
     }
@@ -666,6 +718,19 @@ class PlanTerminal {
       e.frame[i] = act.frame[i];
     txlog_w_ = txlog_w_ + 1;  // publish last
   }
+
+  // --- poll-token chain forwarding (heatpump-firmware#14, dual-terminal) ---
+  // When WE hold the poll focus, hand the poll token on to the live pGD@32
+  // the way the pGD did for us. OFF by default (one experiment at a time);
+  // runtime-switched via the set_poll_fwd service.
+ public:
+  volatile int fwd_polls_{0};
+  volatile uint32_t fwd_ok_{0};    // forwards that saw a completion
+  volatile uint32_t fwd_fail_{0};  // forwards the controller had to re-poll past
+
+ protected:
+  volatile bool fwd_awaiting_{false};    // forward sent, completion not yet heard
+  volatile int64_t fwd_backoff_until_us_{0};  // no forwards until then after a fail
 };
 
 }  // namespace plan

@@ -115,6 +115,9 @@ class PlanBridge : public Component {
   // 1 = send the 7-byte keypad report after the pGD's own poll exchange,
   // 2 = inject in our enrolled terminal's poll slot (needs enroll).
   void set_tx_mode(int m) { term_.tx_mode_ = m; }
+  // Dual-terminal poll chaining (heatpump-firmware#14): forward our poll
+  // token to the live pGD@32. Default off; flip per experiment.
+  void set_poll_fwd(bool e) { term_.fwd_polls_ = e ? 1 : 0; }
   // The PLANCAP PSK (raw 32 bytes, from base64 in YAML -- on ESPHome devices
   // codegen defaults it to api.encryption.key). Called by codegen only when
   // a key is configured (which also sets the PLAN_CAP_NOISE build flag);
