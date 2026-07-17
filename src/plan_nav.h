@@ -226,11 +226,22 @@ class NavEngine {
   // body repaint and renumber with the device state) -- the wrap-stop
   // identity of a settled view. A separator byte per row keeps shifted row
   // contents from hashing alike.
+  //
+  // Digits are normalized to one fixed byte before hashing: page identity on
+  // this device is the LABEL structure. Live numeric values (temperatures,
+  // flows, counters) drift between walk passes -- hashing them verbatim made
+  // a wrapped page never repeat, so the walk ran its full budget and emitted
+  // every page twice (seen live: 25.0 -> 25.1 between D-list passes). Labels
+  // repeat exactly on wrap; everything non-digit ('.', '-', degree signs,
+  // spacing) stays literal so layout still matters.
   uint32_t body_hash_() const {
     uint32_t h = 2166136261u;
     for (int r = 1; r < static_cast<int>(SCR_ROWS); r++) {
       for (const char *p = row_(r); *p != '\0'; p++) {
-        h ^= static_cast<uint8_t>(*p);
+        uint8_t c = static_cast<uint8_t>(*p);
+        if (c >= '0' && c <= '9')
+          c = '#';  // any digit hashes alike (volatile-value normalization)
+        h ^= c;
         h *= 16777619u;
       }
       h ^= 0xFFu;  // row separator

@@ -6,7 +6,8 @@
 // walk across the D pages with wrap-stop dedupe -> service-menu seek -> D14
 // -> anchor), the emitted page sequence including the scrolled last-page
 // views, the running-state D-list variant that sticks early, the wrap-stop
-// walk endings (wrapping / stalled / live-row lists), idle-only set_route,
+// walk endings (wrapping / stalled / drifting-value / toggling-text lists,
+// digit-normalized so live values never defeat the wrap), idle-only set_route,
 // and the failure path (recovery to the anchor + exponential backoff).
 //   c++ -std=c++17 test/test_plan_nav.cpp -o /tmp/t && /tmp/t
 
@@ -137,7 +138,8 @@ struct FakePump {
   bool alarm_broken = false;  // failure-path test: Alarm key does nothing
   bool d_wrap = false;   // Down past the last D page wraps to D01
   bool d_stuck = false;  // Down on a D page does nothing (stalled list)
-  bool d_live = false;   // a D-page body row changes every repaint
+  bool d_live = false;   // a D-page body row carries a live value (digits drift)
+  bool d_toggle = false; // a D-page body row changes TEXT (non-digit change)
   int live_ = 0;
 
   // PW1 gate in front of e.Service settings (same live-recorded model as
@@ -254,13 +256,18 @@ struct FakePump {
       case DPAGE:
         std::snprintf(buf, sizeof buf, " Input/Output      D%02d", dnum);
         scr.put_row(SCR_TERM_ESP, 0, buf, now);
-        // Each page's body is distinct (real D pages carry their own fields);
-        // the wrap-stop hash keys on the body, never the header.
-        std::snprintf(buf, sizeof buf, "Input %02d:        23.4", dnum);
+        // Each page's body is LABEL-distinct (real D pages carry their own
+        // field labels); the wrap-stop hash keys on the labels, never the
+        // header and never the digits -- values drift between passes.
+        std::snprintf(buf, sizeof buf, "Input %c :        23.4", 'A' + dnum - 1);
         scr.put_row(SCR_TERM_ESP, 2, buf, now);
-        if (d_live) {  // a live-updating row: repaints differ every press
+        if (d_live) {  // a live value: only the DIGITS drift between repaints
           std::snprintf(buf, sizeof buf, "Flow: %06d l/h", live_++);
           scr.put_row(SCR_TERM_ESP, 5, buf, now);
+        }
+        if (d_toggle) {  // a non-digit change: the labels genuinely differ
+          std::snprintf(buf, sizeof buf, "Mode:            %c", 'A' + live_++ % 26);
+          scr.put_row(SCR_TERM_ESP, 6, buf, now);
         }
         if (dnum == d_max) {  // a 4-row window over the scrolling output list
           scr.put_row(SCR_TERM_ESP, 1, "Digital outputs", now);
@@ -468,12 +475,65 @@ int main() {
     assert(pump.page == FakePump::STATUS);
   }
 
-  {  // live-updating row: every repaint hashes differently, so the wrap-stop
-     // never fires and the budget stays the cap -- the walk runs in full
+  {  // wrapping list with LIVE values: the real D pages carry temperatures
+     // that drift between passes (25.0 -> 25.1), so a verbatim body hash
+     // never repeated and the walk emitted every page twice. The digit-
+     // normalized hash keys on the labels: the wrap back to the first page
+     // matches the landing seed despite the drifted value, and every page
+     // is emitted exactly once.
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.d_wrap = true;
+    pump.d_max = 3;
+    pump.d_live = true;  // every repaint shows a new numeric value
+    pump.paint(now);
+    PlanNav nav(pump.scr, DROUTE, DROUTE_N);
+    std::vector<std::string> emitted;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] {
+      const char *rows[FIELDS_ROWS];
+      for (size_t r = 0; r < FIELDS_ROWS; r++)
+        rows[r] = pump.scr.row(SCR_TERM_ESP, r);
+      char p[FIELDS_PAGE_MAX];
+      page_of(rows, p);
+      emitted.push_back(p);
+    });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    std::vector<std::string> want = {"D01", "D02", "D03"};
+    assert(emitted == want);  // each page exactly once despite drifting values
+    assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // stalled list with a live value: only the digits change between
+     // repaints, so the settled body still matches the landing seed and the
+     // walk stops with zero walk emits (a drifting value is not a new page)
     uint32_t now = 1000;
     FakePump pump;
     pump.d_stuck = true;  // the page never advances...
-    pump.d_live = true;   // ...but a body row changes every press
+    pump.d_live = true;   // ...but a value on it drifts every press
+    pump.paint(now);
+    PlanNav nav(pump.scr, DROUTE, DROUTE_N);
+    int emits = 0;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_emit([&] { emits++; });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(emits == 1);  // only the D01 landing
+    assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // non-digit live row: a body row whose TEXT changes every repaint is a
+     // genuinely new view (labels/layout changed), so the wrap-stop never
+     // fires and the budget stays the cap -- the walk runs in full
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.d_stuck = true;   // the page never advances...
+    pump.d_toggle = true;  // ...but a body row's text changes every press
     pump.paint(now);
     PlanNav nav(pump.scr, DROUTE, DROUTE_N);
     int emits = 0;
