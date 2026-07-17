@@ -295,6 +295,8 @@ class PlanBridge : public Component {
   std::vector<uint8_t> cap_rec_;  // scratch: one plaintext record being built
   std::array<uint8_t, 32> cap_psk_{};
   bool cap_has_psk_{false};
+  // Reader index into term_.txlog_ (bus task only); see task_main's drain.
+  uint32_t txlog_r_{0};
 };
 
 }  // namespace plan_bridge

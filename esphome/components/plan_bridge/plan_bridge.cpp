@@ -22,6 +22,13 @@ namespace plan_bridge {
 
 static const char *const TAG = "plan_bridge";
 
+// TxAction::Kind names for the tx diag lines (order matches the enum).
+static const char *txkind_name(uint8_t k) {
+  static const char *const NAMES[] = {"none", "rollcall",     "session_ack", "ident",
+                                      "link", "key",          "burst_report", "race_key"};
+  return k < sizeof(NAMES) / sizeof(NAMES[0]) ? NAMES[k] : "?";
+}
+
 // Depth of the pending-key-press queue. A human pressing menu buttons never
 // outruns this; extra presses are dropped rather than queued unboundedly.
 static const int QUEUE_DEPTH = 8;
@@ -329,6 +336,31 @@ void PlanBridge::task_main() {
         capture_diag_(plan::CAP_DIAG_DEBUG, "pGD turnaround (us, last %u): %s",
                       static_cast<unsigned>(n), buf);
       }
+    }
+
+    // TX visibility (heatpump-firmware#14 T1b): drain the ISR's transmit log
+    // into diag records. The RX-only capture never sees our own frames
+    // (DE/RE tied), so this is the only record of what we put on the wire --
+    // including actions we DECIDED but skipped (stale slot). DEBUG severity:
+    // lands in every PLANCAP client, stays off the serial log at the default
+    // level (an enrolled, focused terminal answers ~40 polls/s).
+    while (txlog_r_ != term_.txlog_w_) {
+      if (term_.txlog_w_ - txlog_r_ > plan::PlanTerminal::TXLOG_N) {
+        capture_diag_(plan::CAP_DIAG_WARNING, "txlog: %u entries overwritten",
+                      static_cast<unsigned>(term_.txlog_w_ - txlog_r_ - plan::PlanTerminal::TXLOG_N));
+        txlog_r_ = term_.txlog_w_ - plan::PlanTerminal::TXLOG_N;
+      }
+      plan::PlanTerminal::TxLog e = term_.txlog_[txlog_r_ & (plan::PlanTerminal::TXLOG_N - 1)];
+      if (term_.txlog_w_ - txlog_r_ > plan::PlanTerminal::TXLOG_N)
+        continue;  // writer lapped us mid-copy; the clamp above resyncs
+      txlog_r_++;
+      char hex[sizeof(e.frame) * 4 + 1];
+      int p = 0;
+      for (uint8_t i = 0; i < e.len && i < sizeof(e.frame); i++)
+        p += snprintf(hex + p, sizeof(hex) - static_cast<size_t>(p), "%02X%s ", e.frame[i],
+                      ((e.bit9 >> i) & 1) ? "'" : "");
+      capture_diag_(plan::CAP_DIAG_DEBUG, "tx %s %s @%lluus: %s", e.sent ? "sent" : "skip",
+                    txkind_name(e.kind), static_cast<unsigned long long>(e.us), hex);
     }
 
     capture_poll_();
