@@ -260,16 +260,18 @@ class PlanTerminal {
     isr_win_[3] = isr_win_[4];
     isr_win_[4] = b;
 
-    // Poll-chain completion, variant (a): after our FORWARD_POLL, the pGD
-    // completes the cycle straight to the controller with the mirror of the
-    // ORIGINAL poll (01' 01 1F DE -- from = the focus, not the responder;
-    // the 00:04 dual-poll storm was our from-31 reply to the pGD@1E's
-    // forwarded token being re-poll-rejected every cycle). Byte-pattern
-    // match like the other window matchers; only armed for the ~one poll
-    // cycle after a forward, so paint-data false positives are irrelevant.
+    // Poll-chain completion: after our FORWARD_POLL, the pGD answers the
+    // token AS ITSELF -- 01' 01 20 DD, the mirror of a poll to 20, exactly
+    // as if the controller had polled it directly (live 09:37:17-09:39:00,
+    // 89 forwards -> 89 replies, zero faults; fwd-experiment-0937.txt).
+    // The mirror-of-original variant (01' 01 1F DE) is kept accepted too.
+    // Byte-pattern match like the other window matchers; only armed for the
+    // ~one poll cycle after a forward, so paint-data false positives are
+    // irrelevant.
     if (fwd_awaiting_ && isr_win_[1] == 0x01 && isr_win_[2] == 0x01 &&
-        isr_win_[3] == ENROLL_ADDR &&
-        isr_win_[4] == static_cast<uint8_t>(0xFF - 0x01 - 0x01 - ENROLL_ADDR)) {
+        ((isr_win_[3] == 0x20 && isr_win_[4] == 0xDD) ||
+         (isr_win_[3] == ENROLL_ADDR &&
+          isr_win_[4] == static_cast<uint8_t>(0xFF - 0x01 - 0x01 - ENROLL_ADDR)))) {
       fwd_awaiting_ = false;
       fwd_ok_ = fwd_ok_ + 1;
     }
@@ -506,14 +508,16 @@ class PlanTerminal {
           fwd_awaiting_ = false;
           fwd_fail_ = fwd_fail_ + 1;
           fwd_backoff_until_us_ = now_us + 1'000'000;
-        } else if (fwd_polls_ != 0 && !tx_pending_ && now_us >= fwd_backoff_until_us_ &&
-                   t_pgd_alive_us_ != 0 &&
+        } else if (fwd_polls_ != 0 && !fwd_just_ && !tx_pending_ &&
+                   now_us >= fwd_backoff_until_us_ && t_pgd_alive_us_ != 0 &&
                    static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull) {
-          // Dual-terminal poll chaining: hand the poll token on to the live
-          // pGD@32 exactly the way the pGD@1E handed it to us (21:21:17.709
-          // `1F' 01 1E C1`). tx_sent arms fwd_awaiting_; the completion is
-          // either the pGD's direct mirror to 0x01 (window matcher above)
-          // or its return to us (from > ENROLL_ADDR path here).
+          // ALTERNATE, never forward twice in a row: the controller wants
+          // OUR reply for its poll regardless -- after the pGD answers the
+          // forwarded token it re-polls us within ~3.5 ms, and that one is
+          // ours to answer directly. Forwarding the re-poll too is the
+          // 00:04 ~500 f/s storm (the pGD-as-focus made exactly that
+          // mistake toward us). One forward, one direct reply, repeat:
+          // both terminals answer every ~28 ms macro-cycle.
           act.kind = TxAction::FORWARD_POLL;
           act.len = 4;
           act.frame[0] = 0x20;
@@ -527,6 +531,8 @@ class PlanTerminal {
         fwd_awaiting_ = false;
         fwd_ok_ = fwd_ok_ + 1;  // completion variant (b): returned via us
       }
+      if (from == 0x01)
+        fwd_just_ = false;  // a direct reply re-arms the forward alternation
       const uint8_t lr[4] = {ret, 0x01, ENROLL_ADDR,
                              static_cast<uint8_t>(0xFF - ret - 0x01 - ENROLL_ADDR)};
       if (tx_pending_ && tx_mode_ == 2) {
@@ -642,6 +648,7 @@ class PlanTerminal {
         break;
       case TxAction::FORWARD_POLL:
         fwd_awaiting_ = true;  // completion tracked by the window matcher
+        fwd_just_ = true;      // next direct poll is ours to answer
         break;
       default:
         break;
@@ -731,6 +738,7 @@ class PlanTerminal {
  protected:
   volatile bool fwd_awaiting_{false};    // forward sent, completion not yet heard
   volatile int64_t fwd_backoff_until_us_{0};  // no forwards until then after a fail
+  volatile bool fwd_just_{false};        // last poll was forwarded: alternate
 };
 
 }  // namespace plan

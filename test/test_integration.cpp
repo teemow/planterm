@@ -123,17 +123,20 @@ int main() {
     assert(r[0].v == 0x20 && r[0].bit9 == 1 && r[1].v == 0x01 && r[2].v == ENROLL_ADDR);
     assert(r[3].v == static_cast<uint8_t>(0xFF - 0x20 - 0x01 - ENROLL_ADDR));
 
-    // Completion variant (a): the pGD mirrors the original poll to 0x01.
-    bus.feed({{0x01, 1},
-              {0x01, 0},
-              {ENROLL_ADDR, 0},
-              {static_cast<uint8_t>(0xFF - 0x01 - 0x01 - ENROLL_ADDR), 0}});
+    // Completion: the pGD answers the token as itself (01' 01 20 DD -- the
+    // live-verified variant, fwd-experiment-0937.txt).
+    bus.feed({{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}});
     assert(bus.term.fwd_ok_ == 1);
 
-    // Forward again; no completion this time -> the controller re-polls and
-    // gets the normal link reply; the failure backs forwarding off.
+    // Alternation: the controller re-polls right after the pGD's reply and
+    // that one is ours to answer directly -- never two forwards in a row.
     r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
-    assert(r[0].v == 0x20);  // forwarded
+    assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);  // direct
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r[0].v == 0x20);  // forwarded again
+
+    // No completion this time -> the re-poll gets the normal link reply and
+    // the failure backs forwarding off for 1 s.
     r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
     assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);  // normal reply
     assert(bus.term.fwd_fail_ == 1);
