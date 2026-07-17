@@ -328,6 +328,20 @@ inline void page_of(const char *const rows[FIELDS_ROWS], char *out) {
     fx_copy(last, last + lastn, out, FIELDS_PAGE_MAX);
     return;
   }
+  // Glued headers: a long page title can consume the gap before the ID
+  // cell (" Compressor conf.H1a05", live 2026-07-17 -- the token is
+  // "conf.H1a05"), so fall back to the longest valid page-ID SUFFIX of
+  // the last token. Only tokens longer than an ID qualify: short invalid
+  // tokens must not donate accidental tails.
+  if (last != nullptr && lastn > 5) {
+    for (size_t k = 5; k >= 3; k--) {
+      const char *suf = last + lastn - k;
+      if (fx_page_id(suf, k)) {
+        fx_copy(suf, suf + k, out, FIELDS_PAGE_MAX);
+        return;
+      }
+    }
+  }
   if (fx_clock(r0)) {
     std::strcpy(out, "status");
     return;
