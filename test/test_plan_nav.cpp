@@ -296,6 +296,86 @@ struct FakePump {
   }
 };
 
+// A circular 3-entry cursor menu, modeled on the reference app's Power+ /
+// EVO config menus (live 2026-07-17): NO "header N/total" row, the window
+// renders prev/current/next with the CURRENT entry always on the middle
+// row (5), and the cursor is REMEMBERED across exits. The only text truth
+// for the cursor is that middle row -- the seek-press step's target.
+struct CircPump {
+  TestScreen scr;
+  enum P { STATUS, CMENU, SECTION } page = STATUS;
+  int cur = 1;         // remembered cursor (0 = a, 1 = b, 2 = c)
+  int enters_wrong = 0;
+  static constexpr const char *LABELS[3] = {"a.Configuration", "b.Regulation", "c.Custom"};
+
+  void press(uint8_t k, uint32_t now) {
+    switch (k) {
+      case KEY_ESC:
+        if (page == SECTION)
+          page = CMENU;
+        else
+          page = STATUS;
+        break;
+      case KEY_PRG:
+        if (page == STATUS)
+          page = CMENU;  // straight in; the cursor is wherever it was left
+        break;
+      case KEY_DOWN:
+        if (page == CMENU)
+          cur = (cur + 1) % 3;
+        break;
+      case KEY_ENTER:
+        if (page == CMENU) {
+          if (cur == 0)
+            page = SECTION;
+          else
+            enters_wrong++;  // an Enter on the wrong entry must never fire
+        }
+        break;
+    }
+    paint(now);
+  }
+  void paint(uint32_t now) {
+    scr.clear_(SCR_TERM_ESP, now);
+    switch (page) {
+      case STATUS:
+        scr.put_row(SCR_TERM_ESP, 0, "02:18 03/07/26 Ekobee1", now);
+        break;
+      case CMENU:
+        scr.put_row(SCR_TERM_ESP, 0, "P.Plus Menu' config", now);
+        scr.put_row(SCR_TERM_ESP, 3, LABELS[(cur + 2) % 3], now);
+        scr.put_row(SCR_TERM_ESP, 5, LABELS[cur], now);
+        scr.put_row(SCR_TERM_ESP, 7, LABELS[(cur + 1) % 3], now);
+        break;
+      case SECTION:
+        // exercises the digit-middle page-ID family (H1a01) end to end
+        scr.put_row(SCR_TERM_ESP, 0, " Power+ Config   H1a01", now);
+        scr.put_row(SCR_TERM_ESP, 2, "Motor Type:CUSTOM", now);
+        break;
+    }
+  }
+};
+constexpr const char *CircPump::LABELS[3];
+
+// Seek-press route: into the circular menu, press Down until the target
+// label is the middle row (0 presses when the remembered cursor already
+// sits there), then a verified Enter onto the section's landing page.
+static const ScrapeStep SEEK_ROUTE[] = {
+    {KEY_PRG, 0, false, NEXP_ROW_PREFIX, 0, "P.Plus Menu' config", nullptr, false, 0},
+    {KEY_DOWN, 3, false, NEXP_ROW_PREFIX, 5, "a.Configuration", nullptr, false, 0},
+    {KEY_ENTER, 0, false, NEXP_PAGE, 0, "H1a01", nullptr, true, 0},
+};
+static constexpr size_t SEEK_ROUTE_N = sizeof(SEEK_ROUTE) / sizeof(SEEK_ROUTE[0]);
+
+// Same route at a label the menu never shows: the seek must exhaust its
+// budget and FAIL the cycle (never a blind Enter).
+static const ScrapeStep SEEK_MISS_ROUTE[] = {
+    {KEY_PRG, 0, false, NEXP_ROW_PREFIX, 0, "P.Plus Menu' config", nullptr, false, 0},
+    {KEY_DOWN, 3, false, NEXP_ROW_PREFIX, 5, "d.Nope", nullptr, false, 0},
+    {KEY_ENTER, 0, false, NEXP_PAGE, 0, "H1a01", nullptr, true, 0},
+};
+static constexpr size_t SEEK_MISS_ROUTE_N = sizeof(SEEK_MISS_ROUTE) / sizeof(SEEK_MISS_ROUTE[0]);
+
 // Step simulated time in 50 ms ticks until the predicate holds (bounded).
 template<typename Pred>
 static void run_until(PlanNav &nav, uint32_t &now, Pred done) {
@@ -690,6 +770,69 @@ int main() {
     assert(nav.fails() == 0);
     assert(downs == 1 && ups == 0);  // 8 -> 1 in a single wrapping Down
     assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // seek-press: cursor remembered off-target -> exactly the modular
+     // number of Downs, verified landing; next cycle finds the cursor
+     // already on the target -> zero presses
+    uint32_t now = 1000;
+    CircPump pump;
+    pump.cur = 1;  // b is current: a is 2 Downs away (circular)
+    pump.paint(now);
+    PlanNav nav(pump.scr, SEEK_ROUTE, SEEK_ROUTE_N);
+    int downs = 0;
+    std::vector<std::string> emitted;
+    nav.set_press([&](uint8_t k) {
+      if (k == KEY_DOWN)
+        downs++;
+      pump.press(k, now);
+    });
+    nav.set_emit([&] {
+      const char *rows[FIELDS_ROWS];
+      for (size_t r = 0; r < FIELDS_ROWS; r++)
+        rows[r] = pump.scr.row(SCR_TERM_ESP, r);
+      char p[FIELDS_PAGE_MAX];
+      page_of(rows, p);
+      emitted.push_back(p);
+    });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(downs == 2);
+    assert(pump.enters_wrong == 0);
+    assert(emitted == std::vector<std::string>{"H1a01"});  // digit-middle page ID
+    assert(pump.page == CircPump::STATUS);
+
+    // cycle 2: the menu remembered the cursor on a -> a zero-press hit
+    run_until(nav, now, [&] { return nav.cycles() == 2 && nav.idle(); });
+    assert(nav.fails() == 0);
+    assert(downs == 2);  // no further Down needed
+    assert(pump.enters_wrong == 0);
+  }
+
+  {  // seek-press miss: the label never shows -> budget exhausted, cycle
+     // FAILs and recovers to the anchor; the Enter never fires
+    uint32_t now = 1000;
+    CircPump pump;
+    pump.paint(now);
+    PlanNav nav(pump.scr, SEEK_MISS_ROUTE, SEEK_MISS_ROUTE_N);
+    int downs = 0, enters = 0;
+    nav.set_press([&](uint8_t k) {
+      if (k == KEY_DOWN)
+        downs++;
+      if (k == KEY_ENTER)
+        enters++;
+      pump.press(k, now);
+    });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(nav.fails() == 1);
+    assert(downs == 3);   // the full budget, then give up
+    assert(enters == 0);  // never a blind Enter
+    assert(pump.enters_wrong == 0);
+    assert(pump.page == CircPump::STATUS);  // recovery reached the anchor
   }
 
   {  // no cycle starts while not enrolled

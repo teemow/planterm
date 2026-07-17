@@ -198,6 +198,15 @@ int main() {
   assert(page({" Emergency heat.  EcH01"}) == "EcH01");
   assert(page({"Main menu          1/8"}) == "");
   assert(page({""}) == "");
+  // digit-middle page IDs (the Power+ Inverter family, live 2026-07-17)
+  assert(page({" Power+ Config   H1a01"}) == "H1a01");
+  assert(page({" Power+ Custom   H1c14"}) == "H1c14");
+  assert(page({" Data logger       E35"}) == "E35");
+  assert(page({" EVD Config.     Haa01"}) == "Haa01");
+  // ...without over-matching menu/status headers
+  assert(page({"P.Plus Menu' config   "}) == "");
+  assert(page({" Manufacturer         "}) == "");
+  assert(page({"Manufacturer menu  1/5"}) == "");
 
   // find_spec
   assert(find_spec(SPECS, SPECS_N, "mode") == &SPECS[2]);

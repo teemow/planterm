@@ -284,14 +284,18 @@ inline bool fx_match(const FieldSpec &sp, const char *row, char *val, size_t val
 
 // --- page identity -----------------------------------------------------------
 
-// planscope's pageIDRe: ^[A-Z][A-Za-z]{0,2}\d{2}$ (A01, D14, Gd01, EcH01...)
+// planscope's pageIDRe, widened: ^[A-Z][A-Za-z0-9]{0,2}\d{2}$ (A01, D14,
+// Gd01, EcH01...). The middle segment admits digits because the reference
+// app's Power+ Inverter pages render IDs like H1a01/H1b05/H1c14 (live
+// 2026-07-17 menu walk) -- pure-alpha middles, planscope's original rule,
+// reject the whole family and page_of would return "" for those screens.
 inline bool fx_page_id(const char *tok, size_t n) {
-  if (n < 3 || !(tok[0] >= 'A' && tok[0] <= 'Z'))
+  if (n < 3 || n > 5 || !(tok[0] >= 'A' && tok[0] <= 'Z'))
     return false;
-  size_t i = 1;
-  while (i < n && fx_alpha(tok[i]))
-    i++;
-  return i <= 3 && n - i == 2 && fx_digit(tok[i]) && fx_digit(tok[i + 1]);
+  for (size_t i = 1; i + 2 < n; i++)
+    if (!fx_alpha(tok[i]) && !fx_digit(tok[i]))
+      return false;
+  return fx_digit(tok[n - 2]) && fx_digit(tok[n - 1]);
 }
 
 // planscope's clockRe: ^\d{2}:\d{2} \d{2}/\d{2}/\d{2} (the status anchor row 0)

@@ -154,6 +154,17 @@ struct MacroStep {
 // Exactly one move shape applies:
 //   menu != nullptr && key == 0  -> band-verified menu select (arg = label)
 //   band_seek                    -> seek_selected_(arg, span)
+//   key != 0 && span > 0         -> seek-press: press key up to span times
+//                                   UNTIL exp holds (checked before the
+//                                   first press, so 0 presses is a hit) --
+//                                   the scrape twin of MacroStep.seek. Text
+//                                   truth for cursor menus that paint no
+//                                   "header N/total" (the reference app's
+//                                   Power+/EVO circular menus render a
+//                                   prev/current/next window with the
+//                                   CURRENT entry on the middle row, so a
+//                                   NEXP_ROW_PREFIX on that row is the
+//                                   verifiable cursor position).
 //   otherwise                    -> press key (0 = none), settle, verify exp
 // emit publishes the settled page after the move verifies; walk > 0 turns
 // the step into a budgeted walk -- (press + verify + emit) repeated up to
@@ -171,7 +182,8 @@ struct MacroStep {
 // field trails the struct so existing tables zero-fill it (no gate).
 struct ScrapeStep {
   uint8_t key;
-  uint8_t span;         // band_seek: seek span (span Downs, then 2x span Ups)
+  uint8_t span;         // band_seek: seek span (span Downs, then 2x span Ups);
+                        // with a key and no band_seek: the seek-press budget
   bool band_seek;       // seek the selection band onto arg instead of a press
   NavExp exp;
   uint8_t row;          // NEXP_ROW_PREFIX row
@@ -618,6 +630,8 @@ class PlanNav : public NavEngine {
         a = menu_select_in_(*s.menu, s.arg, now);
       } else if (s.band_seek) {
         a = seek_selected_(s.arg, s.span, now);
+      } else if (s.key != 0 && s.span > 0) {
+        a = seek_press_(s, now);
       } else if (s.key == 0 && s.exp == NEXP_NONE) {
         a = Act::OK;  // emit-only step: nothing to press or verify
       } else if (s.pin != 0) {
@@ -675,6 +689,39 @@ class PlanNav : public NavEngine {
       if (walk_seen_[i] == h)
         return true;
     return false;
+  }
+
+  // A seek-press step (key != 0 && span > 0): press key up to span times
+  // until the step's expectation holds, the current screen checked BEFORE
+  // the first press (a remembered cursor may already sit on the target).
+  // The scrape twin of MacroStep.seek, sharing seek_selected_'s sub-state
+  // (scheck_/seek_i_ -- exactly one primitive runs at a time) and its
+  // 500 ms per-position check window.
+  Act seek_press_(const ScrapeStep &s, uint32_t now) {
+    if (scheck_) {
+      Act a = step_(0, [this, &s] { return expect_(s.exp, s.row, s.arg, s.menu); },
+                    NAV_SEEK_CHECK_MS, now, false);
+      if (a == Act::OK) {
+        scheck_ = true;
+        seek_i_ = 0;
+        return Act::OK;
+      }
+      if (a == Act::FAIL) {  // not here: press on, or give up at the budget
+        if (seek_i_ >= s.span) {
+          scheck_ = true;
+          seek_i_ = 0;
+          return Act::FAIL;
+        }
+        scheck_ = false;
+      }
+      return Act::RUN;
+    }
+    Act a = step_(s.key, [] { return true; }, 0, now);
+    if (a == Act::OK) {
+      seek_i_++;
+      scheck_ = true;
+    }
+    return Act::RUN;
   }
 
   // A PIN-gated press step (pin != 0), mirroring PlanEdit's rphase_ 1/2/3:
