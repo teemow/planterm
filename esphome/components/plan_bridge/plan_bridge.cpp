@@ -6,6 +6,7 @@
 #include "esphome/components/network/util.h"
 
 #include <driver/gpio.h>
+#include <esp_heap_caps.h>
 #include <soc/uart_periph.h>
 
 #include <lwip/sockets.h>
@@ -529,6 +530,29 @@ bool PlanBridge::capture_established_() const {
 // session encrypted -- unit of wire bytes for one client. No-op until that
 // session is established (the session refuses records mid-handshake).
 bool PlanBridge::capture_out_(CapClient &c) {
+  // Backlog growth must NEVER be left to vector::push_back: exceptions are
+  // compiled to abort (__cxa_throw stub), so a bad_alloc from a growth
+  // reallocation in a fragmented heap panics the whole device -- live crash
+  // 2026-07-17 (4 reboots, backtrace: capture_send_ -> push_back ->
+  // __cxa_throw -> panic_abort; ~163 KB free total but no contiguous
+  // block under enroll+scrape load). Guarantee capacity up front, growing
+  // in 4 KiB steps only when the heap provably has the block; otherwise
+  // cut this client -- the same policy as a stalled backlog, just earlier.
+  size_t need = c.backlog.size() + cap_rec_.size() + 64;  // record + framing + MAC
+  if (c.backlog.capacity() < need) {
+    size_t want = c.backlog.capacity() + 4096;
+    if (want < need)
+      want = need;
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < want + 1024) {
+      // Logger only: capture_diag_ would clobber the shared cap_rec_ scratch
+      // mid-fanout and corrupt the record for the remaining clients.
+      ESP_LOGW(TAG, "capture client cut: heap too fragmented for %u B backlog",
+               static_cast<unsigned>(want));
+      c.kick = true;
+      return false;
+    }
+    c.backlog.reserve(want);
+  }
   return c.sess.send_record(cap_rec_.data(), cap_rec_.size(), c.backlog);
 }
 
