@@ -21,7 +21,9 @@
 //   - the edit loop reads the screen back after EVERY press (no step-size
 //     table -- the device calibrates itself) and aborts on stall, stepping
 //     past the target (off the device's step grid), moving away (wrapped),
-//     or the EDIT_MAX_PRESS budget;
+//     or the EDIT_MAX_PRESS budget; a changed row is trusted only once it
+//     stayed put for a quiet window (wait_change_) -- edit-mode repaints
+//     arrive cell by cell, and torn text must never steer the walk;
 //   - enums walk Up first; a bounded list (stall) reverses ONCE and walks
 //     Down; a wrapping list that comes back to the start without showing
 //     the target errors out (full-cycle detection);
@@ -343,9 +345,8 @@ class PlanEdit : public NavEngine {
         if (t_is_num_ && tf < cf)
           key = KEY_DOWN;
         // waitChange: the value row must show something DIFFERENT from cur_
-        // (step_ presses only on its first tick, so key stays constant here)
-        Act a = step_(key, [this] { return read_(next_) && std::strcmp(next_, cur_) != 0; },
-                      NAV_VERIFY_MS, now, false);
+        // AND settle (wait_change_ presses only once; key stays constant here)
+        Act a = wait_change_(key, now);
         if (a == Act::RUN)
           break;
         press_i_++;
@@ -462,9 +463,7 @@ class PlanEdit : public NavEngine {
               finish_(true, "");                        // real list; belt anyway
               break;
             }
-            Act a = step_(sweep_down_ ? KEY_DOWN : KEY_UP,
-                          [this] { return read_(next_) && std::strcmp(next_, cur_) != 0; },
-                          NAV_VERIFY_MS, now, false);
+            Act a = wait_change_(sweep_down_ ? KEY_DOWN : KEY_UP, now);
             if (a == Act::RUN)
               break;
             press_i_++;
@@ -576,6 +575,70 @@ class PlanEdit : public NavEngine {
     return fx_match(*sp, row_(sp->row), out, FIELDS_VAL_MAX);
   }
 
+  // waitChange (macro.go): press once, then wait for the value row to show
+  // something DIFFERENT from cur_ -- and trust it only once it stayed put
+  // for a NAV_QUIET_MS window. An edit-mode value change repaints via
+  // single-cell updates (one 0x0C frame per cell), so the FIRST differing
+  // read can be a half-painted multi-cell value ("ON" -> "ENERGY S." on the
+  // A01 mode ring, live 2026-07-16): acting on the torn text desyncs the
+  // walk by one press -- the next wait returns the completion of the
+  // PREVIOUS repaint, so the loop can wrap-detect on garbage or commit the
+  // target's neighbor. Row-string quiet, not frame quiet, so periodic
+  // same-value repaints cannot stall it; an extractor gone blind mid-tear
+  // does not re-arm (the last extractable glimpse keeps settling). A tear
+  // that settles back to cur_ re-arms the change wait. FAIL still means the
+  // press changed nothing: no edit focus, or the value sits at a device
+  // limit. OK leaves the settled reading in next_.
+  Act wait_change_(uint8_t key, uint32_t now) {
+    switch (wphase_) {
+      case 0: {  // press; glimpse ANY differing read within the verify window
+        Act a = step_(key, [this] { return read_(next_) && std::strcmp(next_, cur_) != 0; },
+                      NAV_VERIFY_MS, now, false);
+        if (a != Act::OK)
+          return a;  // RUN, or FAIL = stuck at cur_
+        std::strcpy(wcand_, next_);
+        wq0_ = now;
+        wdead_ = now + NAV_VERIFY_MS + 10 * NAV_QUIET_MS;  // bound a never-quiet row
+        wphase_ = 1;
+        return Act::RUN;
+      }
+      case 1: {  // the candidate must stay put for NAV_QUIET_MS
+        char g[FIELDS_VAL_MAX];
+        if (read_(g) && std::strcmp(g, wcand_) != 0) {
+          std::strcpy(wcand_, g);  // still repainting: re-arm the quiet window
+          wq0_ = now;
+        }
+        if (now - wq0_ < NAV_QUIET_MS) {
+          if (now >= wdead_) {
+            wphase_ = 0;
+            return Act::FAIL;  // value never settled
+          }
+          return Act::RUN;
+        }
+        if (std::strcmp(wcand_, cur_) == 0) {  // a torn glimpse settled back: no change yet
+          wphase_ = 2;
+          return Act::RUN;
+        }
+        std::strcpy(next_, wcand_);
+        wphase_ = 0;
+        return Act::OK;
+      }
+      default: {  // re-armed change wait (no second press) until the deadline
+        if (read_(next_) && std::strcmp(next_, cur_) != 0) {
+          std::strcpy(wcand_, next_);
+          wq0_ = now;
+          wphase_ = 1;
+          return Act::RUN;
+        }
+        if (now >= wdead_) {
+          wphase_ = 0;
+          return Act::FAIL;  // stuck at cur_ after all
+        }
+        return Act::RUN;
+      }
+    }
+  }
+
   // --- route runner (macro.go runRoute/runStep, non-blocking) ---------------
 
   Act route_tick_(uint32_t now) {
@@ -671,6 +734,7 @@ class PlanEdit : public NavEngine {
     swphase_ = 0;
     sweep_down_ = false;
     seen_n_ = 0;
+    wphase_ = 0;
   }
 
   // Route failures retry the whole route (Go navigate): Esc'ing back and
@@ -755,6 +819,12 @@ class PlanEdit : public NavEngine {
   char cur_[FIELDS_VAL_MAX];
   char next_[FIELDS_VAL_MAX];
   char estart_[FIELDS_VAL_MAX];
+  // wait_change_ sub-state (new members at the class END -- see the W3
+  // member-offset regression)
+  uint8_t wphase_{0};
+  uint32_t wq0_{0};
+  uint32_t wdead_{0};
+  char wcand_[FIELDS_VAL_MAX];
 };
 
 // --- arbiter --------------------------------------------------------------------

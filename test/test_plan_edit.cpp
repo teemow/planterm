@@ -9,7 +9,9 @@
 // Asserts the invariants ported from planscope macro_test.go: happy-path
 // edit, focus hops, clamp rejection before any edit focus, off-grid
 // overshoot abort, device-limit stall abort, enum full-cycle abort,
-// bounded-enum reversal, PW1 entry key sequence, and gate pass-through.
+// bounded-enum reversal, torn multi-cell repaints (the settled change wait:
+// the A01 ring's "ENERGY S." case, and a torn same-value repaint on a
+// stalled press), PW1 entry key sequence, and gate pass-through.
 // Plus the arbiter: a running scrape cycle finishes before a queued edit
 // starts, FIFO drain with the scheduler held, scraping resumes after, and
 // synchronous refusals (read-only set, full queue). Plus multi-op page
@@ -47,7 +49,9 @@ static const NavMenu SVC_MENU{"Service menu", 7, SVC_LABELS, 7};
 
 // The extractor spec table (what plan_fields.h calls device data).
 static const FieldSpec SPECS[] = {
-    {"A01", 4, FX_WORD, false, "", "", "mode", ""},
+    // whole trimmed row, not FX_WORD: mode values carry inner spaces
+    // ("ENERGY S.", live 2026-07-16) -- a word matcher goes blind on them
+    {"A01", 4, FX_TEXT, false, "", "", "mode", ""},
     {"B01", 4, FX_LABEL_NUM, true, "Heating:", "\xDF", "heating_setpoint", "°C"},
     {"B01", 7, FX_LABEL_NUM, true, "Heating:", "\xDF", "heating_eco_setpoint", "°C"},
     {"B02", 4, FX_LABEL_NUM, true, "Domestic:", "\xDF", "dhw_setpoint", "°C"},
@@ -229,15 +233,32 @@ struct FakePump {
   double dev_hi = 1000;  // device limit: Up sticks here (stall)
   double comfort_ext = 19.0;
   double compensation = 50;
-  // enum fields
-  static constexpr int A01_N = 3;
-  const char *a01_opts[A01_N] = {"AUTO", "OFF", "ON"};  // bounded (sticks at the ends)
+  // enum fields. A01 defaults to the historical bounded 3-option fixture;
+  // the ring tests switch it to the live-verified 4-option ring
+  // (AUTO -> OFF -> ON -> ENERGY S. -> AUTO, 2026-07-16).
+  static constexpr int A01_MAX = 4;
+  const char *a01_opts[A01_MAX] = {"AUTO", "OFF", "ON", "ENERGY S."};
+  int a01_n = 3;
+  bool a01_bounded = true;  // 3-option fixture sticks at the ends
   int a01_idx = 0;
   static constexpr int GG_N = 2;
   const char *gg_opts[GG_N] = {"AUT", "MAN"};  // cycling
   int gg_idx[4] = {0, 0, 0, 0};
   const char *comfort_opts[2] = {"DYNAMIC", "FIXED"};  // cycling
   int comfort_idx = 0;
+
+  // torn repaint model (0 = atomic paints, the historical fixture): an A01
+  // value change paints cell-by-cell like the live device -- the row first
+  // shows the new value's first two cells over the OLD text's tail, and
+  // completes tear_ms later (tick() applies it). tear_flash additionally
+  // tears a same-value repaint on a stalled press (the settle-back-to-cur_
+  // case the engine must re-arm on, not treat as a change).
+  int tear_ms = 0;
+  bool tear_flash = false;
+  bool tear_pending = false;
+  uint32_t tear_due = 0;
+  char a01_torn[SCR_COLS + 1] = "";
+  bool a01_torn_active = false;
 
   // edit focus: 0 = navigation, 1..N = field focused (per-page field order)
   int focus = 0;
@@ -283,7 +304,7 @@ struct FakePump {
     return nullptr;
   }
   int *enum_field(int f, int *n, const char *const **opts, bool *bounded) {
-    if (page == A01P) { *n = A01_N; *opts = a01_opts; *bounded = true; return &a01_idx; }
+    if (page == A01P) { *n = a01_n; *opts = a01_opts; *bounded = a01_bounded; return &a01_idx; }
     if (page == GFC11 && f == 1) { *n = 2; *opts = comfort_opts; *bounded = false; return &comfort_idx; }
     if (page == GG01) { *n = GG_N; *opts = gg_opts; *bounded = false; return &gg_idx[f - 1]; }
     if (on_c02()) {
@@ -354,8 +375,19 @@ struct FakePump {
     }
   }
 
+  // Complete a pending torn repaint once its cell updates "arrived".
+  void tick(uint32_t now) {
+    if (tear_pending && now >= tear_due) {
+      tear_pending = false;
+      a01_torn_active = false;
+      paint(now);
+    }
+  }
+
   void press(uint8_t k, uint32_t now) {
     if (page == PW_GATE) { gate_key(k); paint(now); return; }
+    const char *a01_before = a01_opts[a01_idx];
+    bool a01_edit = page == A01P && focus == 1 && (k == KEY_UP || k == KEY_DOWN);
     switch (k) {
       case KEY_ESC:
         if (focus > 0) { leave_focus(false); focus = 0; }
@@ -412,6 +444,31 @@ struct FakePump {
         }
         break;
     }
+    if (tear_ms > 0 && a01_edit) {
+      const char *a01_after = a01_opts[a01_idx];
+      bool changed = std::strcmp(a01_after, a01_before) != 0;
+      if (changed) {
+        // first two cells of the new text land over the old text's tail;
+        // the completion (tick) paints the final row tear_ms later
+        char oldp[SCR_COLS + 1], newp[SCR_COLS + 1];
+        std::snprintf(oldp, sizeof oldp, "%-22.22s", a01_before);
+        std::snprintf(newp, sizeof newp, "%-22.22s", a01_after);
+        std::memcpy(oldp, newp, 2);
+        std::snprintf(a01_torn, sizeof a01_torn, "%s", oldp);
+        a01_torn_active = true;
+        tear_pending = true;
+        tear_due = now + static_cast<uint32_t>(tear_ms);
+      } else if (tear_flash) {
+        // stalled press, same-value repaint torn as a blank-tail refresh:
+        // the row briefly shows only the first two cells ("EN" out of
+        // "ENERGY S."), then completes back to the unchanged value -- the
+        // settle-back-to-cur_ glimpse the engine must NOT take for a change
+        std::snprintf(a01_torn, sizeof a01_torn, "%.2s", a01_after);
+        a01_torn_active = true;
+        tear_pending = true;
+        tear_due = now + static_cast<uint32_t>(tear_ms);
+      }
+    }
     paint(now);
   }
 
@@ -430,7 +487,7 @@ struct FakePump {
         break;
       case A01P:
         scr.put_row(SCR_TERM_ESP, 0, " On/Off Unit       A01", now);
-        scr.put_row(SCR_TERM_ESP, 4, a01_opts[a01_idx], now);
+        scr.put_row(SCR_TERM_ESP, 4, a01_torn_active ? a01_torn : a01_opts[a01_idx], now);
         break;
       case B_PAGE:
         std::snprintf(buf, sizeof buf, " Thermoreg. Unit   B%02d", b_sub + 1);
@@ -547,6 +604,7 @@ static Result run(FakePump &pump, uint32_t &now, const char *macro, const char *
   assert(started);
   for (int i = 0; i < 100000 && !r.called; i++) {
     now += 50;
+    pump.tick(now);
     edit.tick(now);
   }
   assert(r.called);
@@ -572,6 +630,7 @@ static Result run_sched(FakePump &pump, uint32_t &now, const char *day, int slot
   assert(edit.set_ops(mfind("timer-day"), ops, 4, "schedule"));
   for (int i = 0; i < 100000 && !r.called; i++) {
     now += 50;
+    pump.tick(now);
     edit.tick(now);
   }
   assert(r.called && edit.idle());
@@ -598,6 +657,7 @@ static std::vector<std::pair<std::string, std::string>> run_sweep(FakePump &pump
   assert(edit.read_sweep(mfind("timer-day"), 7, "schedule"));
   for (int i = 0; i < 100000 && !called; i++) {
     now += 50;
+    pump.tick(now);
     edit.tick(now);
   }
   assert(called && edit.idle());
@@ -709,6 +769,40 @@ int main() {
     Result r = run(pump, now, "mode", "AUTO");
     assert(r.ok && r.value == "AUTO");
     assert(pump.committed && pump.a01_idx == 0);
+  }
+
+  {  // the live A01 ring with torn repaints (2026-07-23 "set mode from ON"
+     // failure): ON -> AUTO crosses the multi-word "ENERGY S.", whose
+     // cell-by-cell repaint first shows torn text ("EN" over the old row) --
+     // the settled wait must ignore the tear and land EXACTLY on the target
+    FakePump pump;
+    pump.a01_n = 4;
+    pump.a01_bounded = false;  // AUTO -> OFF -> ON -> ENERGY S. -> AUTO
+    pump.a01_idx = 2;          // ON
+    pump.tear_ms = 200;
+    uint32_t now = 1000;
+    pump.paint(now);
+    Result r = run(pump, now, "mode", "AUTO");
+    assert(r.ok && r.value == "AUTO");
+    assert(pump.committed && pump.a01_idx == 0);
+    assert(pump.page == FakePump::STATUS);
+  }
+
+  {  // torn same-value repaint on a stalled press (bounded list top): the
+     // glimpse settles BACK to the current value -- no change, so the enum
+     // reversal must still fire and find the target below, never treating
+     // the tear as a step
+    FakePump pump;
+    pump.a01_n = 4;
+    pump.a01_bounded = true;
+    pump.a01_idx = 3;  // ENERGY S., the bounded top
+    pump.tear_ms = 200;
+    pump.tear_flash = true;
+    uint32_t now = 1000;
+    pump.paint(now);
+    Result r = run(pump, now, "mode", "ON");
+    assert(r.ok && r.value == "ON");
+    assert(pump.committed && pump.a01_idx == 2);
   }
 
   {  // PW1: the gate gets exactly the live-recorded 0815 key sequence, then
