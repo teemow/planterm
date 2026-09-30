@@ -133,15 +133,21 @@ async def to_code(config):
     cg.add(var.set_repeat_interval_ms(config[CONF_REPEAT_INTERVAL_MS]))
     cg.add(var.set_armed(config[CONF_ARMED]))
     cg.add(var.set_enroll(config[CONF_ENROLL]))
-    # PLANCAP encryption: with a key, compile the Noise responder (the same
-    # noise-c + build flags the encrypted ESPHome API uses -- pins must match
-    # the api component's, or PlatformIO sees conflicting versions). Keyless
-    # devices compile the plaintext-only session.
+    # PLANCAP encryption: with a key, compile the Noise responder on the same
+    # noise-c + build flags the encrypted ESPHome API uses. Keyless devices
+    # compile the plaintext-only session.
     if (psk := _capture_psk(config)) is not None:
         cg.add(var.set_capture_psk(list(psk)))
         # A global flag, not a define in one header: every translation unit
         # must see the same PlanCapSession (ODR).
         cg.add_build_flag("-DPLAN_CAP_NOISE")
-        cg.add_library("esphome/noise-c", "0.1.11")
+        # Requested UNPINNED so the api's own pin wins (ESPHome's library
+        # reconcile adopts the pinned side): 0.1.11 through 2026.7, 0.1.21
+        # in 2026.8, 0.1.30 from 2026.9 (where the api auto-loads a `noise`
+        # component) -- and a second, different pin makes 2026.9 refuse the
+        # whole build ("Version pinning failed", heatpump-firmware CD
+        # 2026-09-30). The key is the api's, so the api's pin is always
+        # there to win.
+        cg.add_library("esphome/noise-c", None)
         cg.add_build_flag("-DHAVE_WEAK_SYMBOLS=1")
         cg.add_build_flag("-DHAVE_INLINE_ASM=1")

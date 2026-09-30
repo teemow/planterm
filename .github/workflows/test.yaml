@@ -74,8 +74,8 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: ~/.cache/esphome
-          key: esphome-idf-${{ runner.os }}-2026.7.0
+          key: esphome-idf-${{ runner.os }}-2026.9.1
       - name: Install ESPHome
-        run: pip install "esphome==2026.7.0"
+        run: pip install "esphome==2026.9.1"
       - name: Compile plan_bridge example
         run: esphome compile esphome/plan-bridge-example.yaml
