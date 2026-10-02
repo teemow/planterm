@@ -8,7 +8,10 @@
 // views, the running-state D-list variant that sticks early, the wrap-stop
 // walk endings (wrapping / stalled / drifting-value / toggling-text lists,
 // digit-normalized so live values never defeat the wrap), idle-only set_route,
-// and the failure path (recovery to the anchor + exponential backoff).
+// the failure path (recovery to the anchor + exponential backoff), and the
+// park (yield on the anchor: step-boundary stop, bounded Esc, no cycle or
+// failure counted, resync Esc-first on resume) against the row-0 sequences
+// recorded on the heat pump on 2026-10-02.
 //   c++ -std=c++17 test/test_plan_nav.cpp -o /tmp/t && /tmp/t
 
 #include "../src/plan_nav.h"
@@ -385,6 +388,77 @@ static void run_until(PlanNav &nav, uint32_t &now, Pred done) {
   }
   assert(done());
 }
+
+// --- park fixtures: row-0 sequences recorded on the heat pump, 2026-10-02 ---
+//
+// A terminal screen replayed as the sequence of row-0 texts the controller
+// painted after each Esc (heatpump-firmware logs/enrol-one-terminal-
+// 2026-10-02): every Esc advances one entry; the last entry is where the
+// screen stays. Any other key is a violation (a park presses Esc only).
+struct RecordedPump {
+  TestScreen scr;
+  std::vector<const char *> row0;
+  size_t i = 0;
+  bool esc_dead = false;      // Esc ignored by the controller (budget test)
+  uint32_t storm_ms = 0;      // > 0: a frame lands every storm_ms (never quiet)
+  std::vector<uint8_t> keys;  // every key pressed, in order
+  std::vector<uint32_t> at;   // ... and when
+
+  explicit RecordedPump(std::vector<const char *> seq, uint32_t now) : row0(std::move(seq)) {
+    paint(now);
+  }
+  void press(uint8_t k, uint32_t now) {
+    keys.push_back(k);
+    at.push_back(now);
+    if (k == KEY_ESC && !esc_dead && i + 1 < row0.size())
+      i++;
+    paint(now);
+  }
+  void paint(uint32_t now) {
+    scr.clear_(SCR_TERM_ESP, now);
+    scr.put_row(SCR_TERM_ESP, 0, row0[i], now);
+    if (fx_clock(row0[i])) {  // the anchor body as recorded (passive-3.log)
+      scr.put_row(SCR_TERM_ESP, 2, "    Hotwater:   28.1\xDF" "C", now);
+      scr.put_row(SCR_TERM_ESP, 6, "             STATUS:  ", now);
+    }
+  }
+  // Drive a park to its outcome; the storm keeps the screen busy.
+  void run_park(PlanNav &nav, uint32_t &now) {
+    uint32_t next_frame = now;
+    for (int n = 0; n < 100000 && nav.parking(); n++) {
+      now += 50;
+      if (storm_ms > 0 && now >= next_frame) {
+        paint(now);
+        next_frame = now + storm_ms;
+      }
+      nav.tick(now, true);
+    }
+    assert(!nav.parking());
+  }
+  bool only_esc() const {
+    for (uint8_t k : keys)
+      if (k != KEY_ESC)
+        return false;
+    return true;
+  }
+};
+
+// passive-3.log 08:33:48 (terminal 0x20 right after the yield): the pGD
+// inherited the walk's page, "Main menu 1/8"; one Esc shows the clock row.
+static const std::vector<const char *> REC_PGD_MAIN_MENU = {
+    "Main menu          1/8", "08:48 02/10/26 Ekobee1",
+};
+// enrolled-cap.log 07:35:06-07:35:12 (terminal 0x1F, the walk's own A
+// section and return home): A01 -> Esc -> main menu -> Esc -> clock.
+static const std::vector<const char *> REC_ESP_A01 = {
+    " On/Off Unit       A01", "Main menu          1/8", "07:49 02/10/26 Ekobee1",
+};
+// enrolled-cap.log 07:35:05 (terminal 0x20, frozen on the last page it was
+// served): D14 sits three Escs deep -- Service menu, main menu, clock.
+static const std::vector<const char *> REC_PGD_D14 = {
+    " Valve             D14", "Service menu       3/7", "Main menu          7/8",
+    "07:49 02/10/26 Ekobee1",
+};
 
 int main() {
   // nav_menu_cursor_in (planscope TestMenuCursor)
@@ -847,6 +921,158 @@ int main() {
       nav.tick(now, false);
     }
     assert(nav.idle() && nav.cycles() == 0);
+  }
+
+  // --- park: yield the session on the status anchor ---------------------------
+
+  {  // park from idle on the page the 2026-10-02 yield left behind
+     // (passive-3.log: "Main menu 1/8"): exactly one Esc, then the clock row
+    uint32_t now = 1000;
+    RecordedPump pump(REC_PGD_MAIN_MENU, now);
+    PlanNav nav(pump.scr, ROUTE, ROUTE_N);
+    std::vector<std::string> logs;
+    bool err_logged = false;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_log([&](bool err, const char *m) {
+      err_logged |= err;
+      logs.push_back(m);
+    });
+    assert(!nav.parking() && !nav.parked());
+    nav.park(now);
+    assert(nav.parking() && !nav.idle());  // visible to the owner's arbiter right away
+    pump.run_park(nav, now);
+    assert(nav.parked() && nav.idle());
+    assert(pump.keys.size() == 1 && pump.only_esc());
+    assert(fx_clock(pump.scr.row(SCR_TERM_ESP, 0)));
+    assert(nav.cycles() == 0 && nav.fails() == 0);  // not a cycle, not a failure
+    assert(logs.size() == 1 && logs[0] == "yield: parked on anchor" && !err_logged);
+    nav.park(now);  // already there: one settle, no press
+    pump.run_park(nav, now);
+    assert(nav.parked() && pump.keys.size() == 1);
+  }
+
+  {  // three Escs deep (the pGD's frozen D14 page, enrolled-cap.log): the
+     // Esc loop walks Service menu -> main menu -> clock within the budget
+    uint32_t now = 1000;
+    RecordedPump pump(REC_PGD_D14, now);
+    PlanNav nav(pump.scr, ROUTE, ROUTE_N);
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.park(now);
+    pump.run_park(nav, now);
+    assert(nav.parked());
+    assert(pump.keys.size() == 3 && pump.only_esc());
+    assert(fx_clock(pump.scr.row(SCR_TERM_ESP, 0)));
+    // Esc pacing is the settle wait, never faster.
+    for (size_t k = 1; k < pump.at.size(); k++)
+      assert(pump.at[k] - pump.at[k - 1] >= NAV_QUIET_MS);
+  }
+
+  {  // Esc dead (the controller ignores the key): the press budget ends the
+     // park, parked() is false, and the owner hears it through the error
+     // log path with row 0 (the screen dump evidence)
+    uint32_t now = 1000;
+    RecordedPump pump(REC_ESP_A01, now);
+    pump.esc_dead = true;
+    PlanNav nav(pump.scr, ROUTE, ROUTE_N);
+    std::vector<std::string> errs;
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.set_log([&](bool err, const char *m) {
+      if (err)
+        errs.push_back(m);
+    });
+    uint32_t t0 = now;
+    nav.park(now);
+    pump.run_park(nav, now);
+    assert(!nav.parked() && nav.idle());
+    assert(static_cast<int>(pump.keys.size()) == NAV_ESC_MAX && pump.only_esc());
+    assert(errs.size() == 1);
+    assert(errs[0] == "yield: anchor not reached (row0  On/Off Unit       A01)");
+    assert(now - t0 < NAV_PARK_MS);  // the press budget bites first on a quiet screen
+    assert(nav.cycles() == 0 && nav.fails() == 0);  // still no backoff
+  }
+
+  {  // repaint storm (a frame every 100 ms, the screen never goes quiet):
+     // every Esc stretches to the 6 s settle cap, so the wall clock cap ends
+     // the park after two presses instead of six
+    uint32_t now = 1000;
+    RecordedPump pump(REC_ESP_A01, now);
+    pump.esc_dead = true;
+    pump.storm_ms = 100;
+    PlanNav nav(pump.scr, ROUTE, ROUTE_N);
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    uint32_t t0 = now;
+    nav.park(now);
+    pump.run_park(nav, now);
+    assert(!nav.parked());
+    assert(pump.keys.size() == 2);
+    assert(now - t0 >= NAV_PARK_MS && now - t0 < NAV_PARK_MS + NAV_SETTLE_CAP_MS);
+  }
+
+  {  // park mid-cycle on the scripted pump: the walk is in its D-page Down
+     // walk when the owner yields right after a press -- that key gets its
+     // settle (and the verified page it landed on is still published: paid
+     // for, no extra press), no further move starts, Esc x2 brings the
+     // anchor, and neither a cycle nor a failure is counted
+    uint32_t now = 1000;
+    FakePump pump;
+    pump.paint(now);
+    PlanNav nav(pump.scr, ROUTE, ROUTE_N);
+    std::vector<uint8_t> keys;
+    std::vector<uint32_t> at;
+    int emits = 0;
+    nav.set_press([&](uint8_t k) {
+      keys.push_back(k);
+      at.push_back(now);
+      pump.press(k, now);
+    });
+    nav.set_emit([&] { emits++; });
+    nav.set_interval_ms(60000);
+    nav.enable(now);
+    uint32_t sched = nav.next_run_ms();
+    // run into the D walk: stop on the tick that pressed the Down onto D04
+    run_until(nav, now, [&] { return pump.page == FakePump::DPAGE && pump.dnum == 4; });
+    assert(!keys.empty() && keys.back() == KEY_DOWN && at.back() == now);
+    size_t n_before = keys.size();
+    int emits_before = emits;
+    uint32_t t_park = now;
+    nav.park(now);
+    assert(nav.parking());
+    run_until(nav, now, [&] { return !nav.parking(); });
+    assert(nav.parked() && nav.idle());
+    assert(pump.page == FakePump::STATUS);
+    assert(keys.size() == n_before + 2);  // D page -> menu -> anchor
+    for (size_t k = n_before; k < keys.size(); k++)
+      assert(keys[k] == KEY_ESC);
+    assert(at[n_before] - t_park >= NAV_QUIET_MS);  // the Down settled first
+    assert(emits == emits_before + 1);               // D04 settled -> published; D05 never visited
+    assert(nav.cycles() == 0 && nav.fails() == 0);
+    assert(nav.next_run_ms() == sched);  // the scheduler is untouched (the owner holds it)
+
+    // Resume after a yield: the page state is shared with the physical
+    // terminal, so the model may be stale -- the pGD user left the device on
+    // the main menu while our screen still shows the anchor. With
+    // resync_anchor the cycle presses Esc BEFORE trusting the model and then
+    // runs clean.
+    pump.page = FakePump::MENU;  // the device moved; our model did not repaint
+    nav.resync_anchor();
+    size_t n_resume = keys.size();
+    run_until(nav, now, [&] { return nav.cycles() == 1 && nav.idle(); });
+    assert(keys[n_resume] == KEY_ESC);  // Esc first ...
+    assert(nav.fails() == 0);            // ... and the cycle completed clean
+    assert(emits > emits_before);
+  }
+
+  {  // the recorded A01 sequence as a mid-route park: an owner yielding
+     // while the ESP session shows A01 (enrolled-cap.log 07:35:06) gets the
+     // anchor after two Escs
+    uint32_t now = 1000;
+    RecordedPump pump(REC_ESP_A01, now);
+    PlanNav nav(pump.scr, ROUTE, ROUTE_N);
+    nav.set_press([&](uint8_t k) { pump.press(k, now); });
+    nav.park(now);
+    pump.run_park(nav, now);
+    assert(nav.parked() && pump.keys.size() == 2 && pump.only_esc());
+    assert(std::string(pump.scr.row(SCR_TERM_ESP, 0)) == "07:49 02/10/26 Ekobee1");
   }
 
   std::printf("ok\n");
