@@ -205,6 +205,17 @@ class PlanTerminal {
       uint32_t g = static_cast<uint32_t>(now_us - tel_last_tx_us_);
       if (tel_post_tx_gap_min_us_ == 0 || g < tel_post_tx_gap_min_us_)
         tel_post_tx_gap_min_us_ = g;
+      // planterm#47 reject signal: the MAX gap in the window and a count of our
+      // transmissions the controller did not follow within 100 ms. In steady
+      // enrolled operation every reply is acked within ~0.4 ms and the next
+      // poll is ~25 ms out, so any gap past 100 ms means the controller went
+      // silent right after our TX -- a rejected reply heading into the 2 s link
+      // timeout and FF-walk. Our own wire is invisible (RE is muted while we
+      // drive DE), so this ack/no-ack gap is the only on-device accept signal.
+      if (g > tel_post_tx_gap_max_us_)
+        tel_post_tx_gap_max_us_ = g;
+      if (g > 100000u)
+        tel_tx_unacked_ = tel_tx_unacked_ + 1;
       tel_last_tx_us_ = 0;
     }
 
@@ -292,6 +303,7 @@ class PlanTerminal {
         reset_win_[6] == 0x00 && reset_win_[7] == 0x00) {
       link_reset_ = true;
       t_link_reset_us_ = now_us;  // ring-forwarding lockout window
+      tel_walks_ = tel_walks_ + 1;  // planterm#47: FF-walks seen this window
     }
 
     // Terminal enrollment: the roll-call is a TOKEN RING, not a
@@ -762,6 +774,21 @@ class PlanTerminal {
   volatile int64_t fwd_backoff_until_us_{0};  // no forwards until then after a fail
   volatile int64_t fwd_probe_next_us_{0};     // liveness-unarmed bootstrap probe pacing
   volatile bool fwd_just_{false};        // last poll was forwarded: alternate
+
+  // --- planterm#47 reject instrumentation (read-and-reset per bus10s window) --
+  // The controller silently discards ~1 in 150 of our in-cadence, well-formed
+  // link replies: no ack, then ~2 s of silence, then the FF-walk whose return
+  // drops the pGD. Our RE is muted while we drive DE, so the discarded frame is
+  // invisible in the capture; these three surface it on-device. gap_max/unacked
+  // use the post-TX-gap measurement above (our-TX-end -> next-RX-byte); walks
+  // counts the FF-walk marker. The coincidence of unacked and walks over a long
+  // enrolled window settles whether every walk follows a rejected reply
+  // (reject-driven) or walks also happen on acked replies (controller-side).
+  // LAYOUT RULE (see tel_type_): new members at the class END only.
+ public:
+  volatile uint32_t tel_post_tx_gap_max_us_{0};  // max our-TX-end -> next-byte gap
+  volatile uint32_t tel_tx_unacked_{0};          // our TX not followed within 100 ms
+  volatile uint32_t tel_walks_{0};               // FF-walk markers this window
 };
 
 }  // namespace plan

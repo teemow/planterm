@@ -589,6 +589,36 @@ int main() {
     assert(bus.feed(badp).empty());
   }
 
+  // --- planterm#47 reject instrumentation: post-TX gap max / tx_unacked / walks
+  {
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+
+    // A normal poll -> link reply, promptly followed by the controller's ack:
+    // the post-TX gap is small, nothing counted as unacked, no walk.
+    bus.feed(ctl.emit_poll(ENROLL_ADDR));  // link reply; arms the post-TX gap
+    bus.feed(ctl.emit_ack());              // next byte ~one byte-time later
+    assert(bus.term.tel_tx_unacked_ == 0);
+    assert(bus.term.tel_walks_ == 0);
+    assert(bus.term.tel_post_tx_gap_max_us_ < 100000);
+
+    // A rejected reply: we answer the poll, then the controller goes silent for
+    // >100 ms before any further byte -- the on-device signature of a silent
+    // discard heading into the 2 s link timeout. Counted once; the max gap
+    // records how long the silence was.
+    bus.feed(ctl.emit_poll(ENROLL_ADDR));  // link reply; arms the post-TX gap
+    bus.now += 200000;                     // 200 ms of controller silence
+    bus.feed(ctl.emit_ack());              // the next byte, far later
+    assert(bus.term.tel_tx_unacked_ == 1);
+    assert(bus.term.tel_post_tx_gap_max_us_ >= 200000);
+
+    // The FF-walk marker is counted (the walk whose return drops the pGD).
+    uint32_t walks0 = bus.term.tel_walks_;
+    bus.feed(ctl.emit_link_reset());
+    assert(bus.term.tel_walks_ == walks0 + 1);
+  }
+
   std::printf("ok\n");
   return 0;
 }
