@@ -528,8 +528,13 @@ void PlanBridge::capture_close_client_(CapClient &c) {
   }
   c.kick = false;
   c.sess.reset();
-  c.backlog.clear();
-  c.backlog.shrink_to_fit();  // a stall grows this to ~32 KiB; give it back
+  // Give the backlog's capacity back (a stall grows it to ~32 KiB; every
+  // slot takes a 4 KiB reserve on its first client). NOT shrink_to_fit():
+  // libstdc++ implements it as a no-op under -fno-exceptions (ESP-IDF),
+  // so every slot kept its capacity for the device's lifetime -- measured
+  // 2026-10-02 after the heatpump-firmware#58 flash: the first client on
+  // a slot cost 4.4 KB that never returned, later clients 1.3 KB that did.
+  std::vector<uint8_t>().swap(c.backlog);
 }
 
 bool PlanBridge::capture_established_() const {
