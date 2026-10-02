@@ -44,6 +44,11 @@ static constexpr uint32_t NAV_VERIFY_MS = 2000;      // navTimeout per step veri
 static constexpr uint32_t NAV_SEEK_CHECK_MS = 500;   // seekSelected per-position check
 // escAnchor press budget: the deepest pages observed sit 4 Escs down.
 static constexpr int NAV_ESC_MAX = 6;
+// PlanNav::park wall-clock cap on top of the press budget: a screen that
+// never settles (repaint storm) would otherwise stretch every Esc to the
+// 6 s settle cap. Checked between presses only, so a pressed key always
+// gets its settle.
+static constexpr uint32_t NAV_PARK_MS = 10000;
 static constexpr int NAV_BACKOFF_CAP = 4;  // interval << min(fails, 4)
 // The password gate gets 1 s to show after a PIN-flagged step (macro.go);
 // a session that already passed the PIN lands straight on the target page.
@@ -341,9 +346,14 @@ class NavEngine {
   // escAnchor: press Esc until the clock row shows; NAV_ESC_MAX press budget.
   // Per press: settle, one anchor check, next Esc (Go's escAnchor loop --
   // no per-press verify window, the settle already absorbed the repaint).
-  Act esc_anchor_(uint32_t now) {
+  // press_first skips the initial look at the screen model and presses
+  // one Esc before trusting it (the resync after a yield: the model may be
+  // stale, and the page state is shared with the physical terminal, so an
+  // anchor the model remembers need not be the page the controller shows;
+  // Esc on the anchor itself is a no-op).
+  Act esc_anchor_(uint32_t now, bool press_first = false) {
     if (aphase_ == 0) {
-      if (fx_clock(row0_())) {
+      if (!(press_first && esc_i_ == 0) && fx_clock(row0_())) {
         esc_i_ = 0;
         return Act::OK;
       }
@@ -545,6 +555,9 @@ class NavEngine {
 
 // PlanNav runs a consumer-supplied scrape route on a schedule: Esc to the
 // status anchor, the ScrapeStep list in order, Esc back to the anchor.
+// The owner can also park() it: the cycle stops at its step boundary and
+// Esc's home, so the session is handed over on the anchor (a yield to the
+// physical terminal, which inherits the controller's page state).
 class PlanNav : public NavEngine {
  public:
   PlanNav(const PlanScreen &scr, const ScrapeStep *route, size_t route_n)
@@ -575,6 +588,37 @@ class PlanNav : public NavEngine {
   uint32_t fails() const { return fails_; }
   uint32_t next_run_ms() const { return next_run_ms_; }
 
+  // Park: yield the session ON the status anchor. A running cycle stops at
+  // its step boundary -- a key already pressed gets its settle, no further
+  // move starts -- then Esc is pressed until the clock row shows, bounded
+  // by the NAV_ESC_MAX press budget and NAV_PARK_MS wall clock; the machine
+  // then goes idle WITHOUT counting a cycle or a failure (the owner, not
+  // the device, ended the cycle: no backoff, and an interrupted full walk
+  // stays owed). From idle the anchor is still verified: one settle, Esc
+  // only when the screen is elsewhere. parking() holds until the outcome
+  // is in; parked() is that outcome, also logged as "yield: parked on
+  // anchor" / "yield: anchor not reached (row0 ...)" (the latter through
+  // the error log path, so the owner's screen dump shows where it stuck).
+  void park(uint32_t now) {
+    if (parking())
+      return;
+    if (st_ == St::IDLE) {
+      reset_sub_();
+      begin_park_(now);
+      return;
+    }
+    park_req_ = true;  // honoured at the next step boundary (tick)
+  }
+  bool parking() const { return park_req_ || st_ == St::PARK; }
+  bool parked() const { return parked_ok_; }
+
+  // The next cycle's anchor phase presses Esc BEFORE trusting the screen
+  // model (esc_anchor_ press_first): call on resume after a yield -- the
+  // page state is shared with the physical terminal, whose user may have
+  // navigated meanwhile, and the model may be stale (no repaint while the
+  // link was down). One Esc on the anchor is a no-op.
+  void resync_anchor() { resync_ = true; }
+
   // Advance the machine; call every loop(). While not enrolled no new cycle
   // starts (a cycle already running just fails and backs off -- the presses
   // have no poll slot to ride in, so the screen never verifies).
@@ -585,11 +629,21 @@ class PlanNav : public NavEngine {
       reset_sub_();
       st_ = St::ANCHOR;
     }
+    // A pending park takes over at the step boundary: aphase_ == 0 means no
+    // step_ is mid-flight (the last key settled and was checked; the next
+    // one is not pressed yet), whatever sub-machine the cycle was in.
+    if (park_req_ && aphase_ == 0) {
+      park_req_ = false;
+      reset_sub_();
+      begin_park_(now);
+    }
     switch (st_) {
       case St::IDLE:
         break;
       case St::ANCHOR: {
-        Act a = esc_anchor_(now);
+        Act a = esc_anchor_(now, resync_);
+        if (a != Act::RUN)
+          resync_ = false;
         if (a == Act::OK)
           st_ = route_n_ > 0 ? St::ROUTE : St::ANCHOR_END;
         else if (a == Act::FAIL)
@@ -614,11 +668,37 @@ class PlanNav : public NavEngine {
           finish_(now, false);
         break;
       }
+      case St::PARK: {
+        Act a = esc_anchor_(now);
+        // The wall-clock cap applies between presses only (aphase_ == 0
+        // after a RUN means the last Esc settled and was checked).
+        if (a == Act::RUN && aphase_ == 0 && now - park_t0_ >= NAV_PARK_MS)
+          a = Act::FAIL;
+        if (a == Act::RUN)
+          break;
+        parked_ok_ = a == Act::OK;
+        if (log_) {
+          if (parked_ok_)
+            std::snprintf(buf_, sizeof buf_, "yield: parked on anchor");
+          else
+            std::snprintf(buf_, sizeof buf_, "yield: anchor not reached (row0 %.22s)", row0_());
+          log_(!parked_ok_, buf_);
+        }
+        reset_sub_();
+        st_ = St::IDLE;
+        break;
+      }
     }
   }
 
  protected:
-  enum class St : uint8_t { IDLE, ANCHOR, ROUTE, ANCHOR_END, RECOVER };
+  enum class St : uint8_t { IDLE, ANCHOR, ROUTE, ANCHOR_END, RECOVER, PARK };
+
+  void begin_park_(uint32_t now) {
+    park_t0_ = now;
+    parked_ok_ = false;
+    st_ = St::PARK;
+  }
 
   // One route step per pass: the move (ephase_ 0), then the settled-page
   // emit (ephase_ 1); a walk step repeats the pair `walk` times.
@@ -825,6 +905,12 @@ class PlanNav : public NavEngine {
   uint32_t walk_seen_[WALK_SEEN_MAX]{};  // settled-body hashes this walk
   uint8_t walk_seen_n_{0};
   uint32_t last_emit_hash_{0};  // the last published view (a walk's landing)
+
+  // park() / resync_anchor() state (2026-10-02; class END per the W3 rule).
+  bool park_req_{false};    // park requested mid-cycle, pending the step boundary
+  bool parked_ok_{false};   // outcome of the last park
+  bool resync_{false};      // next anchor phase presses Esc first
+  uint32_t park_t0_{0};     // park start, for the NAV_PARK_MS cap
 };
 
 }  // namespace plan

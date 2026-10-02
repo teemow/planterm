@@ -176,6 +176,11 @@ class PlanEdit : public NavEngine {
 
   bool idle() const { return st_ == St::IDLE; }
 
+  // The next request's anchor phase presses Esc BEFORE trusting the screen
+  // model (NavEngine::esc_anchor_ press_first) -- the owner calls this on
+  // resume after a yield, the same way as PlanNav::resync_anchor.
+  void resync_anchor() { resync_ = true; }
+
   // Start a read: navigate to the macro's page and read its value.
   bool get(const MacroDef *def) { return start_(def, nullptr); }
 
@@ -245,7 +250,9 @@ class PlanEdit : public NavEngine {
       case St::IDLE:
         break;
       case St::ANCHOR: {
-        Act a = esc_anchor_(now);
+        Act a = esc_anchor_(now, resync_);
+        if (a != Act::RUN)
+          resync_ = false;
         if (a == Act::OK) {
           step_i_ = 0;
           rphase_ = 0;
@@ -825,6 +832,7 @@ class PlanEdit : public NavEngine {
   uint32_t wq0_{0};
   uint32_t wdead_{0};
   char wcand_[FIELDS_VAL_MAX];
+  bool resync_{false};  // resync_anchor(): the next anchor phase presses Esc first
 };
 
 // --- arbiter --------------------------------------------------------------------

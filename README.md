@@ -114,8 +114,12 @@ diagnostics, and the command channel (arm, enroll, key injection).
   seek) shared by both machines below, plus `PlanNav`, a scheduled scrape
   runner that executes a consumer-supplied `ScrapeStep[]` route — every step
   screen-verified, each visited page emitted for extraction, exponential
-  backoff on failure. Routes, menu tables, and walk budgets are device
-  application data.
+  backoff on failure, and `park()` for the owner's yields: the cycle stops
+  at its step boundary and Esc's back to the status anchor (bounded), so a
+  session is only ever handed over on the anchor — the controller keeps one
+  page state that the terminal taking over inherits; `resync_anchor()`
+  makes the next cycle press Esc before trusting the screen model again.
+  Routes, menu tables, and walk budgets are device application data.
 - `src/plan_edit.h` — `PlanEdit`, the transactional edit engine (navigate
   with whole-route retry, focus-hop, one press per read-back, commit +
   verify, Esc abort on any divergence, digit-by-digit PIN gate entry),
