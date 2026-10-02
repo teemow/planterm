@@ -186,6 +186,18 @@ The transport session (handshake, framing, encryption) is planterm's
 `test/test_plan_cap.cpp` — the firmware and the Go clients implement the
 same spec, not each other's quirks.
 
+**Heap floor (70 KB free internal heap):** below it no new capture client
+is accepted (the connection drops before the banner; the ESPHome API and
+`ekobeescope call` stay available) and no client's send backlog may grow
+(the client is cut, like a stalled one). A client is the one thing on the
+device whose memory scales with a remote peer's behavior — a backlog
+reserve on connect, up to 32 KiB per stalled client — and the ESP32-C3's
+WiFi stack stopped allocating at ~55 KB free
+([heatpump-firmware#58](https://github.com/teemow/heatpump-firmware/issues/58)),
+so the capture server is what yields first. The periodic `bus10s`
+diagnostic carries `heap_free=` and `heap_block=` (free internal heap and
+its largest block) so a session's heap cost reads off its own stream.
+
 ## Injection verdict
 
 After each transmitted report the task watches for the two rejection

@@ -52,6 +52,15 @@ static const uint16_t CAP_PORT = 6054;
 // downstream, exactly like a dropped log line. Worst-case capture RAM is
 // CAP_MAX_CLIENTS x this, and only while every client stalls at once.
 static const size_t CAP_BACKLOG_MAX = 32 * 1024;
+// Heap floor for the capture server: below this much free internal heap no
+// new client is accepted and no client's backlog may grow (the client is
+// cut instead). The ESP32-C3's WiFi stack stopped allocating RX buffers at
+// ~55 KB free (heatpump-firmware#58, 2026-09-30: the device went dark for
+// the 15 min API reboot_timeout); a capture client is the one thing on the
+// device that can take tens of KB on demand (CAP_BACKLOG_MAX per stalled
+// client), so it is the one thing that yields first.
+static const size_t CAP_MIN_FREE_HEAP = 70 * 1024;
+static size_t heap_free() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL); }
 // Hold counter of a "fresh" press. Ground truth (capture 2026-07-02): a real
 // pGD tap is exactly ONE keypad report with NN=0x01; NN only ramps while a
 // key is held.
@@ -298,10 +307,13 @@ void PlanBridge::task_main() {
       // cap_drop_bytes_ stays MONOTONIC (the capture stream declares it
       // in-band, a reset would look like time travel); bus10s shows the
       // per-window delta like the other counters.
+      // heap_free / heap_block: free internal heap and its largest block
+      // (heatpump-firmware#58) -- the per-session heap cost of a client
+      // reads straight off its own capture stream, no HA round trip.
       uint32_t drop_now = cap_drop_bytes_;
       capture_diag_(plan::CAP_DIAG_INFO,
                     "bus10s: ctrl=%u pgd=%u us=%u other=%u cksum_fail=%u post_tx_gap_min=%uus "
-                    "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u",
+                    "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u heap_free=%u heap_block=%u",
                     static_cast<unsigned>(term_.tel_frames_ctrl_),
                     static_cast<unsigned>(term_.tel_frames_pgd_),
                     static_cast<unsigned>(term_.tel_frames_us_),
@@ -310,7 +322,8 @@ void PlanBridge::task_main() {
                     static_cast<unsigned>(term_.tel_post_tx_gap_min_us_),
                     static_cast<unsigned>(drop_now - drop_last_window_),
                     static_cast<unsigned>(isr_multi_drain_), static_cast<unsigned>(isr_drain_max_),
-                    static_cast<unsigned>(cap_seq_));
+                    static_cast<unsigned>(cap_seq_), static_cast<unsigned>(heap_free()),
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
       drop_last_window_ = drop_now;
       term_.tel_frames_ctrl_ = 0;
       term_.tel_frames_pgd_ = 0;
@@ -543,9 +556,20 @@ bool PlanBridge::capture_out_(CapClient &c) {
     size_t want = c.backlog.capacity() + 4096;
     if (want < need)
       want = need;
+    // Logger only in both branches: capture_diag_ would clobber the shared
+    // cap_rec_ scratch mid-fanout and corrupt the record for the remaining
+    // clients.
+    if (heap_free() < CAP_MIN_FREE_HEAP + want) {
+      // The heap floor (CAP_MIN_FREE_HEAP): a growing backlog is the one
+      // allocation on the device that scales with a remote client's
+      // behavior, so it yields before the WiFi stack starves.
+      ESP_LOGW(TAG, "capture client cut: heap %u B too low for %u B more backlog (floor %u)",
+               static_cast<unsigned>(heap_free()), static_cast<unsigned>(want),
+               static_cast<unsigned>(CAP_MIN_FREE_HEAP));
+      c.kick = true;
+      return false;
+    }
     if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < want + 1024) {
-      // Logger only: capture_diag_ would clobber the shared cap_rec_ scratch
-      // mid-fanout and corrupt the record for the remaining clients.
       ESP_LOGW(TAG, "capture client cut: heap too fragmented for %u B backlog",
                static_cast<unsigned>(want));
       c.kick = true;
@@ -608,6 +632,17 @@ void PlanBridge::capture_poll_() {
       capture_close_client_(c);
   }
   int fd = accept(cap_listen_fd_, nullptr, nullptr);
+  if (fd >= 0 && heap_free() < CAP_MIN_FREE_HEAP) {
+    // The heap floor: a session costs a backlog reserve up front and keeps
+    // the bus task allocating for as long as it lasts. Refuse it (the
+    // client sees the connection drop before the banner and fails fast)
+    // rather than let it push the device into the WiFi-death zone; the
+    // ESPHome API (`ekobeescope call`) stays available for recovery.
+    ESP_LOGW(TAG, "capture client refused: heap %u B below the %u B floor",
+             static_cast<unsigned>(heap_free()), static_cast<unsigned>(CAP_MIN_FREE_HEAP));
+    close(fd);
+    fd = -1;
+  }
   if (fd >= 0) {
     // A free slot, or evict the oldest client when all are taken -- a
     // wedged client can never lock up the port.
