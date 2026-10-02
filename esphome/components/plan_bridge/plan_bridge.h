@@ -94,6 +94,15 @@ class PlanBridge : public Component {
   // Controller FF-walk recovery seen (observe uses it to re-enroll). Sticky
   // until the next injection attempt clears it in task_main.
   bool link_reset() const { return term_.link_reset_; }
+  // planterm#47 reject counters from the LAST completed bus10s window, for
+  // Home Assistant template sensors: latched by task_main before it resets
+  // term_'s running counters, so the sensor's poll phase does not matter.
+  // tx_unacked = our transmissions the controller did not follow within
+  // 100 ms (the reject signal); post_tx_gap_max_us = the longest our-TX ->
+  // next-byte gap (~2.006e6 on a discard); walks = FF-walk markers.
+  uint32_t last_tx_unacked() const { return tx_unacked_window_; }
+  uint32_t last_post_tx_gap_max_us() const { return post_tx_gap_max_window_us_; }
+  uint32_t last_walks() const { return walks_window_; }
   // Observe hook: a second consumer of the drained (byte, bit9) stream,
   // called from the bus task at the same site that feeds the screen-snapshot
   // cache (task context, never the ISR -- no IRAM constraints).
@@ -300,6 +309,14 @@ class PlanBridge : public Component {
   bool cap_has_psk_{false};
   // Reader index into term_.txlog_ (bus task only); see task_main's drain.
   uint32_t txlog_r_{0};
+  // planterm#47 HA telemetry: the last completed bus10s window's reject
+  // counters, latched by task_main just before it resets term_'s running
+  // counters (bus task writes, the HA sensor lambda on the main loop reads a
+  // slightly-stale per-window value -- single-core, uint32_t access is
+  // atomic). LAYOUT RULE: new members at the class END only.
+  uint32_t tx_unacked_window_{0};
+  uint32_t post_tx_gap_max_window_us_{0};
+  uint32_t walks_window_{0};
 };
 
 }  // namespace plan_bridge

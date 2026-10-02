@@ -335,6 +335,11 @@ void PlanBridge::task_main() {
       term_.tel_frames_other_ = 0;
       term_.tel_cksum_fail_ = 0;
       term_.tel_post_tx_gap_min_us_ = 0;
+      // planterm#47: latch this window's reject counters for the HA sensors
+      // before the running counters are cleared (getters read these).
+      tx_unacked_window_ = term_.tel_tx_unacked_;
+      post_tx_gap_max_window_us_ = term_.tel_post_tx_gap_max_us_;
+      walks_window_ = term_.tel_walks_;
       term_.tel_post_tx_gap_max_us_ = 0;
       term_.tel_tx_unacked_ = 0;
       term_.tel_walks_ = 0;
