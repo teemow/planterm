@@ -313,6 +313,7 @@ void PlanBridge::task_main() {
       uint32_t drop_now = cap_drop_bytes_;
       capture_diag_(plan::CAP_DIAG_INFO,
                     "bus10s: ctrl=%u pgd=%u us=%u other=%u cksum_fail=%u post_tx_gap_min=%uus "
+                    "post_tx_gap_max=%uus tx_unacked=%u walks=%u "
                     "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u heap_free=%u heap_block=%u",
                     static_cast<unsigned>(term_.tel_frames_ctrl_),
                     static_cast<unsigned>(term_.tel_frames_pgd_),
@@ -320,6 +321,9 @@ void PlanBridge::task_main() {
                     static_cast<unsigned>(term_.tel_frames_other_),
                     static_cast<unsigned>(term_.tel_cksum_fail_),
                     static_cast<unsigned>(term_.tel_post_tx_gap_min_us_),
+                    static_cast<unsigned>(term_.tel_post_tx_gap_max_us_),
+                    static_cast<unsigned>(term_.tel_tx_unacked_),
+                    static_cast<unsigned>(term_.tel_walks_),
                     static_cast<unsigned>(drop_now - drop_last_window_),
                     static_cast<unsigned>(isr_multi_drain_), static_cast<unsigned>(isr_drain_max_),
                     static_cast<unsigned>(cap_seq_), static_cast<unsigned>(heap_free()),
@@ -331,6 +335,9 @@ void PlanBridge::task_main() {
       term_.tel_frames_other_ = 0;
       term_.tel_cksum_fail_ = 0;
       term_.tel_post_tx_gap_min_us_ = 0;
+      term_.tel_post_tx_gap_max_us_ = 0;
+      term_.tel_tx_unacked_ = 0;
+      term_.tel_walks_ = 0;
       isr_multi_drain_ = 0;
       isr_drain_max_ = 0;
       if (term_.enroll_ || term_.enroll_replies_ > 0)
@@ -779,7 +786,10 @@ void PlanBridge::capture_event_(uint8_t kind, uint8_t a, uint8_t b) {
 // ack, never parsed out of this text. Bus task only (same single-owner
 // rule as capture_event_, same stalled-client policy).
 void PlanBridge::capture_diag_(uint8_t severity, const char *fmt, ...) {
-  char buf[192];
+  // 256, not 192: the bus10s line grew past 192 with the planterm#47 reject
+  // counters (post_tx_gap_max / tx_unacked / walks). vsnprintf still self-caps
+  // to sizeof(buf), so a longer line is truncated rather than overrunning.
+  char buf[256];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
