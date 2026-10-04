@@ -116,6 +116,13 @@ class PlanBridge : public Component {
   // Poll-end -> reply-start delay. Runtime-tunable to probe the acceptance
   // window (controller listening threshold vs. the pGD's own reply time).
   void set_turnaround_us(uint32_t us) { turnaround_us_ = us; }
+  // planterm#47 TX-hardening knobs (default off). set_de_tail_us: hold the
+  // MAX3485 driver this many us after TX_DONE before releasing it, so the last
+  // stop bit clears the bias transient at a weak idle bias. set_carrier_sense:
+  // skip the reply while the UART RX FSM is mid-reception. Both are A/B'd live
+  // against the reject counters (tx_unacked / walks).
+  void set_de_tail_us(uint32_t us) { de_tail_us_ = us; }
+  void set_carrier_sense(bool e) { carrier_sense_ = e ? 1 : 0; }
   // Enable/disable answering the controller's roll-call for a free terminal
   // address. Disabling starts the graceful drain (see PlanTerminal::drain_);
   // task_main finishes the leave.
@@ -317,6 +324,21 @@ class PlanBridge : public Component {
   uint32_t tx_unacked_window_{0};
   uint32_t post_tx_gap_max_window_us_{0};
   uint32_t walks_window_{0};
+  // planterm#47 TX-hardening knobs + reply-jitter telemetry. ISR-written,
+  // task-read per bus10s window. de_tail_us_ / carrier_sense_ are the knobs
+  // (default off). jit_* = poll-byte -> DE-assert delay (turnaround + any ISR
+  // preemption) min/max and a count above turnaround+500 us; de_hold_max_us_ =
+  // DE hold time; cs_would_fire_ = how often carrier sense would block (logged
+  // regardless of the switch); cs_blocked_ = replies it actually skipped.
+  // LAYOUT RULE: new members at the class END only.
+  volatile uint32_t de_tail_us_{0};
+  volatile uint8_t carrier_sense_{0};
+  volatile uint32_t jit_min_us_{0};
+  volatile uint32_t jit_max_us_{0};
+  volatile uint32_t jit_late_{0};
+  volatile uint32_t de_hold_max_us_{0};
+  volatile uint32_t cs_would_fire_{0};
+  volatile uint32_t cs_blocked_{0};
 };
 
 }  // namespace plan_bridge
