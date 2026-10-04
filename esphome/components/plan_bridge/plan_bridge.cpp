@@ -345,6 +345,24 @@ void PlanBridge::task_main() {
       term_.tel_walks_ = 0;
       isr_multi_drain_ = 0;
       isr_drain_max_ = 0;
+      // planterm#47 reply-jitter + TX-hardening telemetry (separate line to
+      // stay under the diag buffer). de_assert = poll-byte -> DE-assert delay
+      // (turnaround + any ISR preemption); late = count above turnaround+500;
+      // de_hold = DE hold time; cs_would/blocked = carrier sense; the de_tail
+      // and cs settings are echoed for visibility. Read-and-reset per window.
+      capture_diag_(plan::CAP_DIAG_INFO,
+                    "jitter10s: de_assert_min=%uus max=%uus late=%u de_hold_max=%uus "
+                    "cs_would=%u cs_blocked=%u de_tail=%uus cs=%u",
+                    static_cast<unsigned>(jit_min_us_), static_cast<unsigned>(jit_max_us_),
+                    static_cast<unsigned>(jit_late_), static_cast<unsigned>(de_hold_max_us_),
+                    static_cast<unsigned>(cs_would_fire_), static_cast<unsigned>(cs_blocked_),
+                    static_cast<unsigned>(de_tail_us_), static_cast<unsigned>(carrier_sense_));
+      jit_min_us_ = 0;
+      jit_max_us_ = 0;
+      jit_late_ = 0;
+      de_hold_max_us_ = 0;
+      cs_would_fire_ = 0;
+      cs_blocked_ = 0;
       if (term_.enroll_ || term_.enroll_replies_ > 0)
         capture_diag_(plan::CAP_DIAG_INFO,
                       "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "

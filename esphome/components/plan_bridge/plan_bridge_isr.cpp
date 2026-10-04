@@ -123,22 +123,57 @@ void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
     uart_ll_read_rxfifo(hw, &b, 1);
     uint8_t bit9 = static_cast<uint8_t>((__builtin_parity(b) != 0) ^ perr);
 
-    plan::TxAction act = self->term_.on_byte(b, bit9, esp_timer_get_time());
+    int64_t now_us = esp_timer_get_time();
+    plan::TxAction act = self->term_.on_byte(b, bit9, now_us);
     if (act.kind != plan::TxAction::NONE) {
       // The response slot only belongs to us if no further byte has arrived
       // behind the match (a stale match means the controller moved on) --
       // checked before AND after the turnaround delay.
       if (uart_ll_get_rxfifo_len(hw) == 0) {
         esp_rom_delay_us(self->turnaround_us_);
-        if (uart_ll_get_rxfifo_len(hw) == 0) {
+        // planterm#47 carrier sense: the RX FSM is mid-reception (a start bit
+        // arrived but the byte is not yet complete, so the FIFO count is still
+        // 0). Always COUNT how often this would fire; only BLOCK the reply when
+        // the switch is on (default off -> the proven path is byte-for-byte
+        // unchanged). st_urx_out is the same register uart_ll_is_tx_idle reads.
+        bool rx_busy = hw->fsm_status.st_urx_out != 0;
+        if (rx_busy)
+          self->cs_would_fire_ = self->cs_would_fire_ + 1;
+        bool block = rx_busy && self->carrier_sense_ != 0;
+        if (uart_ll_get_rxfifo_len(hw) == 0 && !block) {
           gpio_ll_set_level(&GPIO, static_cast<gpio_num_t>(self->de_pin_), 1);
+          int64_t t_de = esp_timer_get_time();  // DE assert = reply start
           uint8_t f[sizeof(act.frame)];
           for (size_t i = 0; i < act.len; i++)
             f[i] = act.frame[i];
           tx_9bit(hw, f, act.len, act.bit9_mask);
+          // planterm#47 DE tail: hold the driver this long after TX_DONE
+          // (tx_9bit already waits st_utx_out idle) so the last stop bit clears
+          // the bias transient at a weak idle bias. Default 0 -> unchanged.
+          if (self->de_tail_us_ != 0)
+            esp_rom_delay_us(self->de_tail_us_);
           gpio_ll_set_level(&GPIO, static_cast<gpio_num_t>(self->de_pin_), 0);
-          self->term_.tx_sent(act, esp_timer_get_time());
+          int64_t t_drop = esp_timer_get_time();
+          // planterm#47 reply-jitter telemetry: the poll byte (now_us) ->
+          // DE-assert delay (turnaround plus any ISR preemption during the
+          // busy-wait) and the DE hold, summarised per bus10s window. A late
+          // jit_max / jit_late tail coinciding with tx_unacked is the
+          // late-reply signature (fix = a timer-driven, preemption-immune
+          // reply start). esp_timer_get_time is already IRAM here.
+          uint32_t jit = static_cast<uint32_t>(t_de - now_us);
+          if (self->jit_min_us_ == 0 || jit < self->jit_min_us_)
+            self->jit_min_us_ = jit;
+          if (jit > self->jit_max_us_)
+            self->jit_max_us_ = jit;
+          if (jit > self->turnaround_us_ + 500)
+            self->jit_late_ = self->jit_late_ + 1;
+          uint32_t hold = static_cast<uint32_t>(t_drop - t_de);
+          if (hold > self->de_hold_max_us_)
+            self->de_hold_max_us_ = hold;
+          self->term_.tx_sent(act, t_drop);
         } else {
+          if (block)
+            self->cs_blocked_ = self->cs_blocked_ + 1;
           self->term_.tx_not_sent(act);
         }
       } else {
