@@ -8,8 +8,8 @@
 //
 // EXTENSION POINTS for later rows:
 //   * fault injection: sim_bus.h FaultHook (no fault logic lives here);
-//   * the pGD master walk / warm FF-walk (R-RC-07, R-LL-18): ff_start()
-//     takes the claims to carry; nothing calls it with claims != 0 yet;
+//   * the pGD master walk / warm FF-walk (R-RC-07, R-LL-18): a terminal's
+//     01' walk probe while DOWN makes ff_start() carry its claims (C11);
 //   * slow FF-walk (R-RC-08), announce form (R-RC-06), planned rebuild
 //     `01' 00` (R-LL-13), member-forwarded tokens (R-RC-16/17): not modelled.
 
@@ -87,7 +87,10 @@ class SimController : public Station {
     int64_t gap_period = 12000000;     // R-RC-03
     int64_t gap_step = 36000;          // R-RC-03: one probe per ~36 ms macro-cycle
     int64_t exch_gap = 1000;
+    int64_t takeover = 9000;           // A6 T17: 02' ~9 ms after a pGD's 01' probe
   } tm;
+  // Why the last link fault happened (FaultHook::ctrl_walk_stall, A2 T1-T6).
+  enum FaultCause { FC_NONE, FC_RC, FC_JOIN, FC_POLL, FC_SACK, FC_KEY };
 
   ScreenScript screen = ScreenScript::demo();
   uint32_t map = bit(1), claims = 0;  // settled masks (R-RC-02)
@@ -95,7 +98,9 @@ class SimController : public Station {
   bool sessioned[33] = {};
   std::array<std::array<std::string, 8>, 33> shadow{};  // R-DI-17 per terminal
   uint32_t ff_walks = 0, gap_walks = 0, link_faults = 0, polls = 0, acks = 0, joins = 0,
-           sacks = 0, resends = 0, idents = 0, fwd_answered = 0, fwd_lost = 0;
+           sacks = 0, resends = 0, idents = 0, fwd_answered = 0, fwd_lost = 0, takeovers = 0,
+           stalls = 0;
+  int last_fault = FC_NONE;
   std::vector<uint8_t> keys;  // accepted key codes (R-KP-11)
 
   SimController() : Station(0x01) {}
@@ -133,7 +138,25 @@ class SimController : public Station {
   void on_timer(int id, int64_t t) override {
     if (id != gen_) return;
     switch (kind_) {
-      case K_FF: ff_start(t, 0); break;
+      case K_FF:
+        // A2 T7 / R-LL-12: the controller faults on its own first walk frame
+        // (nothing visible on the wire), quiet 2.00 s, then walks again.
+        if (last_fault != FC_NONE && bus->hook && bus->hook->ctrl_walk_stall(last_fault, t)) {
+          ff_walks++;
+          stalls++;
+          last_fault = FC_NONE;
+          Frame w = rollcall(2, 0x01, 0xFFFFFFFFu, 0);
+          bus->transmit(this, w, t);
+          last_tx_end_ = t + CHAR_US * static_cast<int64_t>(w.size());
+          cur_tx_t0_ = t;
+          phase_ = DOWN;
+          await_ = A_NONE;
+          arm(last_tx_end_ + tm.link_fault, K_FF);
+          break;
+        }
+        last_fault = FC_NONE;
+        ff_start(t, 0);
+        break;
       case K_WAKE: schedule_(t); break;
       case K_DEADLINE: deadline_(t); break;
     }
@@ -166,6 +189,7 @@ class SimController : public Station {
   void send_(const Frame &f, int64_t t, Await a, int64_t window) {
     bus->transmit(this, f, t);
     last_tx_end_ = t + CHAR_US * static_cast<int64_t>(f.size());
+    cur_tx_t0_ = t;
     await_ = a;
     garbage_ = false;
     asm_.cur.clear();
@@ -174,6 +198,7 @@ class SimController : public Station {
   void idle_after_(const Frame &f, int64_t t) {  // a frame nobody answers
     bus->transmit(this, f, t);
     last_tx_end_ = t + CHAR_US * static_cast<int64_t>(f.size());
+    cur_tx_t0_ = t;
     await_ = A_NONE;
     arm(last_tx_end_ + tm.exch_gap, K_WAKE);
   }
@@ -266,6 +291,7 @@ class SimController : public Station {
     Frame ack{{0x01, true}};
     bus->transmit(this, ack, t + tm.ack_turn);
     last_tx_end_ = t + tm.ack_turn + CHAR_US;
+    cur_tx_t0_ = t + tm.ack_turn;
     await_ = A_NONE;
     if (key_ >= 0) apply_key_(static_cast<uint8_t>(key_), t);  // R-KP-11
     if (join_poll_) join_done_(t);
@@ -368,8 +394,9 @@ class SimController : public Station {
 
  private:
   // --- link fault (R-LL-10) ------------------------------------------------
-  void fault_() {
+  void fault_(int cause) {
     link_faults++;
+    last_fault = cause;
     join_poll_ = false;
     phase_ = DOWN;
     await_ = A_NONE;
@@ -384,6 +411,16 @@ class SimController : public Station {
   // --- dispatch ----------------------------------------------------------------
   void frame_(const Frame &fr, int64_t t) {
     uint8_t to = fr[0].v, ty = fr[1].v;
+    // R-LL-05/06: a frame that began before our latest transmission answers
+    // an older exchange (the pGD's 14 ms resend before our 19 ms re-poll):
+    // never accepted.
+    if (rx_t0_ < cur_tx_t0_) return;
+    // A6 T17 / R-LL-18 / R-RC-07: a terminal's own walk probe to 01' while we
+    // are down: take the token and continue the walk with its claims.
+    if (to == 0x01 && ty == 0x02 && fr[2].v != 0x01 && phase_ == DOWN) {
+      takeovers++;
+      return ff_start(t + tm.takeover, get_mask(fr, 7) & ~bit(1));
+    }
     if (to != 0x01) {
       // R-RC-19 / R-LL-19a: the focus hands its poll token on (`20' 01 1F BF`).
       // R-LL-17: the first poll after a join must get the joiner's own link
@@ -457,18 +494,18 @@ class SimController : public Station {
     bool heard = garbage_ || !asm_.cur.empty();
     switch (await_) {
       case A_RC:
-        if (heard) return fault_();  // R-RC-10: a rejected answer aborts the walk
+        if (heard) return fault_(FC_RC);  // R-RC-10: a rejected answer aborts the walk
         return probe_silent_(t);
       case A_JOIN:
-        return fault_();  // R-RC-13 / R-LL-16: an unaccepted echo is never retried
+        return fault_(FC_JOIN);  // R-RC-13 / R-LL-16: an unaccepted echo is never retried
       case A_REPROBE:
-        if (heard) return fault_();
+        if (heard) return fault_(FC_RC);
         await_ = A_NONE;
         return schedule_(t);
       case A_POLL:
-        if (key_ >= 0) return fault_();  // R-KP-04: report without link reply
-        if (join_poll_) return fault_();  // R-RC-13: any join stage lost -> fault
-        if (poll_attempt_ >= 3) return fault_();  // R-LL-06 -> R-LL-10
+        if (key_ >= 0) return fault_(FC_KEY);  // R-KP-04: report without link reply
+        if (join_poll_) return fault_(FC_JOIN);  // R-RC-13: any join stage lost -> fault
+        if (poll_attempt_ >= 3) return fault_(FC_POLL);  // R-LL-06 -> R-LL-10
         poll_attempt_++;
         return poll_(polled_, poll_t0_ + (poll_attempt_ - 1) *
                                   (heard ? tm.repoll_rejected : tm.repoll_silent), false);
@@ -480,7 +517,7 @@ class SimController : public Station {
         // R-LL-08: an ack that was heard but not accepted -> identical copy
         // 14 ms after the SACK start, at most 3 copies. No ack at all, or
         // the 3rd copy rejected -> link fault (R-SE-14, R-LL-08).
-        if (!heard || copies_ >= 3) return fault_();
+        if (!heard || copies_ >= 3) return fault_(FC_SACK);
         copies_++;
         resends++;
         send_(sq_.front().f, std::max(t, garbage_t0_ + tm.sack_resend),
@@ -549,7 +586,7 @@ class SimController : public Station {
   Await await_ = A_NONE;
   Phase phase_ = DOWN;
   bool garbage_ = false, probe_gap_ = false, join_from_gap_ = false, join_poll_ = false;
-  int64_t rx_t0_ = 0, garbage_t0_ = 0, last_tx_end_ = 0, last_rx_end_ = 0;
+  int64_t rx_t0_ = 0, cur_tx_t0_ = 0, garbage_t0_ = 0, last_tx_end_ = 0, last_rx_end_ = 0;
   int64_t ff_t0_ = 0, probe_t_ = 0, poll_t0_ = 0, next_poll_t_ = 0, next_gap_t_ = 0,
           gap_due_t_ = 0, sess_due_t_ = 0, sess_t0_ = 0;
   uint32_t ff_map_ = 0, ff_claims_ = 0, sent_map_ = 0, sent_claims_ = 0;
