@@ -11,11 +11,13 @@
 // bus counts it (half-duplex arbitration is the stations' job, the bus only
 // referees it).
 //
-// FAULT HOOK: `FaultHook` is the single place later rows inject faults
-// (frames dropped or corrupted per direction, idle-level glitches). This row
-// implements the hook points, not the faults; with no hook the bus is ideal.
+// FAULT HOOK: `FaultHook` is the single place faults are injected (frames
+// dropped or corrupted per direction, idle-level drift, silence, noise).
+// The measured physical regimes live in sim_faults.h (wave C11); with no
+// hook the bus is ideal.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <queue>
@@ -142,6 +144,39 @@ struct FaultHook {
   // When the bus falls idle: may call Bus::inject_glitch() to model the lost
   // idle level (A16: the undriven bus drifts toward SPACE within ~1 ms).
   virtual void on_idle(Bus &, int64_t /*t_us*/) {}
+  // (wave C11) Return false to keep a transmission off the wire entirely
+  // (a silent controller, R9): nothing is logged or delivered.
+  virtual bool tx_allowed(uint8_t /*from*/, const Frame &, int64_t /*t_us*/) { return true; }
+  // (C11) Per byte per receiver, before on_rx_byte: return true to deliver
+  // `extra` to that receiver first (A16: a break byte glued before a frame).
+  virtual bool rx_prefix(uint8_t /*from*/, uint8_t /*to*/, const WireByte &, int64_t /*t_us*/,
+                         WireByte & /*extra*/) {
+    return false;
+  }
+  // (C11) Asked by the controller when its cold FF-walk starts after a link
+  // fault of `cause` (SimController::FaultCause): true = it stalls on its own
+  // first walk frame and stays quiet another 2.00 s (A2 T7 / R-LL-12).
+  virtual bool ctrl_walk_stall(int /*cause*/, int64_t /*t_us*/) { return false; }
+};
+
+// Seeded, platform-independent PRNG (splitmix64) for reproducible faults and
+// terminal jitter (C11).
+struct Rng {
+  uint64_t s;
+  explicit Rng(uint64_t seed) : s(seed) {}
+  uint64_t next() {
+    uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+  }
+  double uni() { return static_cast<double>(next() >> 11) * (1.0 / 9007199254740992.0); }
+  bool chance(double p) { return p > 0 && uni() < p; }
+  double gauss() {  // Box-Muller
+    double u = uni();
+    if (u < 1e-12) u = 1e-12;
+    return std::sqrt(-2.0 * std::log(u)) * std::cos(6.283185307179586 * uni());
+  }
 };
 
 struct LogFrame {
@@ -157,7 +192,7 @@ class Bus {
   int64_t now = 0;
   FaultHook *hook = nullptr;
   std::vector<LogFrame> log;  // ideal probe: everything put on the wire
-  uint32_t collisions = 0;
+  uint32_t collisions = 0, suppressed = 0;
 
   void attach(Station *s) {
     s->bus = this;
@@ -166,6 +201,10 @@ class Bus {
   // Start driving `f` at t0 (>= now). Bytes go back to back.
   void transmit(Station *s, Frame f, int64_t t0) {
     if (t0 < now) t0 = now;
+    if (hook && !hook->tx_allowed(s->addr, f, t0)) {
+      suppressed++;
+      return;
+    }
     if (hook) hook->on_tx_frame(s->addr, f, t0);
     int64_t t1 = t0 + CHAR_US * static_cast<int64_t>(f.size());
     LogFrame lf{t0, s->addr, f};
@@ -198,7 +237,8 @@ class Bus {
         if (now - CHAR_US < c.second && c.first < now) b.err = true, b.v ^= 0xA5;
       for (Station *r : st_) {
         if (r == e.s) continue;  // DE+RE tied: never hears itself
-        WireByte rb = b;
+        WireByte rb = b, pre;
+        if (hook && hook->rx_prefix(e.s->addr, r->addr, rb, now, pre)) r->on_rx(pre, now - CHAR_US);
         if (hook && !hook->on_rx_byte(e.s->addr, r->addr, rb, now)) continue;
         r->on_rx(rb, now);
       }

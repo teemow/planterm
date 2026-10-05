@@ -9,7 +9,8 @@
 // pGD's own FF-walk R-RC-25 / R-LL-18), on_lost_controller(), and the boot
 // silence (R-RC-11, 17-20 s) are where the full state machine
 // OFF/BOOTING/LISTEN/JOINING/SERVED/SESSIONED/PARKED/REPLY_RETRY/TOKEN_LOST
-// plugs in. The stub implements only the healthy answers.
+// plugs in. The stub implements only the healthy answers; the full A6 model
+// is PgdModel in sim_pgd.h (wave C11).
 
 #include "../../src/plan_terminal.h"
 #include "sim_bus.h"
