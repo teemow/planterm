@@ -1,0 +1,94 @@
+# Replay-conformance expectations: test/test_replay_conformance.cpp (REPLAY_UPDATE=1 rewrites).
+# fixture	comparison	class	tag	count	first slot (source line of the answered frame)
+# vs-recorded: planterm replay vs the bridge's recorded TX. vs-pgd-model: vs the pGD-faithful
+# reference at 0x1F (A6 model + R-RC-12/R-RC-30). walk-detector: link_reset_/tel_walks_ vs every
+# FF-walk start. pgd-model-vs-pgd: the reference at 0x20 vs the real pGD (calibration).
+# counterfactual-vs-pgd-model: replayed with the fixture's `# counterfactual:` task state.
+# class is from planterm's side (missing: the other side sends, planterm does not).
+jul17-soak-join	harness	tx_units=75 unaligned=0 isr_stale_drops=0
+jul17-soak-join	counterfactual-vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	1	L2537
+jul17-soak-join	counterfactual-vs-pgd-model	different-bytes	D3/DV-4 (R-LL-17)	1	L2541
+jul17-soak-join	counterfactual-vs-pgd-model	different-bytes	R-LL-19 dual-terminal forward (A6:T19, no pGD rule)	1	L2682
+jul17-soak-join	counterfactual-vs-pgd-model	same	ident	1	L2770
+jul17-soak-join	counterfactual-vs-pgd-model	same	link	47	L2547
+jul17-soak-join	counterfactual-vs-pgd-model	same	rollcall	3	L2533
+jul17-soak-join	counterfactual-vs-pgd-model	same	session_ack	21	L2587
+jul17-soak-join	pgd-model-vs-pgd	same	link	54	L2401
+jul17-soak-join	pgd-model-vs-pgd	same	rollcall	1	L2543
+jul17-soak-join	pgd-model-vs-pgd	same	session_ack	20	L2573
+jul17-soak-join	vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	1	L2537
+jul17-soak-join	vs-pgd-model	different-bytes	R-LL-19 dual-terminal forward (A6:T19, no pGD rule)	20	L2597
+jul17-soak-join	vs-pgd-model	same	ident	1	L2770
+jul17-soak-join	vs-pgd-model	same	link	29	L2541
+jul17-soak-join	vs-pgd-model	same	rollcall	3	L2533
+jul17-soak-join	vs-pgd-model	same	session_ack	21	L2587
+jul17-soak-join	vs-recorded	same	fwd_poll	20	L2597
+jul17-soak-join	vs-recorded	same	ident	1	L2770
+jul17-soak-join	vs-recorded	same	link	29	L2541
+jul17-soak-join	vs-recorded	same	rollcall	4	L2533
+jul17-soak-join	vs-recorded	same	session_ack	21	L2587
+jul17-soak-steady	harness	tx_units=147 unaligned=0 isr_stale_drops=0
+jul17-soak-steady	pgd-model-vs-pgd	same	link	45	L7745
+jul17-soak-steady	pgd-model-vs-pgd	same	session_ack	33	L7726
+jul17-soak-steady	vs-pgd-model	different-bytes	R-LL-19 dual-terminal forward (A6:T19, no pGD rule)	45	L7746
+jul17-soak-steady	vs-pgd-model	same	key	5	L7758
+jul17-soak-steady	vs-pgd-model	same	link	44	L7748
+jul17-soak-steady	vs-pgd-model	same	session_ack	34	L7725
+jul17-soak-steady	vs-recorded	same	fwd_poll	45	L7746
+jul17-soak-steady	vs-recorded	same	key	5	L7758
+jul17-soak-steady	vs-recorded	same	link	44	L7748
+jul17-soak-steady	vs-recorded	same	session_ack	34	L7725
+jul17-nofwd-join	harness	tx_units=69 unaligned=0 isr_stale_drops=0
+jul17-nofwd-join	pgd-model-vs-pgd	same	link	38	L1538
+jul17-nofwd-join	pgd-model-vs-pgd	same	rollcall	1	L1693
+jul17-nofwd-join	pgd-model-vs-pgd	same	session_ack	21	L1576
+jul17-nofwd-join	vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	1	L1687
+jul17-nofwd-join	vs-pgd-model	same	ident	1	L1921
+jul17-nofwd-join	vs-pgd-model	same	link	43	L1691
+jul17-nofwd-join	vs-pgd-model	same	rollcall	3	L1683
+jul17-nofwd-join	vs-pgd-model	same	session_ack	21	L1737
+jul17-nofwd-join	vs-recorded	same	ident	1	L1921
+jul17-nofwd-join	vs-recorded	same	link	43	L1691
+jul17-nofwd-join	vs-recorded	same	rollcall	4	L1683
+jul17-nofwd-join	vs-recorded	same	session_ack	21	L1737
+oct02-passive-ffwalk	harness	tx_units=0 unaligned=0 isr_stale_drops=0
+oct02-passive-ffwalk	counterfactual-vs-pgd-model	extra	R-RC-30/V3	1	L683
+oct02-passive-ffwalk	counterfactual-vs-pgd-model	extra	R-RC-30/V3 + D2/DV-2 honest skip	1	L50
+oct02-passive-ffwalk	pgd-model-vs-pgd	same	ident	2	L110
+oct02-passive-ffwalk	pgd-model-vs-pgd	same	link	204	L55
+oct02-passive-ffwalk	pgd-model-vs-pgd	same	resend (A6:T8/R-LL-05)	8	L343
+oct02-passive-ffwalk	pgd-model-vs-pgd	same	rollcall	4	L51
+oct02-passive-ffwalk	pgd-model-vs-pgd	same	session_ack	62	L108
+oct02-passive-ffwalk	walk-detector	same	ff-walk	2	L21
+oct02-passive-gapwalk	harness	tx_units=0 unaligned=0 isr_stale_drops=0
+oct02-passive-gapwalk	counterfactual-vs-pgd-model	same	rollcall	1	L2149
+oct02-passive-gapwalk	pgd-model-vs-pgd	same	link	52	L2027
+oct02-passive-gapwalk	pgd-model-vs-pgd	same	resend (A6:T8/R-LL-05)	3	L2148
+oct05-enrolled-loop	harness	tx_units=45 unaligned=0 isr_stale_drops=0
+oct05-enrolled-loop	pgd-model-vs-pgd	different-bytes	R-LL-20	2	L222
+oct05-enrolled-loop	pgd-model-vs-pgd	extra	A6:T19	1	L457
+oct05-enrolled-loop	pgd-model-vs-pgd	extra	R-RC-25 (pGD master walk/token)	2	L230
+oct05-enrolled-loop	pgd-model-vs-pgd	extra	R-SE-19/R-LL-20	4	L227
+oct05-enrolled-loop	vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	5	L116
+oct05-enrolled-loop	vs-pgd-model	different-bytes	D3/DV-4 (R-LL-17)	2	L224
+oct05-enrolled-loop	vs-pgd-model	extra	D4/DV-3	6	L225
+oct05-enrolled-loop	vs-pgd-model	extra	R-RC-30/V3	9	L265
+oct05-enrolled-loop	vs-pgd-model	extra	R-RC-30/V3 + D2/DV-2 honest skip	8	L50
+oct05-enrolled-loop	vs-pgd-model	missing	D5 (R-LL-05/A6:T8)	3	L375
+oct05-enrolled-loop	vs-pgd-model	same	link	3	L375
+oct05-enrolled-loop	vs-pgd-model	same	rollcall	12	L114
+oct05-enrolled-loop	vs-recorded	same	fwd_poll	2	L224
+oct05-enrolled-loop	vs-recorded	same	link	3	L375
+oct05-enrolled-loop	vs-recorded	same	rollcall	34	L50
+oct05-enrolled-loop	vs-recorded	same	session_ack	6	L225
+oct05-enrolled-loop	walk-detector	same	ff-walk	22	L20
+oct05-passive-loop	harness	tx_units=0 unaligned=0 isr_stale_drops=0
+oct05-passive-loop	counterfactual-vs-pgd-model	extra	D7 (A6:T13; A1 R-RC-31 keeps it)	1	L327
+oct05-passive-loop	counterfactual-vs-pgd-model	extra	R-RC-30/V3	1	L358
+oct05-passive-loop	pgd-model-vs-pgd	extra	R-RC-25 (pGD master walk/token)	32	L297
+oct05-passive-loop	pgd-model-vs-pgd	same	ident	3	L376
+oct05-passive-loop	pgd-model-vs-pgd	same	link	7	L287
+oct05-passive-loop	pgd-model-vs-pgd	same	resend (A6:T8/R-LL-05)	3	L295
+oct05-passive-loop	pgd-model-vs-pgd	same	rollcall	2	L359
+oct05-passive-loop	pgd-model-vs-pgd	same	session_ack	9	L281
+oct05-passive-loop	walk-detector	missing	D8/V1 warm walk (claims not 00 00)	1	L329

@@ -179,6 +179,7 @@ c++ -std=c++17 test/test_hex_format.cpp    -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_fields.cpp   -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_nav.cpp      -o /tmp/t && /tmp/t  # prints "ok"
 c++ -std=c++17 test/test_plan_edit.cpp     -o /tmp/t && /tmp/t  # prints "ok"
+c++ -std=c++17 test/test_replay_conformance.cpp -o /tmp/t && /tmp/t  # prints "ok"
 ```
 
 `test_integration.cpp` drives `PlanTerminal` end to end against a mock µPC
@@ -188,6 +189,23 @@ address 31, 100 uncontested poll cycles, key injection in the enrolled
 slot, session acks under both checksum grammars, the ident reply, the
 re-poll rejection signal, FF-walk link-reset detection, and the graceful
 disenroll drain.
+
+`test_replay_conformance.cpp` replays recorded bus captures through
+`PlanTerminal::on_byte` exactly as the RX ISR feeds it (byte, 9th bit,
+time; a match inside a frame is dropped by the ISR's FIFO gate) and compares
+the transmit actions with what the bridge really sent in that capture, with
+a pGD-faithful reference terminal at 0x1F (the measured pGD behaviour plus
+the roll-call rules), and checks that reference against the real pGD in the
+same capture. The captures are small windows of July (both terminals
+served), 10-02 (healthy pGD-only bus) and 10-05 (the FF-walk loop) under
+`test/replay/fixtures/`, each a `ekobeescope frames --text --live` stream
+whose header names the source capture, its sha256 and the task state.
+Every divergence (same / different-bytes / different-timing / missing /
+extra, tagged with its spec rule or deviation id) is an expectation in
+`test/replay/expected.tsv`: the test passes on the current code and fails on
+any change of that table, so a protocol fix shows up in review as a diff of
+it. `REPLAY_UPDATE=1 /tmp/t` rewrites the table, `/tmp/t --report` prints
+every divergence slot by slot.
 
 CI runs all of them on every push and pull request, and additionally builds
 the BusCapture example for an ESP32-C3 board with PlatformIO.

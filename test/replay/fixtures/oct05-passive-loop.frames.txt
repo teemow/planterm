@@ -1,0 +1,121 @@
+# replay fixture: oct05-passive-loop
+# what: tonight's passive bus (0 TX): three unacked pGD link replies, its master walk through 0x1F (member token), the warm FF-walk, re-adoption with three ident requests
+# source: heatpump-firmware:logs/bus-disturbance-2026-10-05/passive2.log sha256=8b38c6bdf118e3282b8eae2b77da71bab7843181d9a144a7c9242bad5f4fb025
+# window: 23:50:02.600-23:50:04.000
+# cmd: ekobeescope frames --text --live --from 23:50:02.600 --to 23:50:04.000 <source>   (ekobeescope c36a6b6)
+# task: enroll=0 fwd=0 tx_mode=2
+# pgd: present
+# warmup_ms: 0
+# counterfactual: enroll=1 fwd=1 (today's heatpump-firmware boots enrolled with set_poll_fwd(true), plan_observe.cpp)
+L281 23:50:02.600 rx #257 01>20 bit9 ok disp | 20 0B 1C 01 05 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 F2
+L282 23:50:02.604 rx #258 20>01 bit9 ok reply | 01 03 20 DB
+L283 23:50:02.610 rx #259 01>20 bit9 ok disp | 20 0B 1C 01 06 20 20 20 20 20 20 20 20 20 20 20 20 20 53 54 41 54 55 53 3A 20 20 B3
+L284 23:50:02.618 rx #260 20>01 bit9 ok reply | 01 03 20 DB
+L285 23:50:02.626 rx #261 01>20 bit9 ok disp | 20 0B 1C 01 07 20 20 20 20 20 20 20 20 20 20 20 20 20 4F 6E 20 20 20 20 20 20 20 73
+L286 23:50:02.632 rx #262 20>01 bit9 ok reply | 01 03 20 DB
+L287 23:50:02.634 rx #263 01>20 bit9 ok poll | 20 01 01 DD
+L288 23:50:02.636 rx #264 20>01 bit9 ok reply | 01 01 20 DD
+L289 23:50:02.656 rx #265 ??>01 bit9 none ack | 01
+L290 23:50:02.658 rx #266 01>20 bit9 ok poll | 20 01 01 DD
+L291 23:50:02.660 rx #267 20>01 bit9 ok reply | 01 01 20 DD
+L292 23:50:02.681 rx #268 ??>01 bit9 none ack | 01
+L293 23:50:02.682 rx #269 01>20 bit9 ok poll | 20 01 01 DD
+L294 23:50:02.696 rx #270 20>01 bit9 ok reply | 01 01 20 DD
+L295 23:50:02.711 rx #271 20>01 bit9 ok reply | 01 01 20 DD
+L296 23:50:02.727 rx #272 20>01 bit9 ok reply | 01 01 20 DD
+L297 23:50:02.743 rx #273 20>01 bit9 ok walk | 01 02 20 FF FF FF FF 80 00 00 00 60
+L298 23:50:02.758 rx #274 20>02 bit9 ok walk | 02 02 20 FF FF FF FE 80 00 00 00 60
+L299 23:50:02.772 rx #275 20>03 bit9 ok walk | 03 02 20 FF FF FF FC 80 00 00 00 61
+L300 23:50:02.787 rx #276 20>04 bit9 ok walk | 04 02 20 FF FF FF F8 80 00 00 00 64
+L301 23:50:02.803 rx #277 20>05 bit9 ok walk | 05 02 20 FF FF FF F0 80 00 00 00 6B
+L302 23:50:02.818 rx #278 20>06 bit9 ok walk | 06 02 20 FF FF FF E0 80 00 00 00 7A
+L303 23:50:02.833 rx #279 20>07 bit9 ok walk | 07 02 20 FF FF FF C0 80 00 00 00 99
+L304 23:50:02.848 rx #280 20>08 bit9 ok walk | 08 02 20 FF FF FF 80 80 00 00 00 D8
+L305 23:50:02.864 rx #281 20>09 bit9 ok walk | 09 02 20 FF FF FF 00 80 00 00 00 57
+L306 23:50:02.878 rx #282 20>0A bit9 ok walk | 0A 02 20 FF FF FE 00 80 00 00 00 57
+L307 23:50:02.893 rx #283 20>0B bit9 ok walk | 0B 02 20 FF FF FC 00 80 00 00 00 58
+L308 23:50:02.908 rx #284 20>0C bit9 ok walk | 0C 02 20 FF FF F8 00 80 00 00 00 5B
+L309 23:50:02.923 rx #285 20>0D bit9 ok walk | 0D 02 20 FF FF F0 00 80 00 00 00 62
+L310 23:50:02.938 rx #286 20>0E bit9 ok walk | 0E 02 20 FF FF E0 00 80 00 00 00 71
+L311 23:50:02.953 rx #287 20>0F bit9 ok walk | 0F 02 20 FF FF C0 00 80 00 00 00 90
+L312 23:50:02.968 rx #288 20>10 bit9 ok walk | 10 02 20 FF FF 80 00 80 00 00 00 CF
+L313 23:50:02.984 rx #289 20>11 bit9 ok walk | 11 02 20 FF FF 00 00 80 00 00 00 4E
+L314 23:50:02.998 rx #290 20>12 bit9 ok walk | 12 02 20 FF FE 00 00 80 00 00 00 4E
+L315 23:50:03.013 rx #291 20>13 bit9 ok walk | 13 02 20 FF FC 00 00 80 00 00 00 4F
+L316 23:50:03.028 rx #292 20>14 bit9 ok walk | 14 02 20 FF F8 00 00 80 00 00 00 52
+L317 23:50:03.043 rx #293 20>15 bit9 ok walk | 15 02 20 FF F0 00 00 80 00 00 00 59
+L318 23:50:03.058 rx #294 20>16 bit9 ok walk | 16 02 20 FF E0 00 00 80 00 00 00 68
+L319 23:50:03.074 rx #295 20>17 bit9 ok walk | 17 02 20 FF C0 00 00 80 00 00 00 87
+L320 23:50:03.092 rx #296 20>18 bit9 ok walk | 18 02 20 FF 80 00 00 80 00 00 00 C6
+L321 23:50:03.104 rx #297 20>19 bit9 ok walk | 19 02 20 FF 00 00 00 80 00 00 00 45
+L322 23:50:03.119 rx #298 20>1A bit9 ok walk | 1A 02 20 FE 00 00 00 80 00 00 00 45
+L323 23:50:03.135 rx #299 20>1B bit9 ok walk | 1B 02 20 FC 00 00 00 80 00 00 00 46
+L324 23:50:03.149 rx #300 20>1C bit9 ok walk | 1C 02 20 F8 00 00 00 80 00 00 00 49
+L325 23:50:03.164 rx #301 20>1D bit9 ok walk | 1D 02 20 F0 00 00 00 80 00 00 00 50
+L326 23:50:03.187 rx #302 20>1E bit9 ok walk | 1E 02 20 E0 00 00 00 80 00 00 00 5F
+L327 23:50:03.195 rx #303 20>1F bit9 ok walk | 1F 02 20 C0 00 00 00 80 00 00 00 7E
+L328 23:50:03.201 rx #304 20>01 bit9 ok walk | 01 02 20 FF FF FF FF 80 00 00 00 60
+L329 23:50:03.210 rx #305 01>02 bit9 ok walk | 02 02 01 FF FF FF FF 80 00 00 00 7E
+L330 23:50:03.219 rx #306 01>03 bit9 ok walk | 03 02 01 FF FF FF FD 80 00 00 00 7F
+L331 23:50:03.230 rx #307 01>04 bit9 ok walk | 04 02 01 FF FF FF F9 80 00 00 00 82
+L332 23:50:03.240 rx #308 01>05 bit9 ok walk | 05 02 01 FF FF FF F1 80 00 00 00 89
+L333 23:50:03.251 rx #309 01>06 bit9 ok walk | 06 02 01 FF FF FF E1 80 00 00 00 98
+L334 23:50:03.260 rx #310 01>07 bit9 ok walk | 07 02 01 FF FF FF C1 80 00 00 00 B7
+L335 23:50:03.271 rx #311 01>08 bit9 ok walk | 08 02 01 FF FF FF 81 80 00 00 00 F6
+L336 23:50:03.280 rx #312 01>09 bit9 ok walk | 09 02 01 FF FF FF 01 80 00 00 00 75
+L337 23:50:03.294 rx #313 01>0A bit9 ok walk | 0A 02 01 FF FF FE 01 80 00 00 00 75
+L338 23:50:03.303 rx #314 01>0B bit9 ok walk | 0B 02 01 FF FF FC 01 80 00 00 00 76
+L339 23:50:03.311 rx #315 01>0C bit9 ok walk | 0C 02 01 FF FF F8 01 80 00 00 00 79
+L340 23:50:03.320 rx #316 01>0D bit9 ok walk | 0D 02 01 FF FF F0 01 80 00 00 00 80
+L341 23:50:03.330 rx #317 01>0E bit9 ok walk | 0E 02 01 FF FF E0 01 80 00 00 00 8F
+L342 23:50:03.341 rx #318 01>0F bit9 ok walk | 0F 02 01 FF FF C0 01 80 00 00 00 AE
+L343 23:50:03.353 rx #319 01>10 bit9 ok walk | 10 02 01 FF FF 80 01 80 00 00 00 ED
+L344 23:50:03.363 rx #320 01>11 bit9 ok walk | 11 02 01 FF FF 00 01 80 00 00 00 6C
+L345 23:50:03.371 rx #321 01>12 bit9 ok walk | 12 02 01 FF FE 00 01 80 00 00 00 6C
+L346 23:50:03.393 rx #322 01>13 bit9 ok walk | 13 02 01 FF FC 00 01 80 00 00 00 6D
+L347 23:50:03.404 rx #323 01>14 bit9 ok walk | 14 02 01 FF F8 00 01 80 00 00 00 70
+L348 23:50:03.404 rx #324 01>15 bit9 ok walk | 15 02 01 FF F0 00 01 80 00 00 00 77
+L349 23:50:03.412 rx #325 01>16 bit9 ok walk | 16 02 01 FF E0 00 01 80 00 00 00 86
+L350 23:50:03.422 rx #326 01>17 bit9 ok walk | 17 02 01 FF C0 00 01 80 00 00 00 A5
+L351 23:50:03.432 rx #327 01>18 bit9 ok walk | 18 02 01 FF 80 00 01 80 00 00 00 E4
+L352 23:50:03.442 rx #328 01>19 bit9 ok walk | 19 02 01 FF 00 00 01 80 00 00 00 63
+L353 23:50:03.452 rx #329 01>1A bit9 ok walk | 1A 02 01 FE 00 00 01 80 00 00 00 63
+L354 23:50:03.462 rx #330 01>1B bit9 ok walk | 1B 02 01 FC 00 00 01 80 00 00 00 64
+L355 23:50:03.473 rx #331 01>1C bit9 ok walk | 1C 02 01 F8 00 00 01 80 00 00 00 67
+L356 23:50:03.482 rx #332 01>1D bit9 ok walk | 1D 02 01 F0 00 00 01 80 00 00 00 6E
+L357 23:50:03.493 rx #333 01>1E bit9 ok walk | 1E 02 01 E0 00 00 01 80 00 00 00 7D
+L358 23:50:03.502 rx #334 01>1F bit9 ok walk | 1F 02 01 C0 00 00 01 80 00 00 00 9C
+L359 23:50:03.507 rx #335 01>20 bit9 ok walk | 20 02 01 80 00 00 01 80 00 00 00 DB
+L360 23:50:03.510 rx #336 20>01 bit9 ok walk | 01 02 20 80 00 00 01 80 00 00 00 DB
+L361 23:50:03.513 rx #337 01>20 bit9 ok walk | 20 02 01 80 00 00 01 80 00 00 00 DB
+L362 23:50:03.515 rx #338 20>01 bit9 ok walk | 01 02 20 80 00 00 01 80 00 00 00 DB
+L363 23:50:03.518 rx #339 01>20 bit9 ok poll | 20 01 01 DD
+L364 23:50:03.520 rx #340 20>01 bit9 ok reply | 01 01 20 DD
+L365 23:50:03.541 rx #341 ??>01 bit9 none ack | 01
+L366 23:50:03.542 rx #342 01>20 bit9 ok poll | 20 01 01 DD
+L367 23:50:03.557 rx #343 20>01 bit9 ok reply | 01 01 20 DD
+L368 23:50:03.560 rx #344 20>01 bit9 ok reply | 01 01 20 DD
+L368 23:50:03.560 rx #344 01>20 bit9 ok poll | 20 01 01 DD
+L369 23:50:03.565 rx #345 20>01 bit9 ok reply | 01 01 20 DD
+L370 23:50:03.585 rx #346 ??>01 bit9 none ack | 01
+L371 23:50:03.587 rx #347 01>20 bit9 ok poll | 20 01 01 DD
+L372 23:50:03.591 rx #348 20>01 bit9 ok reply | 01 01 20 DD
+L373 23:50:03.610 rx #349 ??>01 bit9 none ack | 01
+L374 23:50:03.611 rx #350 01>20 bit9 ok other | 20 0A 06 01 00 CE
+L375 23:50:03.619 rx #351 20>01 bit9 ok reply | 01 03 20 DB
+L376 23:50:03.621 rx #352 01>20 bit9 ok other | 20 50 05 01 89
+L377 23:50:03.639 rx #353 20>01 bit9 ok other | 01 51 07 20 0A 17 65
+L378 23:50:03.641 rx #354 01>20 bit9 ok other | 20 50 05 01 89
+L379 23:50:03.659 rx #355 20>01 bit9 ok other | 01 51 07 20 0A 17 65
+L380 23:50:03.661 rx #356 01>20 bit9 ok other | 20 50 05 01 89
+L381 23:50:03.667 rx #357 20>01 bit9 ok other | 01 51 07 20 0A 17 65
+L382 23:50:03.669 rx #358 01>20 bit9 ok disp | 20 66 08 01 00 01 9D 13
+L383 23:50:03.687 rx #359 20>01 bit9 ok reply | 01 03 20 DB
+L384 23:50:03.693 rx #360 01>20 bit9 ok disp | 20 66 08 01 00 01 9D 13
+L385 23:50:03.702 rx #361 20>01 bit9 ok reply | 01 03 20 DB
+L386 23:50:03.702 rx #362 01>20 bit9 ok disp | 20 65 0F 01 01 00 00 00 00 00 00 00 00 9C 46
+L387 23:50:03.713 rx #363 20>01 bit9 ok reply | 01 03 20 DB
+L388 23:50:03.722 rx #364 01>20 bit9 ok disp | 20 65 0F 01 01 00 00 00 00 00 00 00 00 9C 46
+L389 23:50:03.733 rx #365 20>01 bit9 ok reply | 01 03 20 DB
+L390 23:50:03.741 rx #366 01>20 bit9 ok disp | 20 65 0F 01 01 00 00 00 00 00 00 00 00 9C 46
+L391 23:50:03.994 rx #367 20>01 bit9 ok reply | 01 03 20 DB
