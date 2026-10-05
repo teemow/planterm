@@ -17,6 +17,7 @@
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <string>
 
 namespace plan {
@@ -102,6 +103,10 @@ class SimController : public Station {
            stalls = 0;
   int last_fault = FC_NONE;
   std::vector<uint8_t> keys;  // accepted key codes (R-KP-11)
+  // (wave D12) Application hook for an accepted key: return true when the
+  // key was consumed (an edit field, an alarm reset), false for the default
+  // page navigation. The hook repaints through set_row / paint_delta.
+  std::function<bool(uint8_t key, int64_t t)> on_key;
 
   SimController() : Station(0x01) {}
 
@@ -299,6 +304,7 @@ class SimController : public Station {
   }
   void apply_key_(uint8_t k, int64_t t) {  // R-KP-17 / R-SE-15: one shared page
     keys.push_back(k);
+    if (on_key && on_key(k, t)) return;
     size_t to = screen.nav(k);
     if (to == screen.cur) return;
     screen.cur = to;
