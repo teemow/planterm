@@ -308,7 +308,8 @@ class PlanBridge : public Component {
   // connected at the same time. All slots taken -> the oldest client is
   // evicted, so the port can never be locked up by a wedged client. RAM
   // bound: each backlog grows only while ITS client stalls, capped at
-  // CAP_BACKLOG_MAX and returned on close (shrink_to_fit).
+  // CAP_BACKLOG_MAX and returned on close (swap idiom; shrink_to_fit is a
+  // no-op without exceptions).
   static constexpr size_t CAP_MAX_CLIENTS = 3;
   std::array<CapClient, CAP_MAX_CLIENTS> cap_clients_;
   std::vector<uint8_t> cap_rec_;  // scratch: one plaintext record being built
