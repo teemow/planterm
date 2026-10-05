@@ -1,0 +1,170 @@
+# Expected results of today's firmware in the D12 scenario + invariant suite
+# (test/test_sim_invariants.cpp). One row per (invariant, scenario, seed):
+#   status xfail     = today's code fails this invariant here; the rule column
+#                      names the root cause (a firmware rework row). The test
+#                      fails when such a row starts to PASS: flip (delete) it
+#                      in the PR that fixes the cause.
+#   status limit=<us> = I7: today's scrape-walk duration on a healthy bus. A
+#                      slower walk fails (the owner's hard rule); a faster one
+#                      passes -- lower the limit in the PR that speeds it up.
+# Regenerate with `test_sim_invariants --emit`, then review every changed row.
+I1	cold_boot	1	xfail	R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 20.8 s, bound 32.8 s)
+I1	cold_boot	2	xfail	R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 20.8 s, bound 32.8 s)
+I1	cold_boot	3	xfail	R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 20.8 s, bound 32.8 s)
+I1	bridge_boot	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 114.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	bridge_boot	1	xfail	D3/R-LL-17	1 FF-walks with the bridge vs 0 without (slack 0)
+I1	bridge_boot	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 114.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	bridge_boot	2	xfail	D3/R-LL-17	1 FF-walks with the bridge vs 0 without (slack 0)
+I1	bridge_boot	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 114.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	bridge_boot	3	xfail	D3/R-LL-17	1 FF-walks with the bridge vs 0 without (slack 0)
+I1	bridge_reset_noise	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	bridge_reset_noise	1	xfail	A7-DE-floating+D3/R-LL-17	2 FF-walks with the bridge vs 0 without (slack 0)
+I1	bridge_reset_noise	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	bridge_reset_noise	2	xfail	A7-DE-floating+D3/R-LL-17	2 FF-walks with the bridge vs 0 without (slack 0)
+I1	bridge_reset_noise	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	bridge_reset_noise	3	xfail	A7-DE-floating+D3/R-LL-17	2 FF-walks with the bridge vs 0 without (slack 0)
+I1	pgd_power_cycle	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 25.4 s, bound 37.4 s)
+I1	pgd_power_cycle	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 25.4 s, bound 37.4 s)
+I1	pgd_power_cycle	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 25.4 s, bound 37.4 s)
+I1	ctrl_silent_r9	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	ctrl_silent_r9	1	xfail	D3/R-LL-17	2 FF-walks with the bridge vs 1 without (slack 0)
+I1	ctrl_silent_r9	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	ctrl_silent_r9	2	xfail	D3/R-LL-17	2 FF-walks with the bridge vs 1 without (slack 0)
+I1	ctrl_silent_r9	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	ctrl_silent_r9	3	xfail	D3/R-LL-17	2 FF-walks with the bridge vs 1 without (slack 0)
+I1	loss_p00	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	loss_p00	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	loss_p00	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	loss_p01	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	loss_p01	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	loss_p01	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	loss_p05	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	loss_p05	1	xfail	D3/R-LL-17	3 FF-walks with the bridge vs 0 without (slack 0)
+I1	loss_p05	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	loss_p05	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	loss_p05	3	xfail	D3/R-LL-17	3 FF-walks with the bridge vs 0 without (slack 0)
+I1	loss_p15	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 4.3 s, bound 16.3 s)
+I2	loss_p15	1	xfail	A8-R7/R-RC-30(no-backoff)	31 FF-walks with the bridge vs 25 without (slack 5)
+I5	loss_p15	1	xfail	W-01/R-DI-15	1 wrong rows at settle instants: t=75.650s row 2 [    Hotwater:   33.2 C] never shown in the last 6 s (now [    Hotwater:   33.7 C])
+I1	loss_p15	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.1 s, bound 15.1 s)
+I2	loss_p15	2	xfail	A8-R7/R-RC-30(no-backoff)	40 FF-walks with the bridge vs 29 without (slack 5)
+I5	loss_p15	2	xfail	W-01/R-DI-15	1 wrong rows at settle instants: t=99.570s row 2 [    Hotwater:   34.5 C] never shown in the last 6 s (now [    Hotwater:   34.9 C])
+I1	loss_p15	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.0 s, bound 15.0 s)
+I1	loss_p28	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 9.0 s, bound 21.0 s)
+I5	loss_p28	1	xfail	W-01/R-DI-15	3 wrong rows at settle instants: t=59.700s row 2 [    Hotwater:   30.9 C] never shown in the last 6 s (now [    Hotwater:   32.9 C])
+I1	loss_p28	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 13.6 s, bound 25.6 s)
+I5	loss_p28	2	xfail	W-01/R-DI-15	1 wrong rows at settle instants: t=52.720s row 2 [    Hotwater:   32.0 C] never shown in the last 6 s (now [    Hotwater:   32.6 C])
+I1	loss_p28	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 6.6 s, bound 18.6 s)
+I5	loss_p28	3	xfail	W-01/R-DI-15	1 wrong rows at settle instants: t=106.430s row 2 [    Hotwater:   33.7 C] never shown in the last 6 s (now [    Hotwater:   35.3 C])
+I1	loss_p45	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 61.5 s, bound 73.5 s)
+I1	loss_p45	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 43.5 s, bound 55.5 s)
+I1	loss_p45	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 36.8 s, bound 48.8 s)
+I1	edit_p00	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	edit_p00	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	edit_p00	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	edit_p01	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	edit_p01	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	edit_p01	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	edit_p05	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	edit_p05	1	xfail	D3/R-LL-17	1 FF-walks with the bridge vs 0 without (slack 0)
+I1	edit_p05	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	edit_p05	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	edit_p05	3	xfail	D3/R-LL-17	5 FF-walks with the bridge vs 0 without (slack 0)
+I6	edit_p05	3	xfail	F-06/F-07+F-03	1 multi-sent/executed, 1 first-poll keys, 0 false successes (macro failed): key 0x10 (request 2) sent 2 times, executed 2 times
+I1	edit_p15	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 4.3 s, bound 16.3 s)
+I2	edit_p15	1	xfail	A8-R7/R-RC-30(no-backoff)	32 FF-walks with the bridge vs 25 without (slack 5)
+I6	edit_p15	1	xfail	F-06/F-07+F-03	1 multi-sent/executed, 1 first-poll keys, 0 false successes (macro failed): key 0x10 (request 2) sent 2 times, executed 2 times
+I1	edit_p15	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.1 s, bound 15.1 s)
+I2	edit_p15	2	xfail	A8-R7/R-RC-30(no-backoff)	43 FF-walks with the bridge vs 29 without (slack 5)
+I6	edit_p15	2	xfail	F-06/F-07+F-03	1 multi-sent/executed, 1 first-poll keys, 0 false successes (macro failed): key 0x10 (request 1) sent 2 times, executed 1 times
+I1	edit_p15	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.0 s, bound 15.0 s)
+I2	edit_p15	3	xfail	A8-R7/R-RC-30(no-backoff)	41 FF-walks with the bridge vs 32 without (slack 6)
+I5	edit_p15	3	xfail	W-01/R-DI-15	1 wrong rows at settle instants: t=115.610s row 2 [    Hotwater:   35.2 C] never shown in the last 6 s (now [    Hotwater:   35.7 C])
+I6	edit_p15	3	xfail	F-06/F-07+F-03	2 multi-sent/executed, 4 first-poll keys, 0 false successes (macro failed): key 0x10 (request 0) sent 2 times, executed 2 times
+I1	edit_p28	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 9.0 s, bound 21.0 s)
+I5	edit_p28	1	xfail	W-01/R-DI-15	11 wrong rows at settle instants: t=84.020s row 1 [ A.Unit On/Off        ] never shown in the last 6 s (now [                      ])
+I6	edit_p28	1	xfail	F-06/F-07+F-03	2 multi-sent/executed, 5 first-poll keys, 0 false successes (macro failed): key 0x10 (request 1) sent 2 times, executed 2 times
+I1	edit_p28	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 13.6 s, bound 25.6 s)
+I5	edit_p28	2	xfail	W-01/R-DI-15	6 wrong rows at settle instants: t=53.010s row 4 [    Outside:    12.0?C] never shown in the last 6 s (now [ D.Input/Output       ])
+I6	edit_p28	2	xfail	F-06/F-07+F-03	4 multi-sent/executed, 11 first-poll keys, 0 false successes (macro failed): key 0x10 (request 0) sent 2 times, executed 1 times
+I1	edit_p28	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 6.6 s, bound 18.6 s)
+I6	edit_p28	3	xfail	F-06/F-07+F-03	3 multi-sent/executed, 5 first-poll keys, 0 false successes (macro failed): key 0x10 (request 0) sent 2 times, executed 1 times
+I1	edit_p45	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 61.5 s, bound 73.5 s)
+I6	edit_p45	1	xfail	F-03	0 multi-sent/executed, 1 first-poll keys, 0 false successes (macro failed): key 0x10 at t=51.546s in the first poll after the walk at 51.238s
+I1	edit_p45	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 43.5 s, bound 55.5 s)
+I6	edit_p45	2	xfail	F-03	0 multi-sent/executed, 1 first-poll keys, 0 false successes (macro failed): key 0x10 at t=49.466s in the first poll after the walk at 49.158s
+I1	edit_p45	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 36.8 s, bound 48.8 s)
+I6	edit_p45	3	xfail	F-06/F-07+F-03	1 multi-sent/executed, 2 first-poll keys, 0 false successes (macro failed): key 0x10 (request 0) sent 2 times, executed 1 times
+I1	alarm_p00	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p00	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p00	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p01	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p01	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p01	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p05	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p05	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	alarm_p05	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	alarm_p05	3	xfail	D3/R-LL-17	6 FF-walks with the bridge vs 0 without (slack 0)
+I1	alarm_p15	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 4.3 s, bound 16.3 s)
+I2	alarm_p15	1	xfail	A8-R7/R-RC-30(no-backoff)	31 FF-walks with the bridge vs 25 without (slack 5)
+I6	alarm_p15	1	xfail	F-06/F-07+F-03	2 multi-sent/executed, 2 first-poll keys, 0 false successes (macro ok): key 0x0D (request 1) sent 2 times, executed 1 times
+I1	alarm_p15	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.1 s, bound 15.1 s)
+I2	alarm_p15	2	xfail	A8-R7/R-RC-30(no-backoff)	41 FF-walks with the bridge vs 29 without (slack 5)
+I1	alarm_p15	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.0 s, bound 15.0 s)
+I2	alarm_p15	3	xfail	A8-R7/R-RC-30(no-backoff)	40 FF-walks with the bridge vs 32 without (slack 6)
+I6	alarm_p15	3	xfail	F-06/F-07+F-03	3 multi-sent/executed, 5 first-poll keys, 0 false successes (macro ok): key 0x0D (request 0) sent 2 times, executed 1 times
+I1	alarm_p28	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 9.0 s, bound 21.0 s)
+I5	alarm_p28	1	xfail	W-01/R-DI-15	8 wrong rows at settle instants: t=41.370s row 2 [    Hotwater:   30.9 C] never shown in the last 6 s (now [AL04 Low superheat    ])
+I6	alarm_p28	1	xfail	F-06/F-07+F-03	2 multi-sent/executed, 8 first-poll keys, 0 false successes (macro failed): key 0x0D (request 1) sent 4 times, executed 3 times
+I1	alarm_p28	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 13.6 s, bound 25.6 s)
+I5	alarm_p28	2	xfail	W-01/R-DI-15	2 wrong rows at settle instants: t=52.690s row 6 [  STATUS:  Alarm-On   ] never shown in the last 6 s (now [                      ])
+I6	alarm_p28	2	xfail	F-06/F-07+F-03	3 multi-sent/executed, 6 first-poll keys, 0 false successes (macro ok): key 0x0D (request 0) sent 2 times, executed 1 times
+I1	alarm_p28	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 6.6 s, bound 18.6 s)
+I5	alarm_p28	3	xfail	W-01/R-DI-15	7 wrong rows at settle instants: t=90.500s row 0 [Alarms            AL1 ] never shown in the last 6 s (now [10:00 06/10/26 Ekobe  ])
+I6	alarm_p28	3	xfail	F-06/F-07+F-03	2 multi-sent/executed, 5 first-poll keys, 0 false successes (macro failed): key 0x0D (request 0) sent 2 times, executed 1 times
+I1	alarm_p45	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 61.5 s, bound 73.5 s)
+I6	alarm_p45	1	xfail	F-03	0 multi-sent/executed, 1 first-poll keys, 0 false successes (macro failed): key 0x0D at t=51.546s in the first poll after the walk at 51.238s
+I1	alarm_p45	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 43.5 s, bound 55.5 s)
+I6	alarm_p45	2	xfail	F-03	0 multi-sent/executed, 1 first-poll keys, 0 false successes (macro failed): key 0x0D at t=49.466s in the first poll after the walk at 49.158s
+I1	alarm_p45	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 36.8 s, bound 48.8 s)
+I6	alarm_p45	3	xfail	F-06/F-07+F-03	1 multi-sent/executed, 2 first-poll keys, 0 false successes (macro failed): key 0x0D (request 0) sent 2 times, executed 1 times
+I1	idle_drift	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	idle_drift	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	idle_drift	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I1	enrol_toggle	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 58.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	enrol_toggle	1	xfail	D3/R-LL-17	4 FF-walks with the bridge vs 0 without (slack 0)
+I1	enrol_toggle	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 58.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	enrol_toggle	2	xfail	D3/R-LL-17	4 FF-walks with the bridge vs 0 without (slack 0)
+I1	enrol_toggle	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 58.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	enrol_toggle	3	xfail	D3/R-LL-17	4 FF-walks with the bridge vs 0 without (slack 0)
+I1	keys_during_walks_p15	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 4.3 s, bound 16.3 s)
+I2	keys_during_walks_p15	1	xfail	A8-R7/R-RC-30(no-backoff)	34 FF-walks with the bridge vs 25 without (slack 5)
+I6	keys_during_walks_p15	1	xfail	F-06/F-07+F-03	18 multi-sent/executed, 23 first-poll keys, 0 false successes (macro -): key 0x0F (request 4) sent 2 times, executed 1 times
+I1	keys_during_walks_p15	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.1 s, bound 15.1 s)
+I6	keys_during_walks_p15	2	xfail	F-06/F-07+F-03	13 multi-sent/executed, 21 first-poll keys, 0 false successes (macro -): key 0x0F (request 0) sent 4 times, executed 3 times
+I1	keys_during_walks_p15	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 3.0 s, bound 15.0 s)
+I5	keys_during_walks_p15	3	xfail	W-01/R-DI-15	1 wrong rows at settle instants: t=32.700s row 2 [    Hotwater:   31.1 C] never shown in the last 6 s (now [    Hotwater:   31.6 C])
+I6	keys_during_walks_p15	3	xfail	F-06/F-07+F-03	15 multi-sent/executed, 19 first-poll keys, 0 false successes (macro -): key 0x0F (request 0) sent 3 times, executed 2 times
+I1	edit_commit_lost	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I6	edit_commit_lost	1	xfail	F-02/F-13	0 multi-sent/executed, 0 first-poll keys, 1 false successes (macro ok): macro reported success, controller holds 45.0 (commit lost)
+I1	edit_commit_lost	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I6	edit_commit_lost	2	xfail	F-02/F-13	0 multi-sent/executed, 0 first-poll keys, 1 false successes (macro ok): macro reported success, controller holds 45.0 (commit lost)
+I1	edit_commit_lost	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 120.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I6	edit_commit_lost	3	xfail	F-02/F-13	0 multi-sent/executed, 0 first-poll keys, 1 false successes (macro ok): macro reported success, controller holds 45.0 (commit lost)
+I1	recovery_p28_to_p01	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 150.0 s (bridge absent: 9.0 s, bound 21.0 s)
+I5	recovery_p28_to_p01	1	xfail	W-01/R-DI-15	2 wrong rows at settle instants: t=59.700s row 2 [    Hotwater:   30.9 C] never shown in the last 6 s (now [    Hotwater:   32.9 C])
+I1	recovery_p28_to_p01	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 150.0 s (bridge absent: 13.6 s, bound 25.6 s)
+I5	recovery_p28_to_p01	2	xfail	W-01/R-DI-15	1 wrong rows at settle instants: t=52.720s row 2 [    Hotwater:   32.0 C] never shown in the last 6 s (now [    Hotwater:   32.6 C])
+I1	recovery_p28_to_p01	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 150.0 s (bridge absent: 6.6 s, bound 18.6 s)
+I1	scrape_walk_p00	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I7	scrape_walk_p00	1	limit=2670000	owner-walk-never-slower	today's walk duration in us
+I1	scrape_walk_p00	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I7	scrape_walk_p00	2	limit=2670000	owner-walk-never-slower	today's walk duration in us
+I1	scrape_walk_p00	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I7	scrape_walk_p00	3	limit=2670000	owner-walk-never-slower	today's walk duration in us
+I1	scrape_walk_p01	1	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I7	scrape_walk_p01	1	limit=2710000	owner-walk-never-slower	today's walk duration in us
+I1	scrape_walk_p01	2	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I7	scrape_walk_p01	2	limit=2620000	owner-walk-never-slower	today's walk duration in us
+I1	scrape_walk_p01	3	xfail	D3/R-LL-17+R-RC-30/V3+R-RC-32	pGD unpainted for 90.0 s (bridge absent: 2.0 s, bound 15.0 s)
+I7	scrape_walk_p01	3	limit=2620000	owner-walk-never-slower	today's walk duration in us
