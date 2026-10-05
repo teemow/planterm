@@ -304,6 +304,7 @@ class PlanTerminal {
       link_reset_ = true;
       t_link_reset_us_ = now_us;  // ring-forwarding lockout window
       tel_walks_ = tel_walks_ + 1;  // planterm#47: FF-walks seen this window
+      rc_on_walk_(now_us);          // join back-off: did our last join hold?
     }
 
     // Terminal enrollment: the roll-call is a TOKEN RING, not a
@@ -333,7 +334,17 @@ class PlanTerminal {
         uint8_t s = static_cast<uint8_t>(ENROLL_ADDR + 0x02 + rc_from_);
         for (int i = 0; i < 8; i++)
           s += rc_payload_[i];
-        if (static_cast<uint8_t>(s + b) == 0xFF) {
+        const bool rc_ck_ok = static_cast<uint8_t>(s + b) == 0xFF;
+        // Join back-off (see rc_on_walk_): while backed off, stay SILENT on
+        // every roll-call token -- no reply, no renounce frame, nothing on
+        // the wire, exactly like an empty address -- so the controller and
+        // the pGD can settle without us re-joining on every FF-walk. Checked
+        // here, at the reply, not at the address match: the FF-walk marker
+        // frame can itself be addressed to us, and its marker bytes (which
+        // may start the back-off) arrive before its check byte.
+        if (rc_ck_ok && now_us < rc_backoff_until_us_)
+          rc_muted_ = rc_muted_ + 1;
+        else if (rc_ck_ok) {
           act.kind = TxAction::ROLLCALL_REPLY;
           act.len = 12;
           // Forward the token to a LIVE member above us (a pGD at 0x20),
@@ -362,8 +373,27 @@ class PlanTerminal {
           // intact-return of a dead 32 was the 01:04 FF-walk loop). A LIVE
           // 32 keeps its presence bit -- the controller walks it itself
           // right after our return (observed 07:43:04.012).
-          if (!pgd_live)
-            rc_payload_[0] = static_cast<uint8_t>(rc_payload_[0] & ~0x80);
+          // RECOVERY PROBE (2026-10-05/06): the skip alone LATCHES. Once 32
+          // is cleared the controller never probes 0x20, the pGD never
+          // transmits, liveness never re-arms -- the dead -> live direction
+          // had no path (the poll-forward bootstrap needs an established
+          // link and poll forwarding on). So on a bounded schedule (at most
+          // one walk per rc_probe_us_) a liveness-dead 32 is returned INTACT
+          // anyway: a present pGD answers the controller's walk of 0x20 and
+          // re-arms liveness; every other walk keeps the honest skip, so a
+          // truly absent 32 costs at most one walk per interval, never the
+          // permanent intact-return loop of 01:04. rc_probe_us_ = 0 = skip
+          // on every walk (the pre-probe behavior). The slot is spent only
+          // when the token actually carries 32's bit.
+          if (!pgd_live) {
+            if (rc_probe_us_ != 0 && (rc_payload_[0] & 0x80) != 0 &&
+                now_us >= rc_probe_next_us_) {
+              rc_probe_next_us_ = now_us + rc_probe_us_;
+              rc_probes_ = rc_probes_ + 1;
+            } else {
+              rc_payload_[0] = static_cast<uint8_t>(rc_payload_[0] & ~0x80);
+            }
+          }
           act.frame[1] = 0x02;
           act.frame[2] = ENROLL_ADDR;
           for (int i = 0; i < 8; i++)
@@ -658,6 +688,8 @@ class PlanTerminal {
         enroll_replies_ = enroll_replies_ + 1;
         if (drain_)
           drain_replied_ = true;  // the renounce went out; task finishes the leave
+        else
+          rc_claim_us_ = now_us;  // a (re)join: starts the failed-session clock
         break;
       case TxAction::SESSION_ACK:
         session_acks_ = session_acks_ + 1;
@@ -789,6 +821,89 @@ class PlanTerminal {
   volatile uint32_t tel_post_tx_gap_max_us_{0};  // max our-TX-end -> next-byte gap
   volatile uint32_t tel_tx_unacked_{0};          // our TX not followed within 100 ms
   volatile uint32_t tel_walks_{0};               // FF-walk markers this window
+
+  // --- roll-call recovery probe + join back-off (2026-10-05/06) ------------
+  // Recovery probe: see the honest skip in on_byte. Interval between intact
+  // returns of a liveness-dead 32; 0 = honest skip on every walk. Task-set.
+  static constexpr uint32_t RC_PROBE_DEFAULT_US = 30'000'000;
+  // Join back-off. While the controller cannot hold a session (it misses
+  // replies), every FF-walk re-joined us -- 3-6 walks per 10 s for days, and
+  // the restart rate crept from 2.7 to 5.4 per 10 s over 36 h. A FAILED
+  // SESSION is an FF-walk within RC_FAIL_WINDOW_US of our last (re)join
+  // claim: 5x the controller's ~2 s link timeout and under the ~12 s
+  // free-address invitation cadence (a missed reply walks ~2 s later; the
+  // controller never roll-calls an established member, so every claim of
+  // ours IS a join). After RC_FAIL_STREAK in a row we go silent on roll-call
+  // tokens for a back-off that doubles per further failure (30 s, 60 s,
+  // 120 s ... capped at 10 min). A join that held RC_SURVIVE_US resets the
+  // ladder; any join that outlived the fail window breaks the streak. The
+  // streak counts even with the back-off switched off (A/B telemetry).
+  static constexpr int64_t RC_FAIL_WINDOW_US = 10'000'000;
+  static constexpr uint32_t RC_FAIL_STREAK = 3;
+  static constexpr uint32_t RC_BACKOFF_MIN_US = 30'000'000;
+  static constexpr uint32_t RC_BACKOFF_MAX_US = 600'000'000;
+  static constexpr int64_t RC_SURVIVE_US = 60'000'000;
+
+  volatile uint32_t rc_probe_us_{RC_PROBE_DEFAULT_US};  // knob, 0 = off
+  volatile uint8_t rc_backoff_on_{1};                   // knob, 0 = never back off
+  volatile uint32_t rc_probes_{0};       // intact returns of a dead 32 (cumulative)
+  volatile uint32_t rc_fail_streak_{0};  // consecutive failed sessions (raw)
+  volatile uint32_t rc_backoffs_{0};     // back-offs entered (per window)
+  volatile uint32_t rc_muted_{0};        // tokens left unanswered while backed off (cumulative)
+
+  // Task side: a failed-session streak that reads 0 once the current join
+  // has held RC_SURVIVE_US (the ISR only settles it at the next FF-walk).
+  uint32_t rc_fail_streak(int64_t now_us) const {
+    const int64_t claim = read64_(rc_claim_us_);
+    return (claim != 0 && now_us - claim >= RC_SURVIVE_US) ? 0 : rc_fail_streak_;
+  }
+  bool rc_backed_off(int64_t now_us) const { return now_us < read64_(rc_backoff_until_us_); }
+  // Task side: switch the back-off; switching it off also ends a running
+  // one (knob first, so the ISR cannot re-arm the deadline behind us).
+  void set_rc_backoff(bool on) {
+    rc_backoff_on_ = on ? 1 : 0;
+    if (!on)
+      rc_backoff_until_us_ = 0;
+  }
+
+ protected:
+  volatile int64_t rc_probe_next_us_{0};     // next walk a dead 32 may go back intact
+  volatile int64_t rc_claim_us_{0};          // our last (re)join claim, 0 = no session
+  volatile int64_t rc_backoff_until_us_{0};  // silent on roll-call tokens until then
+  volatile uint32_t rc_backoff_next_us_{0};  // next back-off length, 0 = the minimum
+
+  // FF-walk marker seen (ISR, once per walk): settle the session it ended.
+  void PLAN_IRAM rc_on_walk_(int64_t now_us) {
+    const int64_t claim = rc_claim_us_;
+    rc_claim_us_ = 0;  // the walk resets every link, ours included
+    if (claim == 0 || !enroll_)
+      return;
+    const int64_t age = now_us - claim;
+    if (age >= RC_FAIL_WINDOW_US) {
+      rc_fail_streak_ = 0;  // not a failed session: the streak breaks
+      if (age >= RC_SURVIVE_US)
+        rc_backoff_next_us_ = 0;  // a held session resets the ladder
+      return;
+    }
+    rc_fail_streak_ = rc_fail_streak_ + 1;
+    if (rc_backoff_on_ != 0 && rc_fail_streak_ >= RC_FAIL_STREAK) {
+      const uint32_t d = rc_backoff_next_us_ != 0 ? rc_backoff_next_us_ : RC_BACKOFF_MIN_US;
+      rc_backoff_until_us_ = now_us + d;
+      rc_backoff_next_us_ = (d >= RC_BACKOFF_MAX_US / 2) ? RC_BACKOFF_MAX_US : d * 2;
+      rc_backoffs_ = rc_backoffs_ + 1;
+    }
+  }
+
+  // A 64-bit volatile is two loads on the 32-bit core: re-read until stable
+  // so a task-side read never sees half of an ISR update.
+  static int64_t read64_(const volatile int64_t &v) {
+    int64_t a, b;
+    do {
+      a = v;
+      b = v;
+    } while (a != b);
+    return a;
+  }
 };
 
 }  // namespace plan

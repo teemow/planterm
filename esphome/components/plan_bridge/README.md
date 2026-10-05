@@ -123,7 +123,9 @@ add a second planterm `lib_deps` entry or IDF component.
 
 Public methods for YAML lambdas: `press_key(uint8_t keycode)`,
 `set_armed(bool)`, `set_enroll(bool)`, `set_tx_mode(int)`,
-`set_turnaround_us(uint32_t)`. Keycodes are in
+`set_turnaround_us(uint32_t)`, `set_skip_probe_s(uint32_t)`,
+`set_join_backoff(bool)` (see [Roll-call guards](#roll-call-guards)).
+Keycodes are in
 [protocol.md §6](../../../docs/protocol.md).
 
 ### Hooks for components building on top
@@ -197,6 +199,32 @@ WiFi stack stopped allocating at ~55 KB free
 so the capture server is what yields first. The periodic `bus10s`
 diagnostic carries `heap_free=` and `heap_block=` (free internal heap and
 its largest block) so a session's heap cost reads off its own stream.
+
+## Roll-call guards
+
+Two runtime switches keep the bridge from locking the bus into restart
+loops (both default on; measured 2026-10-05/06):
+
+- **Recovery probe** (`set_skip_probe_s`, default 30, `0` = off). When the
+  pGD@32 has been silent for 15 s, our roll-call return clears its
+  presence bit (the honest skip). On its own that latches: the controller
+  never probes 0x20 again, so the pGD never transmits and liveness never
+  re-arms. At most once per interval a dead 32 is returned intact instead,
+  so a present pGD gets walked and recovers; every other walk keeps the
+  skip, so an absent 32 costs at most one walk per interval.
+- **Join back-off** (`set_join_backoff`). An FF-walk within 10 s of our
+  join is a failed session; after 3 in a row the bridge stays silent on
+  roll-call tokens (no reply at all, like an empty address) for 30 s,
+  then 60 s, 120 s ... up to 10 min per further failure. A join that holds
+  60 s resets the ladder. Off also ends a running back-off; the streak is
+  counted either way.
+
+`bus10s` carries `join_fail=` (streak), `backoff=` (running, 1/0) and
+`backoffs=` (started this window), also as `last_join_fail_streak()`,
+`last_join_backoff_active()` and `last_join_backoffs()` for HA template
+sensors. The enroll line counts `skip_probes=` and `muted=` (tokens left
+unanswered while backed off); `jitter10s` carries `de_hold_min=` next to
+`de_hold_max=` (a value under ~770 us means a reply frame was cut short).
 
 ## Injection verdict
 

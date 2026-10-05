@@ -14,6 +14,10 @@
 //     CRC-16/Modbus for 0x64/65/66) get silence, clean frames get acked
 //   * slot-racing mode (tx_mode 0) acceptance and the re-poll rejection signal
 //   * the report-without-link-reply failure -> FF-walk -> link_reset_ detection
+//   * the honest-skip recovery probe: a latched-dead pGD@32 is re-offered on
+//     a bounded schedule and recovers; an absent one never loops
+//   * the join back-off: failed-session streak, silence (no TX at all) while
+//     backed off, the 30 s .. 10 min ladder and its reset
 
 #include "../src/plan_terminal.h"
 #include "mock_controller.h"
@@ -47,6 +51,58 @@ struct Bus {
       }
     }
     return reply;
+  }
+};
+
+// The FF-walk recovery as the live bus runs it, for the recovery-probe and
+// join back-off scenarios: the marker frame, then the walk's token to 0x1F
+// (assume-all-alive presence), then -- unless our return cleared 32's
+// presence bit -- the controller's own walk of 0x20 and the pGD's answer,
+// closed by the controller's next frame so the liveness probe sees it.
+struct Walker {
+  Bus &bus;
+  MockController &ctl;
+  mock::MockPgd &pgd;
+  bool pgd_in_ring{false};  // the controller polls 0x20 between walks
+
+  // One FF-walk; returns our reply to its token (empty = we stayed silent).
+  Bytes walk() {
+    static const uint8_t all_alive[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    static const uint8_t no_claims[4] = {0x00, 0x00, 0x00, 0x00};
+    bus.feed(ctl.emit_link_reset());
+    Bytes r = bus.feed(ctl.emit_token(ENROLL_ADDR, all_alive, no_claims));
+    pgd_in_ring = false;
+    if (r.empty() || ctl.walks_32_after(r)) {
+      uint8_t pres[4], claims[4];
+      for (int i = 0; i < 4; i++) {
+        pres[i] = r.empty() ? all_alive[i] : r[3 + i].v;
+        claims[i] = r.empty() ? no_claims[i] : r[7 + i].v;
+      }
+      Bytes t20 = ctl.emit_token(0x20, pres, claims);
+      assert(bus.feed(t20).empty());  // not ours to answer
+      Bytes a = pgd.answer_token(t20);
+      if (!a.empty()) {
+        assert(bus.feed(a).empty());
+        pgd_in_ring = true;
+      }
+    }
+    bus.feed(ctl.emit_ack());  // the controller's next frame closes the last run
+    return r;
+  }
+
+  // Bus time between walks, in 1 s steps; the controller polls an
+  // established pGD each step and its link reply keeps liveness fresh.
+  void idle(int64_t us) {
+    while (us > 0) {
+      const int64_t d = us < 1'000'000 ? us : 1'000'000;
+      bus.now += d;
+      us -= d;
+      if (pgd_in_ring) {
+        assert(bus.feed(ctl.emit_poll(0x20)).empty());
+        bus.feed(pgd.link_reply());
+        bus.feed(ctl.emit_ack());
+      }
+    }
   }
 };
 
@@ -503,6 +559,9 @@ int main() {
     Bus bus;
     MockController ctl;
     bus.term.enroll_ = true;
+    // The honest skip on its own (recovery probe off, the pre-probe
+    // behavior); the probe's schedule has its own tests below.
+    bus.term.rc_probe_us_ = 0;
 
     // Token forwarded by a pGD at 0x1E (exact live frame, ck 0x7F): presence
     // echoed VERBATIM (the forwarding chain owns it -- the pGD's own cold
@@ -617,6 +676,251 @@ int main() {
     uint32_t walks0 = bus.term.tel_walks_;
     bus.feed(ctl.emit_link_reset());
     assert(bus.term.tel_walks_ == walks0 + 1);
+  }
+
+  // --- Honest-skip recovery probe (2026-10-05/06): the skip alone latches a
+  // --- dead 32 out forever; the probe re-offers it on a bounded schedule ---
+  {
+    Bus bus;
+    MockController ctl;
+    mock::MockPgd pgd;
+    Walker w{bus, ctl, pgd};
+    bus.term.enroll_ = true;
+    assert(bus.term.rc_probe_us_ == PlanTerminal::RC_PROBE_DEFAULT_US);  // on by default
+    bus.term.set_rc_backoff(false);  // isolate the probe from the join back-off
+    bus.term.rc_probe_us_ = 0;       // the pre-probe build first
+
+    // The pGD is THERE, but its liveness is unarmed (boot, or >15 s silent):
+    // every walk clears its bit, the controller never offers 0x20, the pGD
+    // never transmits, liveness never re-arms -- 40 walks over 8 min, latched.
+    for (int i = 0; i < 40; i++) {
+      Bytes r = w.walk();
+      assert(r.size() == 12 && (r[3].v & 0x80) == 0);
+      assert(!w.pgd_in_ring);
+      w.idle(12'000'000);
+    }
+
+    // Probe on: the next walk returns 32 INTACT, the controller walks 0x20,
+    // the pGD answers and liveness re-arms.
+    bus.term.rc_probe_us_ = PlanTerminal::RC_PROBE_DEFAULT_US;
+    Bytes r = w.walk();
+    assert(r.size() == 12 && (r[3].v & 0x80) != 0 && sum8v(r, 0, 12) == 0xFF);
+    assert(w.pgd_in_ring);
+    assert(bus.term.rc_probes_ == 1);
+
+    // 32 is LIVE from here: every walk keeps it, no further probe spent.
+    for (int i = 0; i < 20; i++) {
+      w.idle(5'000'000);
+      r = w.walk();
+      assert(r.size() == 12 && (r[3].v & 0x80) != 0);
+      assert(w.pgd_in_ring);
+    }
+    assert(bus.term.rc_probes_ == 1);
+  }
+  {
+    // A truly ABSENT 32 is never stuck in an intact-return loop (the
+    // 2026-07-17 01:04 incident): under 3 s FF-walk churn at most one walk
+    // per 30 s returns it intact, never two in a row, every other walk keeps
+    // the honest skip. When the pGD comes back, the next probe re-offers it.
+    Bus bus;
+    MockController ctl;
+    mock::MockPgd pgd;
+    pgd.present = false;
+    Walker w{bus, ctl, pgd};
+    bus.term.enroll_ = true;
+    bus.term.set_rc_backoff(false);
+
+    const int64_t t0 = bus.now;
+    int64_t last_intact = 0;
+    bool prev_intact = false;
+    int intact = 0;
+    for (int i = 0; i < 120; i++) {  // 6 min
+      Bytes r = w.walk();
+      assert(r.size() == 12 && sum8v(r, 0, 12) == 0xFF);
+      const bool in = (r[3].v & 0x80) != 0;
+      if (in) {
+        assert(!prev_intact);
+        assert(last_intact == 0 || bus.now - last_intact >= PlanTerminal::RC_PROBE_DEFAULT_US);
+        last_intact = bus.now;
+        intact++;
+      }
+      prev_intact = in;
+      assert(!w.pgd_in_ring);
+      w.idle(3'000'000);
+    }
+    const int64_t span = bus.now - t0;
+    assert(intact >= 2 && intact <= span / PlanTerminal::RC_PROBE_DEFAULT_US + 1);
+    assert(static_cast<int>(bus.term.rc_probes_) == intact);
+
+    // The pGD is plugged back in: recovered within one probe interval plus
+    // one walk, and kept from then on.
+    pgd.present = true;
+    const int64_t back = bus.now;
+    while (!w.pgd_in_ring) {
+      assert(bus.now - back <= PlanTerminal::RC_PROBE_DEFAULT_US + 3'500'000);
+      w.walk();
+      if (!w.pgd_in_ring)
+        w.idle(3'000'000);
+    }
+    const uint32_t probes = bus.term.rc_probes_;
+    for (int i = 0; i < 10; i++) {
+      w.idle(3'000'000);
+      Bytes r = w.walk();
+      assert(r.size() == 12 && (r[3].v & 0x80) != 0 && w.pgd_in_ring);
+    }
+    assert(bus.term.rc_probes_ == probes);
+  }
+
+  // --- Join back-off (2026-10-05/06): the bridge must never be the thing
+  // --- that keeps a struggling controller in restart churn ---
+  {
+    Bus bus;
+    MockController ctl;
+    mock::MockPgd pgd;
+    Walker w{bus, ctl, pgd};
+    bus.term.enroll_ = true;
+    assert(bus.term.rc_backoff_on_ == 1);  // on by default
+    // A back-off of exactly d us started during the walk that just ended.
+    auto backoff_is = [&](int64_t d) {
+      return bus.term.rc_backed_off(bus.now + d - 100'000) && !bus.term.rc_backed_off(bus.now + d);
+    };
+    auto wait_out = [&] {
+      while (bus.term.rc_backed_off(bus.now))
+        w.idle(1'000'000);
+    };
+    const Bytes member_token{{0x1F, 1}, {0x02, 0}, {0x1E, 0}, {0x20, 0}, {0x00, 0}, {0x00, 0},
+                             {0x01, 0}, {0x20, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x7F, 0}};
+
+    // First join: no earlier session of ours, so its walk counts nothing.
+    assert(!w.walk().empty());
+    assert(bus.term.rc_fail_streak_ == 0);
+
+    // The controller cannot hold the session: every join is FF-walked ~2 s
+    // later. Two failed sessions -- still answering.
+    w.idle(2'000'000);
+    assert(!w.walk().empty());
+    assert(bus.term.rc_fail_streak_ == 1);
+    w.idle(2'000'000);
+    assert(!w.walk().empty());
+    assert(bus.term.rc_fail_streak_ == 2);
+
+    // The third: renounce. This very walk's token already goes unanswered.
+    w.idle(2'000'000);
+    assert(w.walk().empty());
+    assert(bus.term.rc_fail_streak_ == 3 && bus.term.rc_backoffs_ == 1);
+    assert(backoff_is(PlanTerminal::RC_BACKOFF_MIN_US));
+    assert(w.pgd_in_ring);  // the controller walks 0x20 itself, the pGD answers
+
+    // NO TX while backed off: the walks keep coming (controller and pGD
+    // restart on their own), plus free-address invitations and
+    // member-forwarded tokens -- silence throughout, the TX log never moves.
+    // (Polls and session frames are not gated, deliberately: the walk reset
+    // every link and we never re-claimed, so the controller has nothing to
+    // poll; answering a poll that did arrive is right, going dark on a live
+    // link is the hard-stop NO LINK fault.)
+    const uint32_t txlog0 = bus.term.txlog_w_;
+    const uint32_t muted0 = bus.term.rc_muted_;
+    for (int i = 0; i < 9; i++) {
+      assert(w.walk().empty());
+      assert(bus.feed(ctl.emit_rollcall(ENROLL_ADDR)).empty());
+      assert(bus.feed(member_token).empty());
+      w.idle(3'000'000);
+    }
+    assert(bus.term.rc_backed_off(bus.now));
+    assert(bus.term.txlog_w_ == txlog0);
+    assert(bus.term.rc_muted_ == muted0 + 27);
+    assert(bus.term.rc_fail_streak_ == 3);  // silent walks are no sessions
+
+    // Over: the next walk's token is answered (a rejoin). Failing again goes
+    // straight into the next back-off, doubled.
+    wait_out();
+    assert(!w.walk().empty());
+    w.idle(2'000'000);
+    assert(w.walk().empty());
+    assert(bus.term.rc_fail_streak_ == 4 && bus.term.rc_backoffs_ == 2);
+    assert(backoff_is(2ll * PlanTerminal::RC_BACKOFF_MIN_US));
+
+    // The ladder doubles up to the 10 min cap and stays there.
+    const int64_t ladder[] = {120'000'000, 240'000'000, 480'000'000, 600'000'000, 600'000'000};
+    for (int64_t d : ladder) {
+      wait_out();
+      assert(!w.walk().empty());
+      w.idle(2'000'000);
+      assert(w.walk().empty());
+      assert(backoff_is(d));
+    }
+
+    // A join that outlives the fail window but not the survival time breaks
+    // the streak, yet keeps the ladder: three more fast failures back off
+    // for the full 10 min again.
+    wait_out();
+    assert(!w.walk().empty());
+    w.idle(20'000'000);
+    assert(!w.walk().empty());
+    assert(bus.term.rc_fail_streak_ == 0);
+    for (int i = 1; i <= 2; i++) {
+      w.idle(2'000'000);
+      assert(!w.walk().empty());
+      assert(bus.term.rc_fail_streak_ == static_cast<uint32_t>(i));
+    }
+    w.idle(2'000'000);
+    assert(w.walk().empty());
+    assert(backoff_is(PlanTerminal::RC_BACKOFF_MAX_US));
+
+    // A join that HOLDS 60 s resets everything: the task-side streak reads 0
+    // once it has held (before any walk settles it), the walk that finally
+    // ends it zeroes the raw streak, and the next back-off is 30 s again.
+    wait_out();
+    assert(!w.walk().empty());
+    w.idle(61'000'000);
+    assert(bus.term.rc_fail_streak_ == 3 && bus.term.rc_fail_streak(bus.now) == 0);
+    assert(!w.walk().empty());
+    assert(bus.term.rc_fail_streak_ == 0);
+    for (int i = 0; i < 2; i++) {
+      w.idle(2'000'000);
+      assert(!w.walk().empty());
+    }
+    w.idle(2'000'000);
+    assert(w.walk().empty());
+    assert(backoff_is(PlanTerminal::RC_BACKOFF_MIN_US));
+  }
+  {
+    // Switched off, the streak is still counted (A/B telemetry) but never
+    // acted on; switching on acts on the next failure; switching off again
+    // ends the running back-off at once.
+    Bus bus;
+    MockController ctl;
+    mock::MockPgd pgd;
+    Walker w{bus, ctl, pgd};
+    bus.term.enroll_ = true;
+    bus.term.set_rc_backoff(false);
+    assert(!w.walk().empty());
+    for (int i = 0; i < 6; i++) {
+      w.idle(2'000'000);
+      assert(!w.walk().empty());
+    }
+    assert(bus.term.rc_fail_streak_ == 6 && bus.term.rc_backoffs_ == 0);
+    bus.term.set_rc_backoff(true);
+    w.idle(2'000'000);
+    assert(w.walk().empty());
+    assert(bus.term.rc_backed_off(bus.now));
+    bus.term.set_rc_backoff(false);
+    assert(!bus.term.rc_backed_off(bus.now));
+    w.idle(2'000'000);
+    assert(!w.walk().empty());
+  }
+  {
+    // Passive (not enrolled): no session of ours, nothing counted.
+    Bus bus;
+    MockController ctl;
+    mock::MockPgd pgd;
+    Walker w{bus, ctl, pgd};
+    for (int i = 0; i < 10; i++) {
+      assert(w.walk().empty());
+      w.idle(2'000'000);
+    }
+    assert(bus.term.rc_fail_streak_ == 0 && bus.term.rc_backoffs_ == 0);
+    assert(bus.term.txlog_w_ == 0);
   }
 
   std::printf("ok\n");

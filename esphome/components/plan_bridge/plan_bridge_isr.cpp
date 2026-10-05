@@ -170,6 +170,8 @@ void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
           uint32_t hold = static_cast<uint32_t>(t_drop - t_de);
           if (hold > self->de_hold_max_us_)
             self->de_hold_max_us_ = hold;
+          if (self->de_hold_min_us_ == 0 || hold < self->de_hold_min_us_)
+            self->de_hold_min_us_ = hold;
           self->term_.tx_sent(act, t_drop);
         } else {
           if (block)

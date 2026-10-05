@@ -82,6 +82,29 @@ class MockController {
     return f;
   }
 
+  // A roll-call token with explicit halves: ADDR' 02 01 <presence> <claims>
+  // CK. The FF-walk recovery walk offers every address the assume-all-alive
+  // presence FF FF FF FF (its first frame is the marker emit_link_reset
+  // sends), so 32's bit arrives set and the token's receiver decides
+  // whether 0x20 stays offered.
+  Bytes emit_token(uint8_t addr, const uint8_t presence[4], const uint8_t claims[4]) const {
+    Bytes f = {{addr, 1}, {0x02, 0}, {0x01, 0}};
+    for (int i = 0; i < 4; i++)
+      f.push_back({presence[i], 0});
+    for (int i = 0; i < 4; i++)
+      f.push_back({claims[i], 0});
+    f.push_back({static_cast<uint8_t>(0xFF - sum8v(f, 0, f.size())), 0});
+    return f;
+  }
+
+  // Whether the controller walks 0x20 itself after a terminal returned its
+  // token: only while 32's presence bit (bit7 of the first presence byte)
+  // came back INTACT (ground truth 2026-07-17 07:43:04.012; a cleared bit is
+  // the honest skip, and 0x20 is then never offered).
+  bool walks_32_after(const Bytes &reply) const {
+    return reply.size() == 12 && (reply[3].v & 0x80) != 0;
+  }
+
   // Application session frame: ADDR' TYPE LEN 01 <payload> CK where LEN is the
   // total length including CK and the frame sums to 0xFF (the general
   // controller->terminal envelope, e.g. TYPE 0x0B = one text row).
@@ -243,6 +266,34 @@ class MockController {
   std::vector<uint8_t> enrolled_;  // addresses adopted via roll-call
   bool needs_reset_{false};
   int link_resets_{0};
+};
+
+// The physical pGD@32 as a ring member. Answers the controller's walk of
+// 0x20 (20' 02 01 <presence> <claims> CK) the way its observed cold join did
+// (2026-07-16 19:39:02): presence echoed untouched, its own claim (bit7)
+// added in the claims half, token returned to the controller --
+// 01' 02 20 <presence> <claims | 80> CK. An absent pGD answers nothing.
+struct MockPgd {
+  bool present{true};
+
+  Bytes answer_token(const Bytes &token) const {
+    if (!present || token.size() != 12 || token[0].v != 0x20 || token[1].v != 0x02)
+      return {};
+    Bytes r = {{0x01, 1}, {0x02, 0}, {0x20, 0}};
+    for (int i = 0; i < 4; i++)
+      r.push_back({token[3 + i].v, 0});
+    for (int i = 0; i < 4; i++)
+      r.push_back({static_cast<uint8_t>(token[7 + i].v | (i == 0 ? 0x80 : 0x00)), 0});
+    r.push_back({static_cast<uint8_t>(0xFF - sum8v(r, 0, r.size())), 0});
+    return r;
+  }
+
+  // Its link reply to a poll (01' 01 20 DD), sent while it is established.
+  Bytes link_reply() const {
+    if (!present)
+      return {};
+    return {{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}};
+  }
 };
 
 }  // namespace mock

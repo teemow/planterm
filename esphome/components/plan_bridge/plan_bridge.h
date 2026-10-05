@@ -103,6 +103,13 @@ class PlanBridge : public Component {
   uint32_t last_tx_unacked() const { return tx_unacked_window_; }
   uint32_t last_post_tx_gap_max_us() const { return post_tx_gap_max_window_us_; }
   uint32_t last_walks() const { return walks_window_; }
+  // Join back-off state from the LAST completed bus10s window, latched the
+  // same way (see PlanTerminal::rc_on_walk_): the consecutive failed-session
+  // streak, whether a back-off was running at the window's end (1/0), and
+  // how many back-offs started in the window.
+  uint32_t last_join_fail_streak() const { return join_fail_streak_window_; }
+  uint32_t last_join_backoff_active() const { return join_backoff_active_window_; }
+  uint32_t last_join_backoffs() const { return join_backoffs_window_; }
   // Observe hook: a second consumer of the drained (byte, bit9) stream,
   // called from the bus task at the same site that feeds the screen-snapshot
   // cache (task context, never the ISR -- no IRAM constraints).
@@ -134,6 +141,17 @@ class PlanBridge : public Component {
   // Dual-terminal poll chaining (heatpump-firmware#14): forward our poll
   // token to the live pGD@32. Default off; flip per experiment.
   void set_poll_fwd(bool e) { term_.fwd_polls_ = e ? 1 : 0; }
+  // Roll-call recovery probe: at most once per `s` seconds return a
+  // liveness-dead pGD@32's presence bit INTACT instead of the honest skip,
+  // so the controller probes 0x20 again and a live pGD re-arms liveness.
+  // Default 30 s; 0 = honest skip on every walk (the pre-probe behavior).
+  // Capped at 1 h (the interval is held in 32-bit microseconds).
+  void set_skip_probe_s(uint32_t s) { term_.rc_probe_us_ = (s > 3600 ? 3600 : s) * 1000000u; }
+  // Join back-off: after 3 failed sessions in a row (FF-walk within 10 s of
+  // our join) stay silent on roll-call tokens for 30 s, 60 s, ... 10 min.
+  // Default on; off also ends a running back-off. The streak is counted
+  // either way.
+  void set_join_backoff(bool e) { term_.set_rc_backoff(e); }
   // The PLANCAP PSK (raw 32 bytes, from base64 in YAML -- on ESPHome devices
   // codegen defaults it to api.encryption.key). Called by codegen only when
   // a key is configured (which also sets the PLAN_CAP_NOISE build flag);
@@ -339,6 +357,16 @@ class PlanBridge : public Component {
   volatile uint32_t de_hold_max_us_{0};
   volatile uint32_t cs_would_fire_{0};
   volatile uint32_t cs_blocked_{0};
+  // Shortest DE hold per window (ISR-written next to de_hold_max_us_): a
+  // value below the frame's nominal byte time means a reply was cut short,
+  // e.g. tx_9bit leaving its per-byte uart_ll_is_tx_idle wait before the
+  // byte started shifting. Nominal ~770 us for the 4-byte link reply, the
+  // shortest frame we send. LAYOUT RULE: new members at the class END only.
+  volatile uint32_t de_hold_min_us_{0};
+  // Join back-off, latched per bus10s window for the getters above.
+  uint32_t join_fail_streak_window_{0};
+  uint32_t join_backoff_active_window_{0};
+  uint32_t join_backoffs_window_{0};
 };
 
 }  // namespace plan_bridge

@@ -7,6 +7,7 @@
 
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <soc/uart_periph.h>
 
 #include <lwip/sockets.h>
@@ -311,9 +312,17 @@ void PlanBridge::task_main() {
       // (heatpump-firmware#58) -- the per-session heap cost of a client
       // reads straight off its own capture stream, no HA round trip.
       uint32_t drop_now = cap_drop_bytes_;
+      // Join back-off (PlanTerminal::rc_on_walk_): latch the streak and the
+      // running state at the window's end, and the back-offs started in it,
+      // for the bus10s line and the HA getters.
+      const int64_t now_us = esp_timer_get_time();
+      join_fail_streak_window_ = term_.rc_fail_streak(now_us);
+      join_backoff_active_window_ = term_.rc_backed_off(now_us) ? 1 : 0;
+      join_backoffs_window_ = term_.rc_backoffs_;
+      term_.rc_backoffs_ = 0;
       capture_diag_(plan::CAP_DIAG_INFO,
                     "bus10s: ctrl=%u pgd=%u us=%u other=%u cksum_fail=%u post_tx_gap_min=%uus "
-                    "post_tx_gap_max=%uus tx_unacked=%u walks=%u "
+                    "post_tx_gap_max=%uus tx_unacked=%u walks=%u join_fail=%u backoff=%u backoffs=%u "
                     "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u heap_free=%u heap_block=%u",
                     static_cast<unsigned>(term_.tel_frames_ctrl_),
                     static_cast<unsigned>(term_.tel_frames_pgd_),
@@ -324,6 +333,9 @@ void PlanBridge::task_main() {
                     static_cast<unsigned>(term_.tel_post_tx_gap_max_us_),
                     static_cast<unsigned>(term_.tel_tx_unacked_),
                     static_cast<unsigned>(term_.tel_walks_),
+                    static_cast<unsigned>(join_fail_streak_window_),
+                    static_cast<unsigned>(join_backoff_active_window_),
+                    static_cast<unsigned>(join_backoffs_window_),
                     static_cast<unsigned>(drop_now - drop_last_window_),
                     static_cast<unsigned>(isr_multi_drain_), static_cast<unsigned>(isr_drain_max_),
                     static_cast<unsigned>(cap_seq_), static_cast<unsigned>(heap_free()),
@@ -351,29 +363,34 @@ void PlanBridge::task_main() {
       // de_hold = DE hold time; cs_would/blocked = carrier sense; the de_tail
       // and cs settings are echoed for visibility. Read-and-reset per window.
       capture_diag_(plan::CAP_DIAG_INFO,
-                    "jitter10s: de_assert_min=%uus max=%uus late=%u de_hold_max=%uus "
+                    "jitter10s: de_assert_min=%uus max=%uus late=%u de_hold_min=%uus de_hold_max=%uus "
                     "cs_would=%u cs_blocked=%u de_tail=%uus cs=%u",
                     static_cast<unsigned>(jit_min_us_), static_cast<unsigned>(jit_max_us_),
-                    static_cast<unsigned>(jit_late_), static_cast<unsigned>(de_hold_max_us_),
+                    static_cast<unsigned>(jit_late_), static_cast<unsigned>(de_hold_min_us_),
+                    static_cast<unsigned>(de_hold_max_us_),
                     static_cast<unsigned>(cs_would_fire_), static_cast<unsigned>(cs_blocked_),
                     static_cast<unsigned>(de_tail_us_), static_cast<unsigned>(carrier_sense_));
       jit_min_us_ = 0;
       jit_max_us_ = 0;
       jit_late_ = 0;
       de_hold_max_us_ = 0;
+      de_hold_min_us_ = 0;
       cs_would_fire_ = 0;
       cs_blocked_ = 0;
       if (term_.enroll_ || term_.enroll_replies_ > 0)
         capture_diag_(plan::CAP_DIAG_INFO,
                       "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "
-                      "%u ident replies, %u acks withheld (cksum fail), fwd=%d ok=%u fail=%u",
+                      "%u ident replies, %u acks withheld (cksum fail), fwd=%d ok=%u fail=%u, "
+                      "skip_probes=%u muted=%u",
                       plan::ENROLL_ADDR, static_cast<unsigned>(term_.enroll_replies_),
                       static_cast<unsigned>(term_.enroll_polls_),
                       static_cast<unsigned>(term_.session_acks_),
                       static_cast<unsigned>(term_.ident_replies_),
                       static_cast<unsigned>(term_.ack_ck_fail_),
                       static_cast<int>(term_.fwd_polls_), static_cast<unsigned>(term_.fwd_ok_),
-                      static_cast<unsigned>(term_.fwd_fail_));
+                      static_cast<unsigned>(term_.fwd_fail_),
+                      static_cast<unsigned>(term_.rc_probes_),
+                      static_cast<unsigned>(term_.rc_muted_));
       if (term_.gap_n_ > 0) {
         char buf[160];
         int p = 0;
@@ -809,10 +826,11 @@ void PlanBridge::capture_event_(uint8_t kind, uint8_t a, uint8_t b) {
 // ack, never parsed out of this text. Bus task only (same single-owner
 // rule as capture_event_, same stalled-client policy).
 void PlanBridge::capture_diag_(uint8_t severity, const char *fmt, ...) {
-  // 256, not 192: the bus10s line grew past 192 with the planterm#47 reject
-  // counters (post_tx_gap_max / tx_unacked / walks). vsnprintf still self-caps
-  // to sizeof(buf), so a longer line is truncated rather than overrunning.
-  char buf[256];
+  // 288, not 192: the bus10s line grew past 192 with the planterm#47 reject
+  // counters (post_tx_gap_max / tx_unacked / walks) and past 256 with the
+  // join back-off fields (join_fail / backoff / backoffs). vsnprintf still
+  // self-caps to sizeof(buf), so a longer line is truncated, not overrun.
+  char buf[288];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
