@@ -199,6 +199,36 @@ so the capture server is what yields first. The periodic `bus10s`
 diagnostic carries `heap_free=` and `heap_block=` (free internal heap and
 its largest block) so a session's heap cost reads off its own stream.
 
+## Bus-health telemetry (wave E5)
+
+The end of every `bus10s` line describes the bus as the bridge hears it,
+**passive included** (the 2026-10 fault was invisible to every counter while
+the bridge only listened). Each field is also a getter on the last completed
+window (`last_bus_window()` or the named one), for Home Assistant sensors:
+
+| field | getter | healthy | meaning |
+|---|---|---|---|
+| `health` | `last_bus_health()` | 0 | 0 healthy / 1 degraded / 2 loop, the `ekobeescope health` thresholds (below) |
+| `ra20` / `ack20` | `last_resend_after_ack_pgd()` / `last_acked_pgd()` / `_pct()` | 0 % | the controller resent a session frame the pGD had acked: it cannot hear the terminals (July 0 %, 10-02 2-5 %, 10-05 28 %) |
+| `ra1f` / `ack1f` | `last_resend_after_ack_us()` / `last_acked_us()` / `_pct()` | 0 % | the same for our own acks (0 while passive) |
+| `pgd_rc` | `last_pgd_rollcalls()` | 0 | `XX' 02 20` frames: the pGD runs the roll-call itself, it lost the controller |
+| `ctrl_tx` | `last_ctrl_frames()` | ~800 | frames the controller sent; 0 = a controller-silent window |
+| `ctrl_sil` / `ctrl_gap` | `last_ctrl_silences()` / `last_ctrl_gap_max_ms()` | 0 / ~25-50 ms | controller silences >= 1 s / the longest gap, the still-open one included |
+| `paint_age` | (in `last_bus_window()`) | < 60 s | since the controller last painted the pGD |
+| `walks` (old) / `warm` | `last_walks()`, `last_walks_cold()` / `last_walks_warm()` | 0 | FF-walks, cold (claims 00) vs warm (claims carried) |
+| `frm` / `brk` / `glitch` | `last_uart_framing_errors()` / `last_uart_breaks()` / `last_uart_glitches()` | 0 | UART receive errors (raw ISR status, counted only) |
+| `addr_bad` | `last_addr_garble()` | 0 | 9th-bit bytes above 0x20: a parity-flipped data byte |
+| `tx` / `hold_dev_min` / `hold_dev_max` | `last_tx_frames()` / `last_hold_dev_min_us()` / `last_hold_dev_max_us()` | 0 .. +20 us | DE hold minus `len x 192 + 16 (+ de_tail)` per frame; below -96 a frame was cut short |
+| `early_idle` | `last_tx_early_idle()` | 0 | bytes whose TX-idle read came before one character time (A7 F1); `set_tx_char_floor(true)` (default off) waits those out |
+
+`health`: **loop** at >= 3 FF-walks in the trailing 30 s or a window without
+a controller frame; **degraded** at any pGD roll-call, a controller silence
+>= 1 s, > 15 % resent after the ack over >= 30 acked frames (trailing 30 s),
+>= 3 own joins with none closed, or a pGD not painted for 60 s.
+`test/test_bus_health.cpp` pins every counter on crafted byte streams and on
+the simulator's fault profiles (p = 0 -> 0, p = 5 % -> ra ~5 %, p = 28 % ->
+loop).
+
 ## Injection verdict
 
 A press is put on the wire **at most once** (wave E3, A5 R-KP-07..15):

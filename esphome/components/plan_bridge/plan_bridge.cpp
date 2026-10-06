@@ -140,6 +140,9 @@ void PlanBridge::setup() {
   }
 
   hw_ = UART_LL_GET_HW(uart_num_);
+  // Wave E5: one 12-bit wire character (start + 8 + bit9 + 2 stop), rounded
+  // up: 192 us at 62500 baud. The DE-hold check and the TX-idle floor use it.
+  char_us_ = (12u * 1000000u + baud_rate_ - 1) / baud_rate_;
   uart_ll_rxfifo_rst(hw_);
   uart_ll_txfifo_rst(hw_);
   // Interrupt on every byte: the poll hunt must track the bus in real time.
@@ -159,7 +162,10 @@ void PlanBridge::setup() {
   uart_ll_ena_intr_mask(hw_, UART_INTR_RXFIFO_FULL | UART_INTR_PARITY_ERR);
 
   // Logging/injection-bookkeeping task; all hard timing lives in the ISR.
-  BaseType_t ok = xTaskCreatePinnedToCore(task_trampoline, "plan_ctrl", 4096, this,
+  // 5120, not 4096: the wave E5 bus10s fields cost 288 B (the formatted
+  // health block) + 256 B (capture_diag_'s larger line buffer) of stack on
+  // this task; 1 KiB more keeps the old headroom with margin.
+  BaseType_t ok = xTaskCreatePinnedToCore(task_trampoline, "plan_ctrl", 5120, this,
                                           configMAX_PRIORITIES - 3, &task_, 0);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "task create failed");
@@ -467,10 +473,16 @@ void PlanBridge::task_main() {
       // (heatpump-firmware#58) -- the per-session heap cost of a client
       // reads straight off its own capture stream, no HA round trip.
       uint32_t drop_now = cap_drop_bytes_;
+      // Wave E5 bus-health window (plan::BusWindow; resets tel_walks_ too).
+      // Its fields go on the END of bus10s so every prefix parser (enroltest,
+      // capture summary) keeps working; the HA getters read bus_win_.
+      const plan::BusWindow w = term_.take_window(esp_timer_get_time());
+      char hl[288];
+      plan::format_bus_window(hl, sizeof(hl), w);
       capture_diag_(plan::CAP_DIAG_INFO,
                     "bus10s: ctrl=%u pgd=%u us=%u other=%u cksum_fail=%u post_tx_gap_min=%uus "
                     "post_tx_gap_max=%uus tx_unacked=%u walks=%u "
-                    "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u heap_free=%u heap_block=%u",
+                    "cap_drop=%u multi_drain=%u drain_max=%u cap_seq=%u heap_free=%u heap_block=%u%s",
                     static_cast<unsigned>(term_.tel_frames_ctrl_),
                     static_cast<unsigned>(term_.tel_frames_pgd_),
                     static_cast<unsigned>(term_.tel_frames_us_),
@@ -479,11 +491,12 @@ void PlanBridge::task_main() {
                     static_cast<unsigned>(term_.tel_post_tx_gap_min_us_),
                     static_cast<unsigned>(term_.tel_post_tx_gap_max_us_),
                     static_cast<unsigned>(term_.tel_tx_unacked_),
-                    static_cast<unsigned>(term_.tel_walks_),
+                    static_cast<unsigned>(w.walks),
                     static_cast<unsigned>(drop_now - drop_last_window_),
                     static_cast<unsigned>(isr_multi_drain_), static_cast<unsigned>(isr_drain_max_),
                     static_cast<unsigned>(cap_seq_), static_cast<unsigned>(heap_free()),
-                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)), hl);
+      bus_win_ = w;
       drop_last_window_ = drop_now;
       term_.tel_frames_ctrl_ = 0;
       term_.tel_frames_pgd_ = 0;
@@ -495,10 +508,9 @@ void PlanBridge::task_main() {
       // before the running counters are cleared (getters read these).
       tx_unacked_window_ = term_.tel_tx_unacked_;
       post_tx_gap_max_window_us_ = term_.tel_post_tx_gap_max_us_;
-      walks_window_ = term_.tel_walks_;
+      walks_window_ = w.walks;
       term_.tel_post_tx_gap_max_us_ = 0;
       term_.tel_tx_unacked_ = 0;
-      term_.tel_walks_ = 0;
       isr_multi_drain_ = 0;
       isr_drain_max_ = 0;
       // planterm#47 reply-jitter + TX-hardening telemetry (separate line to
@@ -906,10 +918,12 @@ void PlanBridge::capture_event_(uint8_t kind, uint8_t a, uint8_t b) {
 // ack, never parsed out of this text. Bus task only (same single-owner
 // rule as capture_event_, same stalled-client policy).
 void PlanBridge::capture_diag_(uint8_t severity, const char *fmt, ...) {
-  // 256, not 192: the bus10s line grew past 192 with the planterm#47 reject
-  // counters (post_tx_gap_max / tx_unacked / walks). vsnprintf still self-caps
-  // to sizeof(buf), so a longer line is truncated rather than overrunning.
-  char buf[256];
+  // 512, not 256: the bus10s line grew past 192 with the planterm#47 reject
+  // counters, and past 256 with the wave E5 bus-health fields (~440 chars
+  // typical, ~475 in a busy loop window, test_bus_health pins it). 512 = the
+  // ESPHome logger default tx_buffer_size, the binding limit of the log copy.
+  // vsnprintf still self-caps to sizeof(buf): a longer line is truncated.
+  char buf[512];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
