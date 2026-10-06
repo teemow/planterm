@@ -2,3 +2,6 @@
 /tmp/
 .esphome/
 __pycache__/
+# crashed host-test binaries
+core
+core.*
