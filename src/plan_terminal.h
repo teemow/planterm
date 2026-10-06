@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 // The ISR calling into this code is IRAM-resident so it keeps running while
 // the flash cache is disabled (WiFi/NVS/OTA writes). Everything it touches --
@@ -109,6 +110,97 @@ struct TxAction {
   uint8_t frame[12];
   uint16_t bit9_mask;  // bit i set => frame[i] carries the 9th/address bit
 };
+
+// --- Wave E5: bus-health telemetry --------------------------------------
+// One bus10s window, latched by the task (PlanTerminal::take_window) so
+// plan_bridge prints it AND keeps it for the Home Assistant getters. Every
+// field is measured while passive too (the bridge only listens), except
+// ack1f/ra1f and tx/hold_dev/tx_early_idle, which need our own transmissions.
+// Healthy reads (July / A8 sect. 4 healthy reference) in the comments.
+struct BusWindow {
+  uint32_t walks;            // FF-walks (= the old walks=), healthy 0
+  uint32_t walks_warm;       // ... of them warm (claims carried); cold = walks - walks_warm
+  uint32_t ack20, ra20;      // controller session frames the pGD acked / then resent anyway
+  uint32_t ack1f, ra1f;      // the same for our own acks (0 while passive)
+  uint32_t pgd_rc;           // pGD-as-master roll-call frames XX' 02 20 (it lost the controller), 0
+  uint32_t ctrl_frames;      // frames the controller sent; 0 = a silent controller
+  uint32_t ctrl_sil;         // controller silences >= 1 s that ended in the window, 0
+  uint32_t ctrl_gap_max_ms;  // longest controller silence, the still-open one included, ~25-50
+  uint32_t paint_age_s;      // since the controller last painted 0x20, < 60
+  uint32_t joins, joins_ok;  // our joins opened / closed (as rollcall10s)
+  uint32_t addr_bad;         // 9th-bit bytes > 0x20 (no such address): parity garble, 0
+  uint32_t uart_frm;         // UART receive errors (raw ISR status): framing, 0
+  uint32_t uart_brk;         // ... break detect, 0
+  uint32_t uart_glitch;      // ... glitch detect, 0
+  uint32_t tx;               // our frames on the wire (uart_isr path)
+  int32_t hold_dev_min_us;   // DE hold minus (len x char + overhead + de_tail); 0 if tx == 0
+  int32_t hold_dev_max_us;   // ... healthy about 0 .. +20 (A7 3.2); < -96 = a frame cut short
+  uint32_t tx_early_idle;    // bytes whose TX-idle read came before one char time (A7 F1), 0
+  uint8_t health;            // BUS_HEALTHY / BUS_DEGRADED / BUS_LOOP
+};
+enum : uint8_t { BUS_HEALTHY = 0, BUS_DEGRADED = 1, BUS_LOOP = 2 };
+
+// `ekobeescope health` thresholds (ekobeescope#46, internal/plan/bushealth.go):
+// LOOP at >= 3 FF-walks at >= 1 per 10 s, or a controller that sent nothing;
+// DEGRADED at any pGD roll-call, a controller silence >= 1 s, > 15 % resent
+// after the ack (over >= 30 acked frames), >= 3 own joins with none closed, or
+// a pGD not painted for a minute. The two rate rules run over the trailing
+// HEALTH_SPAN windows (30 s): 3 walks in 30 s IS ">= 3 at >= 1 per 10 s", and
+// a 2-4 walks/10 s loop then reads LOOP in every window instead of flapping.
+static constexpr uint32_t HEALTH_LOOP_WALKS = 3;
+static constexpr uint32_t HEALTH_SILENCE_MS = 1000;
+static constexpr uint32_t HEALTH_MIN_ACKED = 30;
+static constexpr uint32_t HEALTH_MAX_RESEND_PCT = 15;
+static constexpr uint32_t HEALTH_MIN_JOINS = 3;
+static constexpr uint32_t HEALTH_PAINT_S = 60;
+static constexpr int HEALTH_SPAN = 3;
+// DE hold of an n-byte frame = n x 192 us + 16 us (A7 1.4: 2320 us for every
+// 12-byte frame in 65 windows): the overhead is DE lead + tail + timer reads.
+static constexpr uint32_t TX_HOLD_OVERHEAD_US = 16;
+
+// The trailing-span sums the rate rules need.
+struct BusSpan {
+  uint32_t walks, ack20, ra20, ack1f, ra1f;
+};
+
+inline bool resend_over(uint32_t ra, uint32_t acked) {
+  return acked >= HEALTH_MIN_ACKED && ra * 100u > acked * HEALTH_MAX_RESEND_PCT;
+}
+
+inline uint8_t bus_health(const BusWindow &w, const BusSpan &s) {
+  if (s.walks >= HEALTH_LOOP_WALKS || w.ctrl_frames == 0)
+    return BUS_LOOP;
+  if (w.pgd_rc > 0 || w.ctrl_gap_max_ms >= HEALTH_SILENCE_MS || resend_over(s.ra20, s.ack20) ||
+      resend_over(s.ra1f, s.ack1f) || (w.joins >= HEALTH_MIN_JOINS && w.joins_ok == 0) ||
+      w.paint_age_s >= HEALTH_PAINT_S)
+    return BUS_DEGRADED;
+  return BUS_HEALTHY;
+}
+
+// The bus-health fields appended to bus10s (leading space included). One
+// formatter for the firmware and the host tests, which pin its worst-case
+// length against plan_bridge's diag buffer. Returns snprintf's length.
+inline int format_bus_window(char *out, size_t n, const BusWindow &w) {
+  // health first: should a line ever be cut at the buffer, the tail goes.
+  return snprintf(out, n,
+                  " health=%u ra20=%u ack20=%u ra1f=%u ack1f=%u pgd_rc=%u ctrl_tx=%u ctrl_sil=%u "
+                  "ctrl_gap=%ums paint_age=%us warm=%u frm=%u brk=%u glitch=%u addr_bad=%u tx=%u "
+                  "hold_dev_min=%dus hold_dev_max=%dus early_idle=%u",
+                  static_cast<unsigned>(w.health), static_cast<unsigned>(w.ra20),
+                  static_cast<unsigned>(w.ack20), static_cast<unsigned>(w.ra1f), static_cast<unsigned>(w.ack1f),
+                  static_cast<unsigned>(w.pgd_rc), static_cast<unsigned>(w.ctrl_frames),
+                  static_cast<unsigned>(w.ctrl_sil), static_cast<unsigned>(w.ctrl_gap_max_ms),
+                  static_cast<unsigned>(w.paint_age_s), static_cast<unsigned>(w.walks_warm),
+                  static_cast<unsigned>(w.uart_frm), static_cast<unsigned>(w.uart_brk),
+                  static_cast<unsigned>(w.uart_glitch), static_cast<unsigned>(w.addr_bad),
+                  static_cast<unsigned>(w.tx), static_cast<int>(w.hold_dev_min_us),
+                  static_cast<int>(w.hold_dev_max_us), static_cast<unsigned>(w.tx_early_idle));
+}
+
+// Frame types a terminal acks with 01' 03 T CK (ekobeescope sessionType).
+static inline bool PLAN_IRAM session_type(uint8_t t) {
+  return (t >= 0x0A && t <= 0x0F) || (t >= 0x60 && t <= 0x6F);
+}
 
 class PlanTerminal {
  public:
@@ -269,6 +361,7 @@ class PlanTerminal {
         else
           tel_frames_other_ = tel_frames_other_ + 1;
         rc_run_end_(now_us);
+        hl_run_end_();
       } else if (!rc_init_) {
         rc_init_ = true;  // boot: presume a pGD may exist (see pgd_absent_now_)
         t_pgd_tx_us_ = now_us;
@@ -279,15 +372,26 @@ class PlanTerminal {
       tel_addr_ = b;
       tel_sum_ = b;
       tel_len_ = 1;
+      // Wave E5: a 9th bit on a byte that cannot be an address (pLAN uses
+      // 0x00-0x20) is a parity-flipped data byte -- the one kind of parity
+      // garble the 9th-bit scheme can tell from a real address byte.
+      if (b > 0x20)
+        tel_addr_bad_ = tel_addr_bad_ + 1;
+      tel_hash_ = (2166136261u ^ b) * 16777619u;  // FNV-1a over the run (resend match)
+      tel_start_us_ = now_us;
+      tel_run_sacked_ = false;
     } else if (tel_active_) {
       if (tel_len_ == 1)
         tel_type_ = b;  // frame type = first byte after the address byte
       else if (tel_len_ == 2)
         tel_b3_ = b;  // third byte: the sender in terminal->controller frames
+      else if (tel_len_ == 3)
+        tel_b4_ = b;  // fourth byte: the sender in LEN (session) frames
       else if (tel_len_ == 7)
         tel_c1_ = b;  // roll-call: first CLAIMS byte (bit7 = address 32)
       tel_sum_ = static_cast<uint8_t>(tel_sum_ + b);
       tel_len_ = tel_len_ + 1;
+      tel_hash_ = (tel_hash_ ^ b) * 16777619u;
     }
 
     // Rolling windows.
@@ -852,6 +956,7 @@ class PlanTerminal {
         break;
       case TxAction::SESSION_ACK:
         session_acks_ = session_acks_ + 1;
+        tel_run_sacked_ = true;  // E5: the run on the wire (its last byte) is acked by us
         break;
       case TxAction::IDENT_REPLY:
         ident_replies_ = ident_replies_ + 1;
@@ -1176,6 +1281,191 @@ class PlanTerminal {
         k = 4;
       rc_backoff_until_us_ = now_us + (static_cast<int64_t>(12'000'000) << k);
     }
+  }
+
+  // --- wave E5: bus-health telemetry (A16 sect. 7, A7 sect. 3, A2 D11) ------
+  // LAYOUT RULE (see tel_type_): new members at the class END only. Counting
+  // only: nothing here feeds a transmit decision.
+ public:
+  // ISR-fed counters; take_window() reads and resets them per bus10s window.
+  volatile uint32_t tel_ack20_{0}, tel_ra20_{0}, tel_ack1f_{0}, tel_ra1f_{0};
+  volatile uint32_t tel_pgd_rc_{0};
+  volatile uint32_t tel_ctrl_src_{0};
+  volatile uint32_t tel_ctrl_sil_{0};
+  volatile uint32_t tel_ctrl_gap_max_us_{0};
+  volatile uint32_t tel_addr_bad_{0};
+  volatile uint32_t tel_uart_frm_{0}, tel_uart_brk_{0}, tel_uart_glitch_{0};
+  volatile uint32_t tel_tx_frames_{0};
+  volatile int32_t tel_hold_dev_min_{0}, tel_hold_dev_max_{0};
+  volatile uint32_t tel_tx_early_idle_{0};  // incremented inside tx_9bit (plan_bridge_isr.cpp)
+
+  // uart_isr, once per pass: the UART receive-error bits of its raw status.
+  void PLAN_IRAM uart_errs(bool frm, bool brk, bool glitch) {
+    if (frm)
+      tel_uart_frm_ = tel_uart_frm_ + 1;
+    if (brk)
+      tel_uart_brk_ = tel_uart_brk_ + 1;
+    if (glitch)
+      tel_uart_glitch_ = tel_uart_glitch_ + 1;
+  }
+
+  // uart_isr, after each frame we put on the wire: DE hold vs the frame's
+  // wire length (A7 F2). Any length: a cut 12-byte frame can no longer hide
+  // above the 4-byte minimum like it did in de_hold_max.
+  void PLAN_IRAM tx_hold(uint32_t len, uint32_t hold_us, uint32_t char_us, uint32_t tail_us) {
+    const int32_t dev = static_cast<int32_t>(hold_us) -
+                        static_cast<int32_t>(len * char_us + TX_HOLD_OVERHEAD_US + tail_us);
+    if (tel_tx_frames_ == 0 || dev < tel_hold_dev_min_)
+      tel_hold_dev_min_ = dev;
+    if (tel_tx_frames_ == 0 || dev > tel_hold_dev_max_)
+      tel_hold_dev_max_ = dev;
+    tel_tx_frames_ = tel_tx_frames_ + 1;
+  }
+
+  // Task, once per bus10s window, BEFORE rollcall10s resets tel_walks_warm_ /
+  // tel_joins_*: latch the window, reset its counters (tel_walks_ included),
+  // judge bus_health. Read-then-reset without a lock like the other bus10s
+  // counters (an increment in between lands in the next window).
+  BusWindow take_window(int64_t now_us) {
+    BusWindow w{};
+    w.walks = tel_walks_;
+    tel_walks_ = 0;
+    w.walks_warm = tel_walks_warm_;
+    w.joins = tel_joins_;
+    w.joins_ok = tel_joins_ok_;
+    w.ack20 = tel_ack20_;
+    tel_ack20_ = 0;
+    w.ra20 = tel_ra20_;
+    tel_ra20_ = 0;
+    w.ack1f = tel_ack1f_;
+    tel_ack1f_ = 0;
+    w.ra1f = tel_ra1f_;
+    tel_ra1f_ = 0;
+    w.pgd_rc = tel_pgd_rc_;
+    tel_pgd_rc_ = 0;
+    w.ctrl_frames = tel_ctrl_src_;
+    tel_ctrl_src_ = 0;
+    w.ctrl_sil = tel_ctrl_sil_;
+    tel_ctrl_sil_ = 0;
+    uint32_t gap = tel_ctrl_gap_max_us_;
+    tel_ctrl_gap_max_us_ = 0;
+    const int64_t t_ctrl = load64_(t_ctrl_us_);
+    if (t_ctrl != 0 && sat32_(now_us - t_ctrl) > gap)
+      gap = sat32_(now_us - t_ctrl);  // the silence still open at the window's end
+    w.ctrl_gap_max_ms = gap / 1000u;
+    const int64_t t_paint = load64_(t_paint20_us_);
+    w.paint_age_s = t_paint != 0 ? sat32_(now_us - t_paint) / 1000000u : 0;
+    w.addr_bad = tel_addr_bad_;
+    tel_addr_bad_ = 0;
+    w.uart_frm = tel_uart_frm_;
+    tel_uart_frm_ = 0;
+    w.uart_brk = tel_uart_brk_;
+    tel_uart_brk_ = 0;
+    w.uart_glitch = tel_uart_glitch_;
+    tel_uart_glitch_ = 0;
+    w.tx = tel_tx_frames_;
+    w.hold_dev_min_us = w.tx != 0 ? tel_hold_dev_min_ : 0;
+    w.hold_dev_max_us = w.tx != 0 ? tel_hold_dev_max_ : 0;
+    tel_tx_frames_ = 0;
+    w.tx_early_idle = tel_tx_early_idle_;
+    tel_tx_early_idle_ = 0;
+    BusSpan s{w.walks, w.ack20, w.ra20, w.ack1f, w.ra1f};
+    for (int i = 0; i < HEALTH_SPAN - 1; i++) {
+      s.walks += hl_hist_[i].walks;
+      s.ack20 += hl_hist_[i].ack20;
+      s.ra20 += hl_hist_[i].ra20;
+      s.ack1f += hl_hist_[i].ack1f;
+      s.ra1f += hl_hist_[i].ra1f;
+    }
+    for (int i = HEALTH_SPAN - 2; i > 0; i--)
+      hl_hist_[i] = hl_hist_[i - 1];
+    hl_hist_[0] = BusSpan{w.walks, w.ack20, w.ra20, w.ack1f, w.ra1f};
+    w.health = bus_health(w, s);
+    return w;
+  }
+
+ protected:
+  volatile uint8_t tel_b4_{0};          // fourth byte of the current run
+  volatile uint32_t tel_hash_{0};       // FNV-1a of the current run
+  volatile int64_t tel_start_us_{0};    // its address byte's time
+  volatile bool tel_run_sacked_{false}; // we sent a session ack for it
+  volatile uint8_t ss_state_{0};        // resend watch: 0 off, 1 awaiting the pGD ack, 2 acked
+  volatile uint8_t ss_to_{0};           // ... the watched frame's terminal
+  volatile uint32_t ss_len_{0};         // ... its length
+  volatile uint32_t ss_hash_{0};        // ... its FNV-1a
+  volatile int64_t t_ctrl_us_{0};       // start of the controller's last frame (0 = none yet)
+  volatile int64_t t_paint20_us_{0};    // ... of its last session frame to 0x20 (first run if none)
+  BusSpan hl_hist_[HEALTH_SPAN - 1]{};  // task only: the previous windows' rate inputs
+
+  static uint32_t PLAN_IRAM sat32_(int64_t d) {
+    return d <= 0 ? 0u : d >= 0xFFFFFFFFll ? 0xFFFFFFFFu : static_cast<uint32_t>(d);
+  }
+  // A 64-bit ISR-written time read from the task (two 32-bit loads on the C3).
+  static int64_t load64_(const volatile int64_t &v) {
+    int64_t a = v;
+    while (a != v)
+      a = v;
+    return a;
+  }
+
+  // Run boundary (after rc_run_end_): the bus-health view of the run in
+  // tel_addr_/tel_type_/tel_b3_/tel_b4_/tel_len_/tel_hash_. Same frame rules
+  // as `ekobeescope health` (frameSrc / trackSession / ctrlSeen).
+  void PLAN_IRAM hl_run_end_() {
+    const uint8_t to = tel_addr_, ty = tel_type_;
+    const uint32_t len = tel_len_;
+    const uint8_t src = (ty >= 0x01 && ty <= 0x03) ? tel_b3_ : tel_b4_;
+    const bool from_ctrl = len >= 4 && to != 0x01 && src == 0x01;
+
+    // Resend after ack (A16 7.1, A8 "ra"): a controller session frame, the
+    // terminal's ack, then the identical frame again = the controller did
+    // not hear the ack. Measured for the pGD from its own `01' 03 20 DB`
+    // (works passive: no TX of ours involved) and for us from our session
+    // ack's tx_sent (invisible on the wire: RE is muted while we drive).
+    if (ss_state_ == 1 && len == 4 && to == 0x01 && ty == 0x03 && tel_b3_ == ss_to_) {
+      ss_state_ = 2;
+      tel_ack20_ = tel_ack20_ + 1;
+    } else {
+      if (ss_state_ == 2 && len == ss_len_ && tel_hash_ == ss_hash_) {
+        if (ss_to_ == 0x20)
+          tel_ra20_ = tel_ra20_ + 1;
+        else
+          tel_ra1f_ = tel_ra1f_ + 1;
+      }
+      ss_state_ = 0;
+      if (from_ctrl && len >= 5 && session_type(ty)) {
+        if (to == 0x20) {
+          ss_state_ = 1;
+        } else if (to == ENROLL_ADDR && tel_run_sacked_) {
+          ss_state_ = 2;
+          tel_ack1f_ = tel_ack1f_ + 1;
+        }
+        ss_to_ = to;
+        ss_len_ = len;
+        ss_hash_ = tel_hash_;
+      }
+    }
+
+    // The pGD running the roll-call itself (A8 pGD-master, A6 TOKEN_LOST).
+    if (to != 0x01 && ty == 0x02 && len == 12 && tel_b3_ == 0x20)
+      tel_pgd_rc_ = tel_pgd_rc_ + 1;
+
+    // Controller silences: gaps between the STARTS of its frames.
+    if (from_ctrl) {
+      tel_ctrl_src_ = tel_ctrl_src_ + 1;
+      if (t_ctrl_us_ != 0) {
+        const uint32_t gap = sat32_(tel_start_us_ - t_ctrl_us_);
+        if (gap > tel_ctrl_gap_max_us_)
+          tel_ctrl_gap_max_us_ = gap;
+        if (gap >= HEALTH_SILENCE_MS * 1000u)
+          tel_ctrl_sil_ = tel_ctrl_sil_ + 1;
+      }
+      t_ctrl_us_ = tel_start_us_;
+      if (to == 0x20 && session_type(ty))
+        t_paint20_us_ = tel_start_us_;
+    }
+    if (t_paint20_us_ == 0)
+      t_paint20_us_ = tel_start_us_;  // the paint age counts from the first frame heard
   }
 };
 

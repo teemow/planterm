@@ -21,6 +21,13 @@
 // The function bodies below are copied VERBATIM from pre-split
 // plan_bridge.cpp; any edit to them needs live A/B validation on the bus
 // (see the 2026-07-03 note inside uart_isr).
+//
+// Wave E5 (2026-10-06, LIVE A/B PENDING) added counting only, each marked
+// "E5": tx_9bit times every byte (tx_early_idle, A7 F1) and holds a char-time
+// floor only behind set_tx_char_floor (default off); uart_isr reads the raw
+// UART receive-error bits once per pass and clears them with `status` at
+// exit (A2 D11), and hands each frame's DE hold to term_.tx_hold (A7 F2).
+// No transmit decision reads any of it.
 
 #include "plan_bridge.h"
 
@@ -56,7 +63,8 @@ static inline void IRAM_ATTR uart_reg_update(uart_dev_t *hw) {
 // Transmit with 2 stop bits: the pGD's own bytes are start+8+bit9+2 stop
 // (Phase 0 read the bus cleanly as 8N2 = 12 bit-slots); a wider inter-byte
 // idle can only help the controller's sampler, RX ignores extra idle.
-static void IRAM_ATTR tx_9bit(uart_dev_t *hw, const uint8_t *f, size_t len, uint32_t bit9_mask) {
+static void IRAM_ATTR tx_9bit(uart_dev_t *hw, const uint8_t *f, size_t len, uint32_t bit9_mask,
+                              uint32_t char_us, uint8_t char_floor, volatile uint32_t *early_idle) {
   uart_ll_set_stop_bits(hw, UART_STOP_BITS_2);
   uart_reg_update(hw);
   for (size_t i = 0; i < len; i++) {
@@ -66,10 +74,20 @@ static void IRAM_ATTR tx_9bit(uart_dev_t *hw, const uint8_t *f, size_t len, uint
     uart_ll_set_parity(hw, (ones == bit9) ? UART_PARITY_EVEN : UART_PARITY_ODD);
     uart_reg_update(hw);
     uint8_t b = f[i];
+    int64_t t0 = esp_timer_get_time();  // E5
     uart_ll_write_txfifo(hw, &b, 1);
     // The parity register must not change while a byte is shifting out, so
     // wait for TX idle between bytes (~192 us each at 62500 baud).
     while (!uart_ll_is_tx_idle(hw)) {
+    }
+    // E5 (A7 F1): st_utx_out is a synchronised copy of the TX FSM, so "idle"
+    // before one full character since the write means the next parity switch
+    // or the DE drop would land mid-character. Count it; the floor (knob,
+    // default off) waits the character out. Healthy: never fires.
+    if (static_cast<uint32_t>(esp_timer_get_time() - t0) < char_us) {
+      *early_idle = *early_idle + 1;
+      while (char_floor != 0 && static_cast<uint32_t>(esp_timer_get_time() - t0) < char_us) {
+      }
     }
   }
   // Restore RX framing (8E1: parity slot = bit9 detector).
@@ -91,6 +109,11 @@ void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
   auto *self = static_cast<PlanBridge *>(arg);
   uart_dev_t *hw = self->hw_;
   uint32_t status = uart_ll_get_intsts_mask(hw);
+  // E5 (A2 D11): receive errors, COUNTED ONLY. Not enabled as interrupts, so
+  // they sit in the raw status, never in `status`; cleared with it at exit.
+  uint32_t rx_err = uart_ll_get_intraw_mask(hw) & (UART_INTR_FRAM_ERR | UART_INTR_BRK_DET | UART_INTR_GLITCH_DET);
+  if (rx_err != 0)
+    self->term_.uart_errs(rx_err & UART_INTR_FRAM_ERR, rx_err & UART_INTR_BRK_DET, rx_err & UART_INTR_GLITCH_DET);
 
   BaseType_t hpw = pdFALSE;
   for (;;) {
@@ -146,7 +169,7 @@ void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
           uint8_t f[sizeof(act.frame)];
           for (size_t i = 0; i < act.len; i++)
             f[i] = act.frame[i];
-          tx_9bit(hw, f, act.len, act.bit9_mask);
+          tx_9bit(hw, f, act.len, act.bit9_mask, self->char_us_, self->tx_char_floor_, &self->term_.tel_tx_early_idle_);
           // planterm#47 DE tail: hold the driver this long after TX_DONE
           // (tx_9bit already waits st_utx_out idle) so the last stop bit clears
           // the bias transient at a weak idle bias. Default 0 -> unchanged.
@@ -170,6 +193,7 @@ void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
           uint32_t hold = static_cast<uint32_t>(t_drop - t_de);
           if (hold > self->de_hold_max_us_)
             self->de_hold_max_us_ = hold;
+          self->term_.tx_hold(act.len, hold, self->char_us_, self->de_tail_us_);  // E5 (A7 F2)
           self->term_.tx_sent(act, t_drop);
         } else {
           if (block)
@@ -200,7 +224,7 @@ void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
     }
   }
 
-  uart_ll_clr_intsts_mask(hw, status);
+  uart_ll_clr_intsts_mask(hw, status | rx_err);  // E5: | rx_err
   if (hpw == pdTRUE)
     portYIELD_FROM_ISR();
 }
@@ -228,7 +252,7 @@ bool IRAM_ATTR PlanBridge::link_tick_isr(gptimer_handle_t, const gptimer_alarm_e
   uint8_t f[sizeof(act.frame)];
   for (size_t i = 0; i < act.len; i++)
     f[i] = act.frame[i];
-  tx_9bit(hw, f, act.len, act.bit9_mask);
+  tx_9bit(hw, f, act.len, act.bit9_mask, self->char_us_, self->tx_char_floor_, &self->term_.tel_tx_early_idle_);
   if (self->de_tail_us_ != 0)
     esp_rom_delay_us(self->de_tail_us_);
   gpio_ll_set_level(&GPIO, static_cast<gpio_num_t>(self->de_pin_), 0);

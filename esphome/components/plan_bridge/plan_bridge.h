@@ -21,6 +21,7 @@
 #include <freertos/stream_buffer.h>
 #include <freertos/task.h>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -105,6 +106,35 @@ class PlanBridge : public Component {
   uint32_t last_tx_unacked() const { return tx_unacked_window_; }
   uint32_t last_post_tx_gap_max_us() const { return post_tx_gap_max_window_us_; }
   uint32_t last_walks() const { return walks_window_; }
+  // Wave E5 bus-health telemetry, the LAST completed bus10s window (latched
+  // like the three above; field meanings and healthy reads: plan::BusWindow
+  // in plan_terminal.h). Measured while passive too, except the *_us / tx
+  // ones, which need our own transmissions.
+  const plan::BusWindow &last_bus_window() const { return bus_win_; }
+  // 0 healthy / 1 degraded / 2 loop, the `ekobeescope health` thresholds.
+  uint8_t last_bus_health() const { return bus_win_.health; }
+  // Controller resent a session frame after the terminal's ack (pGD / us),
+  // and the acked frames they are out of; *_pct = NAN below 1 acked frame.
+  uint32_t last_resend_after_ack_pgd() const { return bus_win_.ra20; }
+  uint32_t last_acked_pgd() const { return bus_win_.ack20; }
+  float last_resend_after_ack_pgd_pct() const { return pct_(bus_win_.ra20, bus_win_.ack20); }
+  uint32_t last_resend_after_ack_us() const { return bus_win_.ra1f; }
+  uint32_t last_acked_us() const { return bus_win_.ack1f; }
+  float last_resend_after_ack_us_pct() const { return pct_(bus_win_.ra1f, bus_win_.ack1f); }
+  uint32_t last_pgd_rollcalls() const { return bus_win_.pgd_rc; }
+  uint32_t last_ctrl_frames() const { return bus_win_.ctrl_frames; }  // 0 = controller-silent window
+  uint32_t last_ctrl_silences() const { return bus_win_.ctrl_sil; }
+  uint32_t last_ctrl_gap_max_ms() const { return bus_win_.ctrl_gap_max_ms; }
+  uint32_t last_walks_cold() const { return bus_win_.walks - bus_win_.walks_warm; }
+  uint32_t last_walks_warm() const { return bus_win_.walks_warm; }
+  uint32_t last_uart_framing_errors() const { return bus_win_.uart_frm; }
+  uint32_t last_uart_breaks() const { return bus_win_.uart_brk; }
+  uint32_t last_uart_glitches() const { return bus_win_.uart_glitch; }
+  uint32_t last_addr_garble() const { return bus_win_.addr_bad; }
+  uint32_t last_tx_frames() const { return bus_win_.tx; }
+  int32_t last_hold_dev_min_us() const { return bus_win_.hold_dev_min_us; }
+  int32_t last_hold_dev_max_us() const { return bus_win_.hold_dev_max_us; }
+  uint32_t last_tx_early_idle() const { return bus_win_.tx_early_idle; }
   // Observe hook: a second consumer of the drained (byte, bit9) stream,
   // called from the bus task at the same site that feeds the screen-snapshot
   // cache (task context, never the ISR -- no IRAM constraints).
@@ -125,6 +155,11 @@ class PlanBridge : public Component {
   // against the reject counters (tx_unacked / walks).
   void set_de_tail_us(uint32_t us) { de_tail_us_ = us; }
   void set_carrier_sense(bool e) { carrier_sense_ = e ? 1 : 0; }
+  // Wave E5 / A7 F1 (default OFF, live A/B first): after each byte's TX-idle
+  // read, also wait out one full character time since the FIFO write, so an
+  // early idle (counted always as tx_early_idle) can never switch the parity
+  // or drop DE mid-character. Adds no time when the hardware behaves.
+  void set_tx_char_floor(bool e) { tx_char_floor_ = e ? 1 : 0; }
   // Enable/disable answering the controller's roll-call for a free terminal
   // address. Disabling starts the graceful drain (see PlanTerminal::drain_);
   // task_main finishes the leave.
@@ -385,6 +420,13 @@ class PlanBridge : public Component {
   // new members at the class END only.
   gptimer_handle_t tick_timer_{nullptr};
   volatile uint32_t tick_skipped_{0};  // resends skipped: the bus was busy
+  // Wave E5. LAYOUT RULE: new members at the class END only. char_us_ = one
+  // 12-bit character (start + 8 + bit9 + 2 stop) at baud_rate_, set in
+  // setup(); tx_char_floor_ = the knob above; bus_win_ = the last window.
+  volatile uint32_t char_us_{192};
+  volatile uint8_t tx_char_floor_{0};
+  plan::BusWindow bus_win_{};
+  static float pct_(uint32_t n, uint32_t of) { return of != 0 ? 100.0f * n / of : NAN; }
 };
 
 }  // namespace plan_bridge
