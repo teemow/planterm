@@ -50,6 +50,8 @@ struct Bus {
   }
 };
 
+static const int64_t TERM_LR_GAP1 = PlanTerminal::LR_GAP1_US, TERM_LR_GAP2 = PlanTerminal::LR_GAP2_US;
+
 static void arm_key(PlanTerminal &t, uint8_t keycode) {
   uint8_t f[REPLY9_LEN];
   encode_reply9(keycode, 0x01, f);
@@ -640,6 +642,7 @@ int main() {
     Bus bus;
     MockController ctl;
     bus.term.enroll_ = true;
+    bus.term.drain_quiet_ = 0;  // the legacy drain (the default is in the E2 block)
     Bytes beacon{{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}};
     bus.feed(beacon);  // arm the pGD liveness probe
     assert(ctl.handle_rollcall_reply(ENROLL_ADDR, bus.feed(ctl.emit_rollcall(ENROLL_ADDR))));
@@ -668,6 +671,91 @@ int main() {
     assert(bus.feed(ctl.emit_poll(ENROLL_ADDR)).empty());
   }
 
+  // --- wave E2: link / session fixes (A2 D4/D5/D7, A1 V4) -----------------
+  {
+    // D7 (A6 T13): a member-forwarded token -- the pGD's master-walk probe
+    // `1F' 02 20 FF FF FF FF 80 00 00 00 ..` -- is ignored like the pGD does.
+    Bus bus;
+    bus.term.enroll_ = true;
+    Bytes mw = {{0x1F, 1}, {0x02, 0}, {0x20, 0}, {0xFF, 0}, {0xFF, 0}, {0xFF, 0}, {0xFF, 0},
+                {0x80, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}};
+    uint8_t ck = 0;
+    for (const auto &b : mw) ck = static_cast<uint8_t>(ck + b.v);
+    mw.push_back({static_cast<uint8_t>(0xFF - ck), 0});
+    assert(bus.feed(mw).empty());
+    assert(bus.term.tel_rc_member_ign_ == 1);
+    bus.term.rc_member_tokens_ = 1;  // legacy: answered, returned to 0x01
+    Bytes r = bus.feed(mw);
+    assert(r.size() == 12 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);
+  }
+  {
+    // D4 (A3 DV-3): the pGD's own request `1F' 1F 07 20 20 04 76` (R-LL-20)
+    // is not acked; the controller's frames still are.
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+    Bytes req{{0x1F, 1}, {0x1F, 0}, {0x07, 0}, {0x20, 0}, {0x20, 0}, {0x04, 0}, {0x76, 0}};
+    assert(bus.feed(req).empty());
+    assert(bus.term.tel_sack_foreign_ == 1 && bus.term.session_acks_ == 0);
+    assert(ctl.handle_session_ack(ENROLL_ADDR, bus.feed(ctl.emit_session(ENROLL_ADDR, 0x0B, {0x00, 0x41}))));
+    bus.term.sack_ctrl_only_ = 0;  // legacy: acked toward 0x01
+    Bytes a = bus.feed(req);
+    assert(a.size() == 4 && a[0].v == 0x01 && a[1].v == 0x03 && a[2].v == ENROLL_ADDR);
+  }
+  {
+    // D5 (A6 T8 / R-LL-05): an unacked link reply to the controller's poll is
+    // resent byte-identically 14 and 15 ms later (start to start), 3
+    // transmissions in all, then nothing; any byte cancels.
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+    bus.term.lr_resend_ = 1;  // D5 is default OFF until the tick ISR is A/B'd live
+    Bytes r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4 && r[0].v == 0x01);
+    const int64_t t0 = bus.now;  // end of our reply
+    assert(bus.term.on_tick(t0 + 13'000).kind == TxAction::NONE);  // not yet
+    TxAction a = bus.term.on_tick(t0 + TERM_LR_GAP1);
+    assert(a.kind == TxAction::LINK_RESEND && a.len == 4);
+    for (int i = 0; i < 4; i++) assert(a.frame[i] == r[i].v);
+    bus.term.tx_sent(a, t0 + TERM_LR_GAP1 + 4 * 192);
+    a = bus.term.on_tick(t0 + TERM_LR_GAP1 + 4 * 192 + TERM_LR_GAP2);
+    assert(a.kind == TxAction::LINK_RESEND);
+    bus.term.tx_sent(a, t0 + 2 * (TERM_LR_GAP1 + 4 * 192));
+    assert(bus.term.on_tick(t0 + 200'000).kind == TxAction::NONE);  // 3 sent: stop
+    assert(bus.term.tel_lr_resends_ == 2 && bus.term.tel_lr_lost_ == 1);
+    // a new poll ends the window; its reply's ack cancels the next one
+    bus.now += 30'000;
+    r = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(r.size() == 4 && r[0].v == 0x01);
+    bus.feed(ctl.emit_ack());
+    assert(bus.term.on_tick(bus.now + 20'000).kind == TxAction::NONE);
+    // default (D5 off): no resend
+    Bus old;
+    old.term.enroll_ = true;
+    old.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(old.term.on_tick(old.now + 14'000).kind == TxAction::NONE);
+  }
+  {
+    // V4 (A1 R-RC-33, R-RC-21c): the drain leaves by member loss -- polls
+    // unanswered, session frames still acked -- and the leave is complete
+    // once the controller re-probes the remaining member after >= 3 polls.
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+    assert(ctl.handle_reply(ENROLL_ADDR, bus.feed(ctl.emit_poll(ENROLL_ADDR))) == MockController::LINK_OK);
+    bus.term.claim_mask_ = 0;  // task side of set_enroll(false)
+    bus.term.drain_polls_ = 0;
+    bus.term.drain_ = true;
+    for (int i = 0; i < 3; i++) assert(bus.feed(ctl.emit_poll(ENROLL_ADDR)).empty());
+    assert(ctl.handle_session_ack(ENROLL_ADDR, bus.feed(ctl.emit_session(ENROLL_ADDR, 0x0B, {0x00, 0x41}))));
+    assert(!bus.term.drain_replied_);
+    // the controller's member-loss re-probe of 0x20 (w7 10:49:02.615)
+    bus.feed({{0x20, 1}, {0x02, 0}, {0x01, 0}, {0x80, 0}, {0x00, 0}, {0x00, 0}, {0x01, 0},
+              {0xC0, 0}, {0x00, 0}, {0x00, 0}, {0x00, 0}, {0x9B, 0}});
+    bus.feed(ctl.emit_ack());  // closes the run
+    assert(bus.term.drain_replied_);
+  }
+
   // --- Roll-call token ring (ground truth 2026-07-16): tokens arrive from
   // --- ANY ring member, and the reply forwards to the next live member ---
   {
@@ -676,6 +764,7 @@ int main() {
     bus.term.enroll_ = true;
 
     bus.term.rc_honest_skip_ = 1;  // pre-E1 liveness skip (the default is in the E1 block)
+    bus.term.rc_member_tokens_ = 1;  // pre-E2 D7: answer member tokens (default in the E2 block)
     // Token forwarded by a pGD at 0x1E (exact live frame, ck 0x7F): presence
     // echoed VERBATIM (the forwarding chain owns it -- the pGD's own cold
     // join behaves this way), our bit claimed in the CLAIMS half only,

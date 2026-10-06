@@ -11,25 +11,15 @@
 # I7 limits re-based in wave E1 (planterm, roll-call rework): the D12 limits were measured with the pGD
 #   locked out (single-terminal repaints). With both terminals served every display frame is mirrored
 #   (20' then 1F', R-DI/A4), ~+150 ms per step. OWNER DECISION pending (scrape walk never slower).
+# Wave E2 (planterm, link/session fixes): D7 flipped the 6 p45 I1 rows, V4 the 3 enrol_toggle rows,
+#   the I1 "served on a static page" measure the 3 edit_commit_lost rows, the sim's member-loss model
+#   (R-RC-21c) alarm_p05/1. The three p05 I2 rows left are random reply losses, not D5 (see their tag).
 I2	bridge_reset_noise	1	xfail	A7-DE-floating(hw 10k pull-down)	1 FF-walks with the bridge vs 0 without (slack 0)
 I2	bridge_reset_noise	2	xfail	A7-DE-floating(hw 10k pull-down)	1 FF-walks with the bridge vs 0 without (slack 0)
 I2	bridge_reset_noise	3	xfail	A7-DE-floating(hw 10k pull-down)	1 FF-walks with the bridge vs 0 without (slack 0)
-I2	loss_p05	3	xfail	D5/R-LL-05+R-LL-19/T12(lost reply not resent)	3 FF-walks with the bridge vs 0 without (slack 0)
-I1	loss_p45	2	xfail	D7/R-RC-31(answers pGD master tokens)+C11-caveat	pGD unpainted for 56.9 s (bridge absent: 43.5 s, bound 55.5 s)
-I1	loss_p45	3	xfail	D7/R-RC-31(answers pGD master tokens)+C11-caveat	pGD unpainted for 58.1 s (bridge absent: 36.8 s, bound 48.8 s)
-I2	edit_p05	3	xfail	D5/R-LL-05+R-LL-19/T12(lost reply not resent)	3 FF-walks with the bridge vs 0 without (slack 0)
-I1	edit_p45	2	xfail	D7/R-RC-31(answers pGD master tokens)+C11-caveat	pGD unpainted for 56.9 s (bridge absent: 43.5 s, bound 55.5 s)
-I1	edit_p45	3	xfail	D7/R-RC-31(answers pGD master tokens)+C11-caveat	pGD unpainted for 58.1 s (bridge absent: 36.8 s, bound 48.8 s)
-I2	alarm_p05	1	xfail	D5/R-LL-05+R-LL-19/T12(lost reply not resent)	1 FF-walks with the bridge vs 0 without (slack 0)
-I2	alarm_p05	3	xfail	D5/R-LL-05+R-LL-19/T12(lost reply not resent)	6 FF-walks with the bridge vs 0 without (slack 0)
-I1	alarm_p45	2	xfail	D7/R-RC-31(answers pGD master tokens)+C11-caveat	pGD unpainted for 56.9 s (bridge absent: 43.5 s, bound 55.5 s)
-I1	alarm_p45	3	xfail	D7/R-RC-31(answers pGD master tokens)+C11-caveat	pGD unpainted for 58.1 s (bridge absent: 36.8 s, bound 48.8 s)
-I2	enrol_toggle	1	xfail	V4/R-RC-33(leave=member-loss link fault)	2 FF-walks with the bridge vs 0 without (slack 0)
-I2	enrol_toggle	2	xfail	V4/R-RC-33(leave=member-loss link fault)	2 FF-walks with the bridge vs 0 without (slack 0)
-I2	enrol_toggle	3	xfail	V4/R-RC-33(leave=member-loss link fault)	2 FF-walks with the bridge vs 0 without (slack 0)
-I1	edit_commit_lost	1	xfail	I1-artifact:E3-macro-fails-static-page(pGD served,C0/C0,0 walks)	pGD unpainted for 100.8 s (bridge absent: 2.0 s, bound 15.0 s)
-I1	edit_commit_lost	2	xfail	I1-artifact:E3-macro-fails-static-page(pGD served,C0/C0,0 walks)	pGD unpainted for 100.8 s (bridge absent: 2.0 s, bound 15.0 s)
-I1	edit_commit_lost	3	xfail	I1-artifact:E3-macro-fails-static-page(pGD served,C0/C0,0 walks)	pGD unpainted for 100.8 s (bridge absent: 2.0 s, bound 15.0 s)
+I2	loss_p05	3	xfail	p05-triple-loss(our reply lost 3x, 1 attempt spent on the forward R-LL-19a)->member loss->re-join echo lost(R-RC-13); not D5: a copy is never accepted(R-LL-06)	3 FF-walks with the bridge vs 0 without (slack 0)
+I2	edit_p05	3	xfail	p05-triple-loss(our reply lost 3x, 1 attempt spent on the forward R-LL-19a)->member loss->re-join echo lost(R-RC-13); not D5: a copy is never accepted(R-LL-06)	3 FF-walks with the bridge vs 0 without (slack 0)
+I2	alarm_p05	3	xfail	p05-triple-loss(our reply lost 3x, 1 attempt spent on the forward R-LL-19a)->member loss->re-join echo lost(R-RC-13); not D5: a copy is never accepted(R-LL-06)	6 FF-walks with the bridge vs 0 without (slack 0)
 I7	scrape_walk_p00	1	limit=3130000	owner-walk-never-slower	today's walk duration in us
 I7	scrape_walk_p00	2	limit=3130000	owner-walk-never-slower	today's walk duration in us
 I7	scrape_walk_p00	3	limit=3130000	owner-walk-never-slower	today's walk duration in us

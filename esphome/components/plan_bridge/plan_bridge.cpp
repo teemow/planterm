@@ -202,6 +202,32 @@ void PlanBridge::capture_event_state_() {
   capture_event_(EV_STATE, a, static_cast<uint8_t>(term_.tx_mode_));
 }
 
+void PlanBridge::set_link_resend(bool e) {
+  if (e && tick_timer_ == nullptr) {
+    // Created on the first enable only: with D5 off (default) the firmware has
+    // no tick interrupt at all. 1 MHz counter, 1 ms auto-reload alarm.
+    gptimer_config_t cfg = {};
+    cfg.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+    cfg.direction = GPTIMER_COUNT_UP;
+    cfg.resolution_hz = 1000000;
+    gptimer_handle_t t = nullptr;
+    gptimer_event_callbacks_t cbs = {};
+    cbs.on_alarm = &PlanBridge::link_tick_isr;
+    gptimer_alarm_config_t alarm = {};
+    alarm.alarm_count = 1000;
+    alarm.reload_count = 0;
+    alarm.flags.auto_reload_on_alarm = true;
+    if (gptimer_new_timer(&cfg, &t) != ESP_OK || gptimer_register_event_callbacks(t, &cbs, this) != ESP_OK ||
+        gptimer_set_alarm_action(t, &alarm) != ESP_OK || gptimer_enable(t) != ESP_OK ||
+        gptimer_start(t) != ESP_OK) {
+      ESP_LOGE(TAG, "link resend: tick timer setup failed, D5 stays off");
+      return;
+    }
+    tick_timer_ = t;
+  }
+  term_.lr_resend_ = e ? 1 : 0;
+}
+
 void PlanBridge::set_armed(bool a) {
   bool changed = armed_ != a;
   armed_ = a;
@@ -225,9 +251,12 @@ void PlanBridge::set_enroll(bool e) {
     term_.sess_ready_ = false;  // keys wait for the session's first row (R-KP-07)
     term_.enroll_ = true;
   } else if (term_.enroll_ && !term_.drain_) {
-    // Graceful leave: stay fully on the link but renounce our bit in the next
-    // periodic roll-call walk (~12 s cadence). task_main finishes the leave on
-    // drain_replied_ or at the deadline.
+    // Graceful leave (wave E2, V4 / R-RC-33): members are never probed, so the
+    // drain leaves by member loss -- polls unanswered, session frames still
+    // acked (drain_quiet_) -- and the ISR flags drain_replied_ once the
+    // controller re-probes elsewhere (R-RC-21c). task_main finishes the leave
+    // then, or at the deadline. drain_quiet_ = 0: the pre-E2 drain.
+    term_.drain_polls_ = 0;
     term_.drain_replied_ = false;
     term_.claim_mask_ = 0;
     term_.drain_ = true;
@@ -517,6 +546,18 @@ void PlanBridge::task_main() {
         term_.tel_joins_ok_ = 0;
         term_.tel_joins_failed_ = 0;
       }
+      // Wave E2 link telemetry: member-forwarded tokens ignored (D7), terminal
+      // frames to us not acked (D4), link-reply copies / replies unacked after
+      // 3 transmissions / copies skipped on a busy bus (D5, 0 while off).
+      capture_diag_(plan::CAP_DIAG_INFO, "link10s: member_tok_ign=%u foreign_noack=%u lr_resends=%u lr_lost=%u lr_skipped=%u",
+                    static_cast<unsigned>(term_.tel_rc_member_ign_), static_cast<unsigned>(term_.tel_sack_foreign_),
+                    static_cast<unsigned>(term_.tel_lr_resends_), static_cast<unsigned>(term_.tel_lr_lost_),
+                    static_cast<unsigned>(tick_skipped_));
+      term_.tel_rc_member_ign_ = 0;
+      term_.tel_sack_foreign_ = 0;
+      term_.tel_lr_resends_ = 0;
+      term_.tel_lr_lost_ = 0;
+      tick_skipped_ = 0;
       if (term_.enroll_ || term_.enroll_replies_ > 0)
         capture_diag_(plan::CAP_DIAG_INFO,
                       "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "

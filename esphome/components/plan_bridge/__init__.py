@@ -120,6 +120,15 @@ async def to_code(config):
     # 2026.7's native esp-idf toolchain git-clones library repository URIs.
     from esphome.components.esp32 import add_idf_component
 
+    # Wave E2 D5: set_link_resend() creates a GPTimer tick (default off). The
+    # gptimer driver is excluded from ESP-IDF builds by default since 2026.8.
+    try:
+        from esphome.components.esp32 import include_builtin_idf_component
+
+        include_builtin_idf_component("esp_driver_gptimer")
+    except ImportError:
+        pass
+
     repo_root = Path(__file__).resolve().parents[3]
     add_idf_component(name="planterm", path=str(repo_root / "planterm"))
     cg.add(var.set_rx_pin(config[CONF_RX_PIN]))

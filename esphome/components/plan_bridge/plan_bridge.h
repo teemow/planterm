@@ -12,6 +12,7 @@
 #include <plan_snapshot.h>
 #include <plan_terminal.h>
 
+#include <driver/gptimer.h>
 #include <driver/uart.h>
 #include <hal/uart_ll.h>
 #include <esp_intr_alloc.h>
@@ -149,6 +150,19 @@ class PlanBridge : public Component {
   void set_walk_any_claims(bool e) { term_.rc_walk_any_claims_ = e ? 1 : 0; }
   void set_rc_backoff(bool e) { term_.rc_backoff_ = e ? 1 : 0; }
   void set_pgd_absent_s(uint32_t s) { term_.pgd_absent_us_ = s * 1000000u; }
+  // Wave E2 link / session knobs (PlanTerminal; defaults = the fixed
+  // behaviour, the other value = pre-E2): rc_member_tokens TRUE answers
+  // member-forwarded roll-call tokens again (D7); sack_ctrl_only FALSE acks
+  // terminal frames to us again (D4); drain_quiet FALSE restores the old
+  // drain (polls answered until the deadline, V4).
+  void set_rc_member_tokens(bool e) { term_.rc_member_tokens_ = e ? 1 : 0; }
+  void set_sack_ctrl_only(bool e) { term_.sack_ctrl_only_ = e ? 1 : 0; }
+  void set_drain_quiet(bool e) { term_.drain_quiet_ = e ? 1 : 0; }
+  // D5 (A6 T8 / R-LL-05): resend an unacked link reply like the pGD, 3
+  // transmissions 14/15 ms apart. Default OFF: it needs a 1 kHz GPTimer tick
+  // ISR (link_tick_isr, plan_bridge_isr.cpp; uart_isr untouched), created on
+  // the first enable -- live A/B before turning it on for good.
+  void set_link_resend(bool e);
   // The PLANCAP PSK (raw 32 bytes, from base64 in YAML -- on ESPHome devices
   // codegen defaults it to api.encryption.key). Called by codegen only when
   // a key is configured (which also sets the PLAN_CAP_NOISE build flag);
@@ -182,6 +196,7 @@ class PlanBridge : public Component {
   // never shift the ISR's codegen (see the header comment there). Do not
   // move it back into plan_bridge.cpp.
   static void uart_isr(void *arg);
+  static bool link_tick_isr(gptimer_handle_t timer, const gptimer_alarm_event_data_t *ev, void *arg);
   static void task_trampoline(void *arg);
   void task_main();
   void arm_isr_tx_();    // encode pending_key_/hold_ into tx_frame_ and hand it to the ISR
@@ -366,6 +381,10 @@ class PlanBridge : public Component {
   uint8_t key_st_{0};                 // KeySt (plan_bridge.cpp)
   uint32_t key_t_ms_{0};              // TX / withdrawal / repeat time of the current key
   volatile uint32_t key_fate_word_{0};
+  // Wave E2 D5 tick timer (null until set_link_resend(true)). LAYOUT RULE:
+  // new members at the class END only.
+  gptimer_handle_t tick_timer_{nullptr};
+  volatile uint32_t tick_skipped_{0};  // resends skipped: the bus was busy
 };
 
 }  // namespace plan_bridge

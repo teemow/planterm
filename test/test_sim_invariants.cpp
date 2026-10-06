@@ -10,7 +10,9 @@
 // (same seed, same faults).
 //
 // Invariants (rule IDs from the wave chapters A1-A8):
-//   I1 pGD served: never locked out by us. The pGD's longest unpainted span
+//   I1 pGD served: never locked out by us. The pGD's longest unserved span
+//      (no display frame to 0x20, and -- on a static page -- not served by
+//      the controller with a poll answered in the last second; wave E2)
 //      with the bridge stays within the bridge-absent span + one gap-walk
 //      period (R-RC-03, 12 s), floor 15 s (R-RC-30, R-RC-32, A8 R3/R4).
 //   I2 walks: the bridge never causes more FF-walks than the same bus without
@@ -98,6 +100,15 @@ class IsrBridge : public Station {
     term->enroll_ = true;
     term->sess_ready_ = false;  // set_enroll(true): keys wait for the session's first row
     term->fwd_polls_ = 1;
+    // E2_LEGACY=d4,d7,v4: the pre-E2 behaviour of those knobs, to show which
+    // rows each fix flips; d5on: the default-OFF D5 resend switched on (the
+    // table is checked with the defaults).
+    if (const char *l = getenv("E2_LEGACY")) {
+      if (strstr(l, "d4")) term->sack_ctrl_only_ = 0;
+      if (strstr(l, "d5on")) term->lr_resend_ = 1;
+      if (strstr(l, "d7")) term->rc_member_tokens_ = 1;
+      if (strstr(l, "v4")) term->drain_quiet_ = 0;
+    }
     scr = PlanScreen();
     has_ = false;
     ++gen_;
@@ -132,7 +143,22 @@ class IsrBridge : public Station {
   }
   void on_timer(int id, int64_t t) override {
     if (id == 1) {  // DE drop
-      if (sent_gen_ == gen_) term->tx_sent(sent_, t);
+      if (sent_gen_ != gen_) return;
+      term->tx_sent(sent_, t);
+      // the firmware's 1 kHz tick (wave E2, D5): due instants of a resend
+      bus->at(this, t + PlanTerminal::LR_GAP1_US, 3);
+      bus->at(this, t + PlanTerminal::LR_GAP2_US, 3);
+      bus->at(this, t + PlanTerminal::LR_GAP2_US + 2 * MS, 3);  // give-up bookkeeping
+      return;
+    }
+    if (id == 3) {  // tick: the tick ISR transmits at once, carrier sense first
+      if (!powered || has_ || t < tx_end_) return;  // the tick ISR never runs inside our TX
+      TxAction a = term->on_tick(t);
+      if (a.kind == TxAction::NONE) return;
+      if (bus->busy(t, this)) return term->tx_not_sent(a);
+      act_ = a;
+      has_ = true;
+      bus->at(this, t, 2 * (++gen_));
       return;
     }
     if (!has_ || id != 2 * gen_) return;
@@ -338,7 +364,8 @@ struct Scenario {
   MacroKind mk = MK_NONE;
   int kind = 0;            // 0 plain, 1 cold boot, 2 bridge boot, 3 reset, 4 pGD cycle,
                            // 5 ctrl silent, 6 drift, 7 enrol toggles, 8 recovery,
-                           // 9 the commit Enter's keypad report rejected once
+                           // 9 the commit Enter's keypad report rejected once,
+                           // 10 the 09-30 pGD answers forwarded polls with type-0x1F requests (T20)
 };
 
 static std::vector<Scenario> scenarios() {
@@ -366,6 +393,10 @@ static std::vector<Scenario> scenarios() {
   v.push_back({"keys_during_walks_p15", 0.15, 150 * S, 30 * S, -1, MK_KEYS, 0});
   v.push_back({"edit_commit_lost", 0, 150 * S, 30 * S, 0, MK_EDIT, 9});
   v.push_back({"recovery_p28_to_p01", 0.28, 180 * S, 30 * S, 90 * S, MK_NONE, 8});
+  // D4 (wave E2): the pGD's own `1F' 1F 07 20 20 04 76` requests reach us
+  // (A2 R-LL-20a, A6 T20); I3 fails on any ack of a frame the controller
+  // did not send.
+  v.push_back({"pgd_req04_t20", 0, 150 * S, 30 * S, -1, MK_NONE, 10});
   v.push_back({"scrape_walk_p00", 0, 120 * S, 30 * S, 0, MK_WALK, 0});
   v.push_back({"scrape_walk_p01", 0.01, 120 * S, 30 * S, 0, MK_WALK, 0});
   return v;
@@ -523,6 +554,7 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
     return false;
   };
 
+  if (sc.kind == 10) pgd.prm.p_fwd_req04 = 0.15;  // LOOP0930: 405 requests / 891 forwards
   if (sc.kind == 1) pgd.power_on(0, true);
   ctl.start(0);
   // The bridge powers up with the controller only in cold_boot; everywhere
@@ -536,7 +568,7 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
   }
 
   std::vector<Snap> hist;
-  std::vector<int64_t> served31;
+  std::vector<int64_t> served31, served32;
   int value = 0;
   int64_t next_val = 2 * S, drain_t0 = 0;
   Result r;
@@ -552,6 +584,7 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
     if (sc.kind == 8 && t == 90 * S) f.spec.p_to_ctrl = 0.01, f.spec.p_walk_stall = 0;
     if (with_bridge && sc.kind == 7 && (t == 40 * S || t == 120 * S)) {  // set_enroll(false): drain
       br.term->drain_replied_ = false;
+      br.term->drain_polls_ = 0;
       br.term->claim_mask_ = 0;
       br.term->drain_ = true;
       drain_t0 = t;
@@ -577,6 +610,10 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
     // controller ground truth (current page content)
     const auto &rows = ctl.screen.pages[ctl.screen.cur].rows;
     if (hist.empty() || hist.back().rows != rows) hist.push_back({t, rows});
+    {
+      auto sv = ctl.served();
+      if (std::find(sv.begin(), sv.end(), 0x20) != sv.end()) served32.push_back(t);
+    }
     if (with_bridge) {
       auto sv = ctl.served();
       if (std::find(sv.begin(), sv.end(), ENROLL_ADDR) != sv.end()) served31.push_back(t);
@@ -626,8 +663,15 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
   // ---- verdict inputs from the wire log ------------------------------------
   std::vector<LogFrame> L = bus.log;
   std::stable_sort(L.begin(), L.end(), [](const LogFrame &a, const LogFrame &b) { return a.t < b.t; });
-  std::vector<int64_t> walks, polls31;
-  int64_t last_paint = sc.eval_t0;
+  // I1 measures "pGD served", not "pGD repainted" (wave E2): a display
+  // frame to 0x20, or -- on a static page (unchanged since the pGD's last
+  // paint), where the controller has nothing to paint -- a 10 ms sample with
+  // 32 served by the controller (CLAIMS, MAP, sessioned) while the pGD
+  // answered a poll within the last second. A
+  // locked-out pGD has neither; a served pGD on an unchanging page (the
+  // edit_commit_lost artifact: C0/C0, 0 walks, 100 s without a repaint) is
+  // not dark.
+  std::vector<int64_t> walks, polls31, lit, pgd_lr;
   for (const auto &l : L) {
     if (l.from == 0x01 && is_ffwalk(l.f)) {
       walks.push_back(l.t);
@@ -635,10 +679,29 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
     }
     if (l.from == 0x01 && l.f.size() == 4 && l.f[0].v == ENROLL_ADDR && l.f[1].v == 0x01) polls31.push_back(l.t);
     if (l.from == 0x01 && l.f.size() > 2 && l.f[0].v == 0x20 && l.t >= sc.eval_t0 &&
-        (l.f[1].v == 0x0B || l.f[1].v == 0x0C || l.f[1].v == 0x64 || l.f[1].v == 0x65)) {
-      r.dark_max = std::max(r.dark_max, l.t - last_paint);
-      last_paint = l.t;
+        (l.f[1].v == 0x0B || l.f[1].v == 0x0C || l.f[1].v == 0x64 || l.f[1].v == 0x65))
+      lit.push_back(l.t);
+    if (l.from == 0x20 && l.f.size() == 4 && l.f[0].v == 0x01 && l.f[1].v == 0x01) pgd_lr.push_back(l.t);
+  }
+  {
+    std::vector<int64_t> paints = lit;  // log order = time order (L is sorted)
+    size_t k = 0, pi = 0, hi = 0;
+    for (int64_t ts : served32) {
+      while (k < pgd_lr.size() && pgd_lr[k] <= ts) k++;
+      while (pi < paints.size() && paints[pi] <= ts) pi++;
+      while (hi + 1 < hist.size() && hist[hi + 1].t <= ts) hi++;
+      // static: the page has not changed since the pGD's last paint (hist is
+      // sampled on the 10 ms loop: a change noticed at hist.t happened after
+      // hist.t - 10 ms)
+      const bool stat = pi > 0 && paints[pi - 1] > hist[hi].t - 10 * MS;
+      if (ts >= sc.eval_t0 && stat && k > 0 && ts - pgd_lr[k - 1] < 1 * S) lit.push_back(ts);
     }
+  }
+  std::sort(lit.begin(), lit.end());
+  int64_t last_paint = sc.eval_t0;
+  for (int64_t ts : lit) {
+    r.dark_max = std::max(r.dark_max, ts - last_paint);
+    last_paint = ts;
   }
   r.dark_max = std::max(r.dark_max, sc.dur - last_paint);
   if (!with_bridge) return r;
@@ -658,11 +721,39 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
       if (L[j].from != ENROLL_ADDR && L[j].from != 0) overlap = true;
     bool in_window = prev && prev->f[0].v == ENROLL_ADDR && L[i].t - prev->end() <= 2 * MS &&
                      L[i].t >= prev->end();
+    // R-LL-05 / A6 T8 (wave E2, D5): the identical resend of our unacked link
+    // reply is a reply window of its own -- 12-17 ms after the start of the
+    // previous copy with nothing else on the wire in between, at most 2 copies.
+    const char *why = overlap ? "overlaps another frame" : "no reply window";
+    if (!in_window && L[i].f.size() == 4 && L[i].f[1].v == 0x01) {
+      int copies = 0;
+      size_t k = i;
+      for (;;) {  // walk back over our own copies; any other frame ends it
+        size_t j = k;
+        while (j > 0 && L[j - 1].from == 0) j--;  // noise glitches only
+        if (j-- == 0) break;
+        const int64_t d = L[k].t - L[j].t;
+        if (L[j].from != ENROLL_ADDR || L[j].f.size() != 4 || L[j].f[1].v != 0x01 ||
+            L[j].f[0].v != L[k].f[0].v || d < 12 * MS || d > 17 * MS)
+          break;
+        copies++;
+        k = j;
+      }
+      in_window = copies >= 1 && copies <= 2;
+      if (copies > 2) why = "more than 3 transmissions of a link reply";
+    }
+    // A3 DV-3 / A2 D4: an ack or ident reply answers the controller only --
+    // the frame it answers must carry the controller as its sender (byte 3).
+    if (in_window && (L[i].f[1].v == 0x03 || L[i].f[1].v == 0x51) && prev->f.size() > 3 &&
+        prev->f[1].v >= 0x03 && prev->f[3].v != 0x01) {
+      in_window = false;
+      why = "acks a frame the controller did not send (D4)";
+    }
     if (!in_window || overlap) {
       if (!r.tx_outside) {
         char m[200];
         snprintf(m, sizeof m, "t=%.3fs TX [%s] after [%s] (%s)", L[i].t / 1e6, hex(L[i].f).c_str(),
-                 prev ? hex(prev->f).c_str() : "-", overlap ? "overlaps another frame" : "no reply window");
+                 prev ? hex(prev->f).c_str() : "-", why);
         r.i3_msg = m;
       }
       r.tx_outside++;
@@ -749,13 +840,18 @@ static std::vector<Verdict> evaluate(const Scenario &sc, uint64_t seed) {
   std::vector<Verdict> v;
   char m[300];
   int64_t bound = std::max(a.dark_max + 12 * S, 15 * S);
-  snprintf(m, sizeof m, "pGD unpainted for %.1f s (bridge absent: %.1f s, bound %.1f s)", b.dark_max / 1e6,
+  snprintf(m, sizeof m, "pGD unserved for %.1f s (bridge absent: %.1f s, bound %.1f s)", b.dark_max / 1e6,
            a.dark_max / 1e6, bound / 1e6);
-  v.push_back({"I1", sc.name, seed, b.dark_max <= bound, m, -1,
+  // pgd_req04_t20 (kind 10): I1/I2 do not apply. The T20 requests answer
+  // only member-forwarded polls, so the bridge-absent run (nobody forwards)
+  // never sees one: its walks and dark spans are no baseline for a bus whose
+  // pGD transmits outside any slot. The scenario exists for I3 (D4) and I5.
+  const bool ab = sc.kind != 10;
+  if (ab) v.push_back({"I1", sc.name, seed, b.dark_max <= bound, m, -1,
                sc.kind == 1 ? "R-RC-30/V3+R-RC-32" : "D3/R-LL-17+R-RC-30/V3+R-RC-32"});
   int slack = a.walks / 5;
   snprintf(m, sizeof m, "%d FF-walks with the bridge vs %d without (slack %d)", b.walks, a.walks, slack);
-  v.push_back({"I2", sc.name, seed, b.walks <= a.walks + slack, m, -1,
+  if (ab) v.push_back({"I2", sc.name, seed, b.walks <= a.walks + slack, m, -1,
                sc.kind == 3   ? "A7-DE-floating+D3/R-LL-17"
                : sc.p >= 0.15 ? "A8-R7/R-RC-30(no-backoff)"
                               : "D3/R-LL-17"});
