@@ -97,10 +97,11 @@ class SimController : public Station {
   uint32_t map = bit(1), claims = 0;  // settled masks (R-RC-02)
   uint8_t focus = 0;                  // R-RC-19
   bool sessioned[33] = {};
+  bool member_loss = true;  // R-RC-21c (false: every lost focus link-faults, the D12 model)
   std::array<std::array<std::string, 8>, 33> shadow{};  // R-DI-17 per terminal
   uint32_t ff_walks = 0, gap_walks = 0, link_faults = 0, polls = 0, acks = 0, joins = 0,
            sacks = 0, resends = 0, idents = 0, fwd_answered = 0, fwd_lost = 0, takeovers = 0,
-           stalls = 0;
+           member_losses = 0, stalls = 0;
   int last_fault = FC_NONE;
   std::vector<uint8_t> keys;  // accepted key codes (R-KP-11)
   // (wave D12) Application hook for an accepted key: return true when the
@@ -218,6 +219,7 @@ class SimController : public Station {
     send_(rollcall(a, 0x01, sent_map_, sent_claims_), t, A_RC, tm.rc_window);
   }
   void probe_silent_(int64_t t) {
+    if (loss_probe_) return fault_(FC_POLL);  // the remaining member is gone too
     if (probe_gap_) {  // R-RC-03: next gap address one macro-cycle later
       await_ = A_NONE;
       gap_addr_ = probe_addr_ + 1;
@@ -242,7 +244,33 @@ class SimController : public Station {
     return 32;
   }
   // R-RC-09: the first accepted answer ends the walk; its masks win.
+  // R-RC-21c / R-RC-33 (wave E2; w7 2026-07-06 10:49:02.571-.651): a polled
+  // member that misses 3 polls is dropped from MAP (its CLAIMS bit stays
+  // stale until the next FF-walk) and the remaining served member is
+  // re-probed with the current masks and re-joined (echo, confirm, echo,
+  // poll, link reply, `01'`, re-session) -- no link fault. Only the loss of
+  // the last member link-faults (R-LL-06 J-post -> R-LL-10).
+  void member_loss_(int64_t t) {
+    uint8_t rest = 0;
+    for (uint8_t a = 32; a >= 2 && !rest; a--)
+      if (a != polled_ && (claims & map & bit(a)) && sessioned[a]) rest = a;
+    if (!member_loss || !rest) return fault_(FC_POLL);
+    member_losses++;
+    map &= ~bit(polled_);
+    sessioned[polled_] = false;
+    focus = 0;
+    post_.clear();
+    sq_.clear();
+    loss_probe_ = true;
+    probe_addr_ = rest;
+    probe_t_ = t;
+    probe_gap_ = false;
+    sent_map_ = map;
+    sent_claims_ = claims;
+    send_(rollcall(rest, 0x01, map, claims), t + tm.exch_gap, A_RC, tm.rc_window);
+  }
   void accept_(const Frame &fr, int64_t t) {
+    loss_probe_ = false;
     uint32_t m = get_mask(fr, 3) | bit(1), c = get_mask(fr, 7) & ~bit(1);  // R-RC-02
     confirms_left_ = (m == sent_map_ && c == sent_claims_) ? 1 : 2;      // R-RC-13
     map = m;
@@ -404,6 +432,7 @@ class SimController : public Station {
     link_faults++;
     last_fault = cause;
     join_poll_ = false;
+    loss_probe_ = false;
     phase_ = DOWN;
     await_ = A_NONE;
     focus = 0;
@@ -511,7 +540,7 @@ class SimController : public Station {
       case A_POLL:
         if (key_ >= 0) return fault_(FC_KEY);  // R-KP-04: report without link reply
         if (join_poll_) return fault_(FC_JOIN);  // R-RC-13: any join stage lost -> fault
-        if (poll_attempt_ >= 3) return fault_(FC_POLL);  // R-LL-06 -> R-LL-10
+        if (poll_attempt_ >= 3) return member_loss_(t);  // R-LL-06 -> R-RC-21c / R-LL-10
         poll_attempt_++;
         return poll_(polled_, poll_t0_ + (poll_attempt_ - 1) *
                                   (heard ? tm.repoll_rejected : tm.repoll_silent), false);
@@ -592,6 +621,7 @@ class SimController : public Station {
   Await await_ = A_NONE;
   Phase phase_ = DOWN;
   bool garbage_ = false, probe_gap_ = false, join_from_gap_ = false, join_poll_ = false;
+  bool loss_probe_ = false;  // the member-loss re-probe is out (R-RC-21c)
   int64_t rx_t0_ = 0, cur_tx_t0_ = 0, garbage_t0_ = 0, last_tx_end_ = 0, last_rx_end_ = 0;
   int64_t ff_t0_ = 0, probe_t_ = 0, poll_t0_ = 0, next_poll_t_ = 0, next_gap_t_ = 0,
           gap_due_t_ = 0, sess_due_t_ = 0, sess_t0_ = 0;

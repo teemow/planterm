@@ -102,6 +102,7 @@ struct TxAction {
     AFTER_BURST_REPORT,// tx_mode 1: standalone report after the pGD's burst
     RACE_KEY_REPLY,    // tx_mode 0: race the pGD for the 0x20 response slot
     FORWARD_POLL,      // dual-terminal: hand our poll token on to the pGD@32
+    LINK_RESEND,       // A6 T8 / R-LL-05: identical resend of an unacked link reply (on_tick)
   };
   Kind kind;
   uint8_t len;
@@ -218,6 +219,12 @@ class PlanTerminal {
         tel_tx_unacked_ = tel_tx_unacked_ + 1;
       tel_last_tx_us_ = 0;
     }
+
+    // Link-reply resend (wave E2, A6 T8 / R-LL-05): any byte on the wire
+    // after our link reply ends its resend window -- the controller's 01'
+    // accepted it, or the bus moved on (its re-poll) and a copy would collide.
+    if (lr_rs_n_ != 0)
+      lr_rs_n_ = 0;
 
     // Key fate (A5 R-KP-11/12): the FIRST byte after our key burst decides
     // the exchange. The controller acks with a bare 01' ~0.4 ms after the
@@ -393,7 +400,17 @@ class PlanTerminal {
         uint8_t s = static_cast<uint8_t>(ENROLL_ADDR + 0x02 + rc_from_);
         for (int i = 0; i < 8; i++)
           s += rc_payload_[i];
-        if (static_cast<uint8_t>(s + b) == 0xFF) {
+        if (static_cast<uint8_t>(s + b) == 0xFF && rc_from_ != 0x01 && !rc_member_tokens_) {
+          // A2 D7 / A6 T13 (wave E2, parent decision): a real terminal ignores
+          // member-forwarded tokens -- the pGD ignored our 20' 02 1F (GT
+          // 07-17 07:43) and every `1F' 02 20 ..` reaching us is a probe of
+          // the pGD's own master walk (R-LL-18), not a ring the controller
+          // runs. Answering it puts our claim into a frame the controller
+          // never asked for and keeps the pGD's walk alive. Silent; the
+          // controller's own walk (or its take-over of the pGD's token, A6
+          // T17) is where we join. rc_member_tokens_ = 1: the legacy answer.
+          tel_rc_member_ign_ = tel_rc_member_ign_ + 1;
+        } else if (static_cast<uint8_t>(s + b) == 0xFF) {
           // Which controller frame is this? A CONFIRM re-sends our own last
           // reply's masks (R-RC-09/13) with no FF-walk in between; anything
           // else from 0x01 is a PROBE that would open a join. (Bytes, not
@@ -544,6 +561,8 @@ class PlanTerminal {
             fa_count_ = 0;
           }
         } else {
+          if (fa_count_ == 3)
+            fa_src_ = b;  // byte 3: the sender (0x01 in every controller frame)
           fa_count_ = fa_count_ + 1;
           if (fa_count_ >= fa_len_) {
             fa_count_ = 0;
@@ -555,7 +574,15 @@ class PlanTerminal {
             bool crc_type = fa_type_ == GRAPHIC_TYPE || fa_type_ == SESSION_INIT_TYPE ||
                             fa_type_ == SESSION_CTL_TYPE;
             bool ck_ok = crc_type ? (fa_crc_ == 0) : (fa_sum_ == 0xFF);
-            if (ck_ok) {
+            // A2 D4 / A3 DV-3 (wave E2): only the controller's frames are
+            // acked. A terminal's own request to us -- since 09-30 the pGD's
+            // `1F' 1F 07 20 20 04 76` (R-LL-20, R-SE-19) -- is no session
+            // frame: our `01' 03 1F DC` went to the controller for a frame it
+            // never sent. sack_ctrl_only_ = 0: the legacy ack-anything.
+            const bool foreign = sack_ctrl_only_ && fa_src_ != 0x01;
+            if (ck_ok && foreign)
+              tel_sack_foreign_ = tel_sack_foreign_ + 1;
+            if (ck_ok && !foreign) {
               // Session-ready gate: the session (re)init (0A/50/66/65)
               // closes it, the first text row (0B/0C) after it opens it.
               if (fa_type_ == 0x0A || fa_type_ == IDENT_REQ_TYPE ||
@@ -566,6 +593,8 @@ class PlanTerminal {
             }
             if (!ck_ok) {
               ack_ck_fail_ = ack_ck_fail_ + 1;  // stay silent on garble
+            } else if (foreign) {
+              // not ours to answer (counted above)
             } else if (fa_type_ == IDENT_REQ_TYPE) {
               act.kind = TxAction::IDENT_REPLY;
               act.len = 7;
@@ -624,8 +653,26 @@ class PlanTerminal {
       // forwarder. A token from ABOVE us (0x20 answering OUR forward) is
       // the RETURN leg -- produce the controller's completion, the mirror
       // of its original poll (from = the focus = us).
+      // A1 V4 / R-RC-33 (wave E2): leaving. Members are never probed, so a
+      // renounce in a roll-call reply can never be sent; the controller's own
+      // leave path is member loss (R-RC-21c, w7 07-06 10:49:02.615): three
+      // unanswered polls, then it drops us from MAP and re-probes and re-joins
+      // the remaining member -- no link fault. So the drain stops answering
+      // polls at once but keeps acking the controller's session frames: an
+      // unacked session frame is a link fault (R-LL-08), an unanswered poll
+      // is not while another member remains. drain_replied_ (the task ends
+      // the leave) once the controller has let us go: at least 3 polls left
+      // unanswered and then a controller roll-call to another address (its
+      // re-probe, or the walk after the loss of a lone member).
+      // drain_quiet_ = 0: the legacy drain (polls answered until the task's
+      // deadline, then a hard stop mid-exchange).
+      if (drain_ && drain_quiet_) {
+        drain_polls_ = drain_polls_ + 1;
+        return act;
+      }
       const uint8_t from = isr_win_[3];
       const uint8_t ret = (from > ENROLL_ADDR) ? 0x01 : from;
+      lr_direct_ = from == 0x01;  // D5: only a reply to the controller's own poll is resent
       if (from == 0x01) {
         if (fwd_awaiting_) {
           // Our forward never completed and the controller re-polls us
@@ -812,6 +859,21 @@ class PlanTerminal {
       case TxAction::ENROLL_LINK_REPLY:
         enroll_polls_ = enroll_polls_ + 1;
         lr_ack_wait_ = 1;  // a bare 01' as the next run = accepted (rc_run_end_)
+        // D5: a reply to the controller's own poll is resent if unacked
+        // (on_tick); replies to member-forwarded tokens never are (A6 T12).
+        if (lr_resend_ && lr_direct_) {
+          for (int i = 0; i < 4; i++)
+            lr_rs_frame_[i] = act.frame[i];
+          lr_rs_n_ = 1;
+          lr_rs_t_ = now_us;
+        }
+        break;
+      case TxAction::LINK_RESEND:
+        tel_lr_resends_ = tel_lr_resends_ + 1;
+        lr_ack_wait_ = 1;  // an ack of the copy closes a join just the same
+        if (lr_rs_n_ != 0)
+          lr_rs_n_ = static_cast<uint8_t>(lr_rs_n_ + 1);
+        lr_rs_t_ = now_us;
         break;
       case TxAction::ENROLL_KEY_REPLY:
         enroll_polls_ = enroll_polls_ + 1;
@@ -845,6 +907,46 @@ class PlanTerminal {
     txlog_push_(act, 0, 0);
     if (act.kind == TxAction::RACE_KEY_REPLY)
       isr_stale_ = isr_stale_ + 1;
+    if (act.kind == TxAction::LINK_RESEND)
+      lr_rs_n_ = 0;  // the bus was busy: the exchange moved on without us
+  }
+
+  // Timer entry (wave E2, D5): call every <= 1 ms while the bus is quiet (the
+  // firmware's tick ISR; the simulator schedules it). Returns the identical
+  // resend of a link reply the controller left unacked -- the pGD's REPLY_RETRY
+  // (A6 T8, R-LL-05): 3 transmissions in all, 14 and 15 ms apart start to start
+  // (LR_GAP*_US from the end of the previous copy), then nothing: no own walk
+  // (we never act as master), and no timeout anywhere is extended. Any received
+  // byte cancels it (on_byte), so a resend never lands in the controller's
+  // 19 ms re-poll (R-LL-06); a tick later than LR_LATE_US (flash-cache stall)
+  // gives the slot up instead of transmitting late. Same caller contract as
+  // on_byte: report tx_sent / tx_not_sent.
+  static constexpr int64_t LR_GAP1_US = 13200;  // 14 ms start to start (4-byte reply)
+  static constexpr int64_t LR_GAP2_US = 14200;  // 15 ms
+  static constexpr int64_t LR_LATE_US = 1500;
+  TxAction PLAN_IRAM on_tick(int64_t now_us) {
+    TxAction act;
+    act.kind = TxAction::NONE;
+    act.len = 0;
+    act.bit9_mask = 0;
+    if (lr_rs_n_ == 0)
+      return act;
+    const int64_t due = lr_rs_t_ + (lr_rs_n_ == 1 ? LR_GAP1_US : LR_GAP2_US);
+    if (now_us < due)
+      return act;
+    if (lr_rs_n_ >= 3 || !enroll_ || drain_ || !lr_resend_ || now_us - due > LR_LATE_US) {
+      if (lr_rs_n_ >= 3)
+        tel_lr_lost_ = tel_lr_lost_ + 1;  // 3 transmissions, none acked
+      lr_rs_n_ = 0;
+      return act;
+    }
+    lr_rs_t_ = now_us;  // in flight: no second copy before tx_sent / tx_not_sent
+    act.kind = TxAction::LINK_RESEND;
+    act.len = 4;
+    for (int i = 0; i < 4; i++)
+      act.frame[i] = lr_rs_frame_[i];
+    act.bit9_mask = 0x01;
+    return act;
   }
 
  protected:
@@ -1018,6 +1120,10 @@ class PlanTerminal {
       rc20_unans_ = true;
     }
     const bool ctrl_rc = tel_type_ == 0x02 && tel_b3_ == 0x01 && tel_len_ == 12;
+    // V4: the controller has let us go -- our polls went unanswered and it
+    // runs a roll-call elsewhere (its member-loss re-probe, or a walk).
+    if (drain_ && drain_quiet_ && ctrl_rc && tel_addr_ != ENROLL_ADDR && drain_polls_ >= 3)
+      drain_replied_ = true;
     rc20_open_ = ctrl_rc && tel_addr_ == 0x20;
     if (ctrl_rc)
       rc_claims32_ = (tel_c1_ & 0x80) != 0;
@@ -1033,6 +1139,31 @@ class PlanTerminal {
     walk_prev_ = walk_run_;
     walk_run_ = false;
   }
+
+  // --- wave E2: link / session fixes (A2 D4/D5/D7, A1 V4) ------------------
+  // LAYOUT RULE (see tel_type_): new members at the class END only.
+ public:
+  // Knobs (task -> ISR, runtime-switchable via PlanBridge setters). Defaults
+  // are the fixed behaviour; the other value restores the pre-E2 behaviour.
+  // EXCEPT D5: default OFF -- its copies need a timer entry (on_tick), i.e. a
+  // new tick ISR in the firmware, which waits for a live A/B (parent decision).
+  volatile uint8_t rc_member_tokens_{0};  // D7: 1 = answer member-forwarded roll-call tokens
+  volatile uint8_t sack_ctrl_only_{1};    // D4: ack only frames whose sender is 0x01
+  volatile uint8_t lr_resend_{0};         // D5: 1 = resend an unacked link reply (on_tick)
+  volatile uint8_t drain_quiet_{1};       // V4: leave by member loss (polls unanswered, sessions acked)
+  // Telemetry (ISR increments; the task reads and resets per bus10s window).
+  volatile uint32_t tel_rc_member_ign_{0};  // member-forwarded tokens ignored (D7)
+  volatile uint32_t tel_sack_foreign_{0};   // terminal frames to us not acked (D4)
+  volatile uint32_t tel_lr_resends_{0};     // link-reply copies sent (D5)
+  volatile uint32_t tel_lr_lost_{0};        // replies unacked after all 3 transmissions
+  volatile uint32_t drain_polls_{0};        // state: polls left unanswered in this drain
+
+ protected:
+  volatile uint8_t fa_src_{0};          // session-frame ack: sender byte (byte 3)
+  volatile bool lr_direct_{false};      // the pending link reply answers a poll from 0x01
+  volatile uint8_t lr_rs_n_{0};         // transmissions of the unacked reply (0 = none pending)
+  volatile int64_t lr_rs_t_{0};         // end of its latest copy
+  volatile uint8_t lr_rs_frame_[4]{0};  // the reply, byte-identical for the copies
 
   void PLAN_IRAM rc_join_failed_(int64_t now_us) {
     join_open_ = false;

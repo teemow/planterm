@@ -141,6 +141,13 @@ class PhysFault : public FaultHook {
         first = k == 0;
         break;
       }
+    // The bridge's link-reply copies (wave E2, D5 / R-LL-05: its identical
+    // frame within 20 ms, nothing else on the wire in between) take their
+    // original's fate without a draw. The controller never accepts a copy
+    // (R-LL-06), so a draw could only shift every later loss decision of the
+    // run -- I2/I7 would then compare RNG luck, not behaviour, against the
+    // pre-E2 table. The pGD model's own copies keep their draw (C11).
+    if (from == 0x1F && copy_of_prev_(from, start)) return;  // dec_ holds the original's
     if (to == 0x01 && from != 0x01 && from != 0) {  // R-LL-21: terminal -> controller
       double p = spec.p_to_ctrl;
       if ((type == 0x01 || type == 0x02) && spec.p_to_ctrl_reply >= 0) p = spec.p_to_ctrl_reply;
@@ -160,6 +167,16 @@ class PhysFault : public FaultHook {
       else d.drop_addr = true;
     }
     dec_[key_(from, to)] = d;
+  }
+  bool copy_of_prev_(uint8_t from, int64_t start) const {
+    const Tx *cur = nullptr, *prev = nullptr;  // prev: the latest frame that started before it
+    for (const auto &x : tx_) {
+      if (x.from == from && x.t0 == start) cur = &x;
+      else if (x.t0 < start && (!prev || x.t0 > prev->t0)) prev = &x;
+    }
+    return cur && prev && prev->from == from && start - prev->t0 <= 20000 && prev->f.size() == cur->f.size() &&
+           std::equal(prev->f.begin(), prev->f.end(), cur->f.begin(),
+                      [](const WireByte &a, const WireByte &b) { return a.v == b.v; });
   }
 
   Rng rng_;

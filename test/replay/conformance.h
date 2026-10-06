@@ -213,6 +213,7 @@ struct PlantermRun {
   std::vector<bool> backoff; // per rx index: forward back-off active (a forward failed < 1 s ago)
   std::vector<bool> walk;    // per rx index: the FF-walk detector fired (tel_walks_ counted it)
   std::vector<bool> folded;  // per rx index: an opener folded into its lone announce (R-RC-06)
+  std::vector<int> resent;   // per rx index: link-reply copies sent after answering it (D5, on_tick)
   uint32_t not_sent = 0;     // actions the ISR's FIFO gate would have dropped (stale match)
 };
 
@@ -230,10 +231,26 @@ inline PlantermRun run_planterm(const Stream &s, const TaskState &ts) {
   r.backoff.resize(s.rx.size());
   r.walk.resize(s.rx.size());
   r.folded.resize(s.rx.size());
-  int64_t fail_at = -1;
-  size_t ev = 0;
+  r.resent.resize(s.rx.size());
+  int64_t fail_at = -1, tx_end = -1;
+  size_t ev = 0, last_slot = 0;
   for (size_t i = 0; i < s.rx.size(); i++) {
     const Frame &f = s.rx[i];
+    // The firmware's 1 kHz tick (wave E2, D5): on_tick through the silence
+    // before this frame; a copy goes out only if it ends before the frame.
+    for (int64_t tk = tx_end + 1000; tx_end >= 0 && tk < f.start_us && tk <= tx_end + 50'000; tk += 1000) {
+      plan::TxAction a = term.on_tick(tk);
+      if (a.kind == plan::TxAction::NONE)
+        continue;
+      const int64_t end = tk + a.len * 192 + 16;
+      if (end < f.start_us) {
+        term.tx_sent(a, end);
+        r.resent[last_slot]++;
+        tx_end = end;
+      } else {
+        term.tx_not_sent(a);
+      }
+    }
     ev = ts.apply_due(ev, f.line, [&](const std::string &k, int v) {
       if (k == "enroll")
         term.enroll_ = v != 0;
@@ -264,7 +281,9 @@ inline PlantermRun run_planterm(const Stream &s, const TaskState &ts) {
       else if (i + 1 < s.rx.size())
         next = byte_time(s.rx[i + 1], 0);
       if (next - t > ts.turnaround_us) {
-        term.tx_sent(act, t + ts.turnaround_us + act.len * 192 + 16);
+        tx_end = t + ts.turnaround_us + act.len * 192 + 16;
+        last_slot = i;
+        term.tx_sent(act, tx_end);
         r.out[i].bytes.assign(act.frame, act.frame + act.len);
       } else {
         term.tx_not_sent(act);
@@ -465,16 +484,20 @@ inline std::vector<Div> compare(const std::string &cmp, const Stream &s, const P
     }
     slot_of.push_back(i);
     // A6:T8 / R-LL-05: a pGD resends an unacked link reply (2 more copies,
-    // ~14 ms apart). planterm never does (D5). Only judged where the
-    // recording shows the reply really went out and the next frame on the
-    // wire is neither the controller's ack nor a new frame to us.
+    // ~14 ms apart). planterm does only with the D5 knob on (wave E2,
+    // default OFF; on_tick). Only judged where the recording shows the reply
+    // really went out and the next frame on the wire is neither the
+    // controller's ack nor a new frame to us.
     const std::string kp = kind_of(p.bytes);
     if (check_resend && (kp == "link" || kp == "key") && s.rec_of[i] >= 0 &&
         s.tx[s.rec_of[i]].bytes == p.bytes && i + 1 < s.rx.size() && !is_bare_ack(s.rx[i + 1]) &&
         !(s.rx[i + 1].bit9 && s.rx[i + 1].to == BRIDGE)) {
       Unit resend;
       resend.bytes.assign(p.bytes.end() - 4, p.bytes.end());
-      divs.push_back(make_div(cmp, "missing", "D5 (R-LL-05/A6:T8)", s.rx[i], Unit(), resend, "A6:T8"));
+      if (run.resent[i] > 0)
+        divs.push_back(make_div(cmp, "same", "resend (A6:T8/R-LL-05)", s.rx[i], resend, resend, "A6:T8"));
+      else
+        divs.push_back(make_div(cmp, "missing", "D5 (R-LL-05/A6:T8)", s.rx[i], Unit(), resend, "A6:T8"));
       slot_of.push_back(i);
     }
   }

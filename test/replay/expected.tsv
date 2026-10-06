@@ -68,21 +68,19 @@ oct05-enrolled-loop	pgd-model-vs-pgd	extra	A6:T19	1	L457
 oct05-enrolled-loop	pgd-model-vs-pgd	extra	R-RC-25 (pGD master walk/token)	2	L230
 oct05-enrolled-loop	pgd-model-vs-pgd	extra	R-SE-19/R-LL-20	4	L227
 oct05-enrolled-loop	vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	2	L116
-oct05-enrolled-loop	vs-pgd-model	extra	D4/DV-3	6	L225
 oct05-enrolled-loop	vs-pgd-model	missing	D5 (R-LL-05/A6:T8)	3	L375
 oct05-enrolled-loop	vs-pgd-model	missing	counterfactual confirm (R-RC-30 silent before)	12	L219
 oct05-enrolled-loop	vs-pgd-model	same	link	5	L224
 oct05-enrolled-loop	vs-pgd-model	same	rollcall	3	L114
 oct05-enrolled-loop	vs-pgd-model	same	silent (R-RC-30)	17	L50
 oct05-enrolled-loop	vs-recorded	different-bytes	D3/DV-4 (R-LL-17)	2	L224
+oct05-enrolled-loop	vs-recorded	missing	D4/DV-3	6	L225
 oct05-enrolled-loop	vs-recorded	missing	counterfactual confirm (R-RC-30 silent before)	29	L50
 oct05-enrolled-loop	vs-recorded	same	link	3	L375
 oct05-enrolled-loop	vs-recorded	same	rollcall	5	L114
-oct05-enrolled-loop	vs-recorded	same	session_ack	6	L225
 oct05-enrolled-loop	walk-detector	same	ff-walk	17	L20
 oct05-enrolled-loop	walk-detector	same	ff-walk restart folded (R-RC-06)	5	L118
 oct05-passive-loop	harness	tx_units=0 unaligned=0 isr_stale_drops=0
-oct05-passive-loop	counterfactual-vs-pgd-model	extra	D7 (A6:T13; A1 R-RC-31 keeps it)	1	L327
 oct05-passive-loop	counterfactual-vs-pgd-model	same	silent (R-RC-30)	1	L358
 oct05-passive-loop	pgd-model-vs-pgd	extra	R-RC-25 (pGD master walk/token)	32	L297
 oct05-passive-loop	pgd-model-vs-pgd	same	ident	3	L376

@@ -205,5 +205,36 @@ void IRAM_ATTR PlanBridge::uart_isr(void *arg) {
     portYIELD_FROM_ISR();
 }
 
+// Wave E2, D5 (default OFF, live A/B pending): the 1 kHz GPTimer tick. A link
+// reply the controller left unacked is resent like the pGD does (A6 T8 /
+// R-LL-05) -- in silence, where no UART byte arrives to run uart_isr, hence a
+// timer. uart_isr above is untouched; this is a separate interrupt that only
+// exists once set_link_resend(true) created it. The resend is unsolicited, so
+// it always carrier-senses (RX FIFO empty AND the RX FSM not mid-byte) and
+// never waits a turnaround; any received byte has already cancelled it in
+// on_byte. No RX can interleave our TX: DE+RE are tied.
+bool IRAM_ATTR PlanBridge::link_tick_isr(gptimer_handle_t, const gptimer_alarm_event_data_t *, void *arg) {
+  auto *self = static_cast<PlanBridge *>(arg);
+  uart_dev_t *hw = self->hw_;
+  plan::TxAction act = self->term_.on_tick(esp_timer_get_time());
+  if (act.kind == plan::TxAction::NONE)
+    return false;
+  if (uart_ll_get_rxfifo_len(hw) != 0 || hw->fsm_status.st_urx_out != 0) {
+    self->tick_skipped_ = self->tick_skipped_ + 1;
+    self->term_.tx_not_sent(act);
+    return false;
+  }
+  gpio_ll_set_level(&GPIO, static_cast<gpio_num_t>(self->de_pin_), 1);
+  uint8_t f[sizeof(act.frame)];
+  for (size_t i = 0; i < act.len; i++)
+    f[i] = act.frame[i];
+  tx_9bit(hw, f, act.len, act.bit9_mask);
+  if (self->de_tail_us_ != 0)
+    esp_rom_delay_us(self->de_tail_us_);
+  gpio_ll_set_level(&GPIO, static_cast<gpio_num_t>(self->de_pin_), 0);
+  self->term_.tx_sent(act, esp_timer_get_time());
+  return false;
+}
+
 }  // namespace plan_bridge
 }  // namespace esphome

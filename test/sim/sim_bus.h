@@ -220,6 +220,13 @@ class Bus {
       push_({t0 + CHAR_US * static_cast<int64_t>(i + 1), seq_++, s, -1, f[i]});
   }
   void at(Station *s, int64_t t, int id) { push_({t, seq_++, s, id, {0, false}}); }
+  // Another station is driving the bus at t (the firmware's carrier sense:
+  // RX FIFO not empty / UART RX FSM mid-byte, plan_bridge_isr.cpp).
+  bool busy(int64_t t, const Station *self) const {
+    for (const auto &a : active_)
+      if (a.from != self && a.t0 <= t && t < a.t1) return true;
+    return false;
+  }
   // A stray byte on an otherwise idle bus (fault rows): delivered to everyone.
   void inject_glitch(int64_t t, WireByte b) { transmit(&noise_, Frame{b}, t); }
 

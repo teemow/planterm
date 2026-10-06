@@ -26,8 +26,14 @@
 //   member-forwarded poll `20' 01 SRC` (SRC != 01): link reply to 0x01 as
 //             itself, no retry (T12); member-forwarded roll-call: ignored (T13).
 //
-// Gaps (A6 sect. 8, not modelled): pGD poll forwarding and type-0x1F frames
-// (T19/T20), NO LINK timer, idle-timer walks on a silent bus, release /
+//   T20 (wave E2, the post-09-30 pathology, R-LL-20a / R-SE-19): with
+//             p_fwd_req04 > 0 a member-forwarded poll is answered, with that
+//             probability, by the request `SRC' 1F 07 20 20 04 CK` three
+//             times 15.05 ms apart (LOOP0930 17:47:08.909, carrier-sensed)
+//             instead of the link reply. p = 0: July. What follows the 3rd
+//             (its poll `1F' 01 20 BF` or its own walk) is not modelled.
+//
+// Gaps (A6 sect. 8, not modelled): pGD poll forwarding outside T20 (T19), NO LINK timer, idle-timer walks on a silent bus, release /
 // combination key codes, 4th consecutive roll-call (we wrap to a new echo).
 
 #include "sim_bus.h"
@@ -55,13 +61,15 @@ class PgdModel : public Station {
     int64_t t_slot_us = 15000;         // T15: probe spacing
     int64_t round_restart_us = 12000;  // T16: 1F' -> 01'
     int64_t park_us = 500000;          // T14: no poll for this long = PARKED
+    double p_fwd_req04 = 0;            // T20: P(type-0x1F request answers a forwarded poll)
+    int64_t req04_us = 15050;          // T20: 15.05 ms apart (device clock)
     uint64_t seed = 0x20;
   };
   Params prm;
   std::array<std::string, 8> screen;
   uint32_t polls = 0, fwd_polls = 0, replies = 0, resends = 0, acks_rx = 0, echoes = 0,
            sacks = 0, bad_ck = 0, inits = 0, idents = 0, keys_sent = 0, master_walks = 0,
-           master_probes = 0, handoffs = 0, joins = 0, fwd_rollcalls_ignored = 0;
+           master_probes = 0, handoffs = 0, joins = 0, fwd_rollcalls_ignored = 0, req04 = 0;
 
   // booted = true: start in LISTEN (skip the 18 s boot for steady-state tests).
   explicit PgdModel(bool booted = true, uint8_t a = 0x20) : Station(a), rng_(0x20) {
@@ -102,6 +110,7 @@ class PgdModel : public Station {
   }
 
   void on_rx(const WireByte &b, int64_t t) override {
+    last_rx_t_ = t;
     if (st_ == OFF || st_ == BOOTING) return;  // T2: nothing while booting
     // The bare `01'` ack of our link reply (sect. 4: consumed, never answered).
     if (await_ack_ && b.addr && !b.err && b.v == 0x01) {
@@ -137,6 +146,15 @@ class PgdModel : public Station {
         }
         break;
       case T_ECHO: master_(t); break;  // T6: nothing followed the echo
+      case T_REQ04:  // T20: 3 requests 15.05 ms apart, carrier-sensed
+        if (bus->busy(t, this) || t - last_rx_t_ < 2000) {  // never inside a reply slot
+          arm_(t + 300, T_REQ04);
+        } else if (++req_n_ <= 3) {
+          req04++;
+          tx_(mk(req_to_, {0x1F, 0x07, addr, addr, 0x04}), t);
+          if (req_n_ < 3) arm_(t + prm.req04_us, T_REQ04);
+        }
+        break;
       case T_PROBE:                    // T15: probed address silent
         mmap_ &= ~bit(nn_);
         if (++nn_ >= addr) {  // T16: wrap after 1F' with an all-ones MAP
@@ -150,7 +168,7 @@ class PgdModel : public Station {
   }
 
  private:
-  enum Tk { T_BOOT, T_RESEND, T_ECHO, T_PROBE };
+  enum Tk { T_BOOT, T_RESEND, T_ECHO, T_PROBE, T_REQ04 };
 
   static uint8_t src_of(const Frame &f) {
     uint8_t ty = f[1].v;
@@ -200,6 +218,12 @@ class PgdModel : public Station {
       last_poll_t_ = t;
       bool direct = src == 0x01;
       (direct ? polls : fwd_polls)++;
+      if (!direct && rng_.chance(prm.p_fwd_req04)) {  // T20
+        req_to_ = src;
+        req_n_ = 0;
+        tk_ = T_REQ04;
+        return on_timer(++gen_, t0);
+      }
       return reply_(t0, direct, key_report_(t));
     }
     rc_n_ = 0;
@@ -272,11 +296,12 @@ class PgdModel : public Station {
   FrameAsm asm_;
   State st_;
   Tk tk_ = T_BOOT;
-  int gen_ = 0, rc_n_ = 0, attempt_ = 0;
+  int gen_ = 0, rc_n_ = 0, attempt_ = 0, req_n_ = 0;
+  uint8_t req_to_ = 0;
   bool await_ack_ = false, sessioned_ = false;
   uint8_t nn_ = 1, key_ = 0, key_nn_ = 0;
   uint32_t mmap_ = 0;
-  int64_t last_poll_t_ = 0, hold_us_ = 0, key_t0_ = -1;
+  int64_t last_poll_t_ = 0, hold_us_ = 0, key_t0_ = -1, last_rx_t_ = 0;
 };
 
 }  // namespace sim

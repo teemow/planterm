@@ -360,6 +360,9 @@ static void test_ff_walk_silent_at_31() {
   DropHook h(0x1F, 0x01, 40 * S, 40 * S + 200 * MS);
   w.bus.hook = &h;
   w.br.term.enroll_ = true;
+  // the lost replies must link-fault here, not take the member-loss path the
+  // controller has while the pGD remains (R-RC-21c, wave E2)
+  w.ctl.member_loss = false;
   w.ctl.start(0);
   w.bus.run_until(20 * S);
   CHECK(w.ctl.link_faults == 0 && w.ctl.map == 0xC0000001u && w.ctl.claims == 0xC0000000u);
