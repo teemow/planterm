@@ -409,6 +409,15 @@ inline bool fx_dout(const char *row, char *name, size_t namesz, char *val, size_
   return true;
 }
 
+// CAREL's open-probe reading (B9 "Discharge comp." with no probe fitted
+// paints -204.8 deg C, wave A4 W-10): not a temperature. Emitted as "nan"
+// so a numeric consumer (strtof) publishes NaN = unavailable instead of a
+// reading; text and other units pass through.
+static constexpr const char *FIELDS_OPEN_PROBE = "-204.8";
+inline const char *fx_reading(const char *val, const char *unit) {
+  return unit != nullptr && std::strcmp(unit, "°C") == 0 && std::strcmp(val, FIELDS_OPEN_PROBE) == 0 ? "nan" : val;
+}
+
 // extract_io scans an Input/Output screen by row content: analogue-probe
 // label/value pairs and digital-output rows appear at varying positions
 // (and even mixed mid-repaint), so position-keyed extraction cannot work
@@ -447,9 +456,9 @@ inline void extract_io(const char *page, const char *const rows[FIELDS_ROWS], Em
       std::snprintf(name, sizeof name, "%s_press", id);
       emit(page, name, val, "barg");
       std::snprintf(name, sizeof name, "%s_temp", id);
-      emit(page, name, val2, "°C");
+      emit(page, name, fx_reading(val2, "°C"), "°C");
     } else if (fx_find_num(vrow, "\xDF", val, sizeof val) != nullptr) {
-      emit(page, id, val, "°C");
+      emit(page, id, fx_reading(val, "°C"), "°C");
     }
   }
 }
@@ -472,7 +481,7 @@ inline void extract_fields(const FieldSpec *specs, size_t nspecs,
     if (std::strcmp(sp.page, page) != 0)
       continue;
     if (fx_match(sp, rows[sp.row], val, sizeof val))
-      emit(page, sp.name, val, sp.unit);
+      emit(page, sp.name, fx_reading(val, sp.unit), sp.unit);
   }
 }
 

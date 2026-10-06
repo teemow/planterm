@@ -324,11 +324,27 @@ class NavEngine {
       return Act::RUN;
     }
     if (aphase_ == 1) {
-      uint32_t p = scr_.painted_ms(SCR_TERM_ESP);
+      // PlanScreen::settled: quiet, no session init still painting, the
+      // controller still transmitting (A4 R-DI-26). A never-painted screen
+      // has nothing to wait for; the verify below fails it.
       bool quiet = (key == 0 || now - at0_ >= NAV_QUIET_MS) &&
-                   (p == 0 || now - p >= NAV_QUIET_MS);
-      if (!quiet && now - at0_ < NAV_SETTLE_CAP_MS)
-        return Act::RUN;
+                   (scr_.painted_ms(SCR_TERM_ESP) == 0 || scr_.settled(SCR_TERM_ESP, now, NAV_QUIET_MS));
+      if (!quiet) {
+        if (now - at0_ < NAV_SETTLE_CAP_MS)
+          return Act::RUN;
+        // W-05: a screen that never settled has no valid read. Say so; a
+        // keyless settle (the emit's) FAILs instead of reading a torn page.
+        // A keyed step still runs its verify: its callers re-press on FAIL,
+        // and the next read (the emit) settles again anyway.
+        settle_caps_++;
+        if (log_)
+          log_(true, key == 0 ? "settle cap: screen never settled, nothing read"
+                              : "settle cap: screen never settled after a key");
+        if (key == 0) {
+          aphase_ = 0;
+          return Act::FAIL;
+        }
+      }
       at0_ = now;
       aphase_ = 2;  // fall through to the verify check this same tick
     }
@@ -551,6 +567,12 @@ class NavEngine {
   uint8_t pphase_{0};
   int pin_stage_{0}, pin_shown_{0}, pin_left_{0};
   int pins_[2]{0, 0};
+
+  // Steps failed at NAV_SETTLE_CAP_MS (class END per the W3 rule).
+  uint32_t settle_caps_{0};
+
+ public:
+  uint32_t settle_caps() const { return settle_caps_; }
 };
 
 // PlanNav runs a consumer-supplied scrape route on a schedule: Esc to the
@@ -736,7 +758,10 @@ class PlanNav : public NavEngine {
     // the walk WITHOUT emitting -- every view published exactly once.
     bool wrap_stop = false;
     if (s.emit) {
-      if (step_(0, [] { return true; }, 0, now) != Act::OK)
+      Act a = step_(0, [] { return true; }, 0, now);
+      if (a == Act::FAIL)
+        return fail_("emit: screen never settled");
+      if (a != Act::OK)
         return;
       uint32_t h = body_hash_();
       if (s.walk > 1) {
