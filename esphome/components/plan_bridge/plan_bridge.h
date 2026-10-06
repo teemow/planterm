@@ -33,9 +33,10 @@ namespace plan_bridge {
 // humans; these values are the wire protocol.
 static const uint8_t EV_STATE = 1;         // a = armed | enroll<<1 (0 no, 1 yes, 2 drain), b = tx_mode
 static const uint8_t EV_JOIN = 2;          // first poll to our address answered since set_enroll(true)
-static const uint8_t EV_TX_FIRED = 3;      // a = keycode, b = attempt
-static const uint8_t EV_KEY_ACCEPTED = 4;  // a = keycode, b = attempt
+static const uint8_t EV_TX_FIRED = 3;      // a = keycode, b = 0 (a key goes on the wire once)
+static const uint8_t EV_KEY_ACCEPTED = 4;  // a = keycode, b = 0: the controller acked the burst
 static const uint8_t EV_HOLD = 5;          // plan_observe's walk yielded; a = 1 paused, 0 armed
+static const uint8_t EV_KEY_FATE = 6;      // a = keycode, b = plan::KeyFate (REJECTED/EXPIRED)
 
 // Phase 3 bus participation + key-press injection for the CAREL pLAN /pGD
 // terminal-emulation project. Unlike the Phase 0/2 read-only components, this
@@ -151,6 +152,10 @@ class PlanBridge : public Component {
   // keys 24/7 while the "write enable" switch keeps gating only HA/API
   // presses (which go through press_key).
   void press_key_internal(uint8_t keycode);
+  // Fate of the most recent press (plan::KeyFate): seq << 16 | key << 8 |
+  // fate, one word so a main-loop reader never sees a torn triple. Consumers
+  // forward each new seq to NavEngine/PlanEdit::key_fate(key, fate).
+  uint32_t key_fate_word() const { return key_fate_word_; }
 
   void setup() override;
   void dump_config() override;
@@ -166,6 +171,10 @@ class PlanBridge : public Component {
   static void task_trampoline(void *arg);
   void task_main();
   void arm_isr_tx_();    // encode pending_key_/hold_ into tx_frame_ and hand it to the ISR
+  void key_tick_(uint32_t now);  // the key pump: queue -> armed -> once on the wire -> fate
+  void key_fired_(uint32_t now);
+  void drop_queue_(const char *why);
+  void publish_fate_(uint8_t key, uint8_t fate);
   void log_state_();     // one "state: armed=... enroll=..." line (human prose)
   // One PLANCAP client slot: its socket, its own transport session
   // (handshake state + cipher states) and its own send backlog, so a slow
@@ -282,7 +291,7 @@ class PlanBridge : public Component {
   int pending_frames_{0};
   uint8_t pending_key_{0};
   uint8_t hold_{0};
-  int retries_{0};  // collision retries used for the current press
+  int retries_{0};  // unused since the key pump stopped retrying (kept: layout rule)
   uint32_t inject_deadline_ms_{0};
   // Hard stop for the graceful drain: if no roll-call walk renounced us by
   // then (walks come ~every 12 s), drop the link the old abrupt way.
@@ -339,6 +348,10 @@ class PlanBridge : public Component {
   volatile uint32_t de_hold_max_us_{0};
   volatile uint32_t cs_would_fire_{0};
   volatile uint32_t cs_blocked_{0};
+  // Key pump (wave E3). LAYOUT RULE: new members at the class END only.
+  uint8_t key_st_{0};                 // KeySt (plan_bridge.cpp)
+  uint32_t key_t_ms_{0};              // TX / withdrawal / repeat time of the current key
+  volatile uint32_t key_fate_word_{0};
 };
 
 }  // namespace plan_bridge

@@ -385,7 +385,19 @@ struct FakePump {
     }
   }
 
+  // Lost keys (A5 F-12/F-13): the controller acked the burst but the
+  // keypad report never reached the application -- the Enter does nothing.
+  bool drop_focus_enter = false;   // the first Enter on a value page with no focus open
+  bool drop_commit_enter = false;  // the first Enter pressed with a focus open
   void press(uint8_t k, uint32_t now) {
+    if (k == KEY_ENTER && drop_focus_enter && focus == 0 && (page == B_PAGE || page == A01P)) {
+      drop_focus_enter = false;
+      return;
+    }
+    if (k == KEY_ENTER && drop_commit_enter && focus != 0) {
+      drop_commit_enter = false;
+      return;
+    }
     if (page == PW_GATE) { gate_key(k); paint(now); return; }
     const char *a01_before = a01_opts[a01_idx];
     bool a01_edit = page == A01P && focus == 1 && (k == KEY_UP || k == KEY_DOWN);
@@ -1173,6 +1185,73 @@ int main() {
       assert(arb.enqueue(mfind("mode"), nullptr));
     assert(!arb.enqueue(mfind("mode"), nullptr));  // full
     assert(arb.pending());
+  }
+
+  {  // F-13: a lost commit Enter must not report success. The row shows the
+     // candidate either way; the confirming re-visit after the teardown
+     // (whose Esc cancel-restored the old value) decides.
+    FakePump pump;
+    pump.drop_commit_enter = true;
+    uint32_t now = 1000;
+    pump.paint(now);
+    Result r = run(pump, now, "dhw-setpoint", "40.0");
+    assert(!r.ok && r.msg.find("commit not confirmed") != std::string::npos);
+    assert(r.value == "39.0");  // the pre-edit value, which the device still holds
+    assert(pump.bvals[1][0] == 39.0 && !pump.committed && pump.page == FakePump::STATUS);
+  }
+
+  {  // F-12: a lost focus Enter -- the first Up pages away instead of editing;
+     // the edit aborts there, never walking the neighbouring page's value
+    FakePump pump;
+    pump.drop_focus_enter = true;
+    uint32_t now = 1000;
+    pump.paint(now);
+    Result r = run(pump, now, "dhw-setpoint", "40.0");
+    assert(!r.ok);
+    assert(pump.bvals[0][0] == 10.0 && pump.bvals[1][0] == 39.0 && !pump.committed);
+  }
+
+  {  // key fates (A5 R-KP-14/15): a press the bridge reports REJECTED (or
+     // EXPIRED) did not execute and is pressed once more by its step; an
+     // ACCEPTED one never is. Baseline = the same get with no loss.
+    for (int lose : {0, 1, 2}) {  // 0: none, 1: lost + REJECTED, 2: lost + ACCEPTED (unknowable)
+      FakePump pump;
+      uint32_t now = 1000;
+      pump.paint(now);
+      PlanEdit edit(pump.scr);
+      edit.set_specs(SPECS, SPECS_N);
+      int presses = 0;
+      uint8_t fate_key = 0;
+      edit.set_press([&](uint8_t k) {
+        if (++presses == 1 && lose != 0) {
+          fate_key = k;  // the bridge's verdict arrives ~100 ms later
+          return;
+        }
+        pump.press(k, now);
+      });
+      Result r;
+      edit.set_done([&](bool ok, const char *value, const char *msg) {
+        r.called = true;
+        r.ok = ok;
+        r.value = value;
+        r.msg = msg;
+      });
+      assert(edit.get(mfind("dhw-setpoint")));
+      for (int i = 0; i < 100000 && !r.called; i++) {
+        now += 50;
+        pump.tick(now);
+        if (fate_key != 0 && i == 2) {
+          edit.key_fate(fate_key, lose == 1 ? KEY_FATE_REJECTED : KEY_FATE_ACCEPTED);
+          fate_key = 0;
+        }
+        edit.tick(now);
+      }
+      static int base = 0;
+      if (lose == 0) base = presses;
+      if (lose == 0 || lose == 1) assert(r.ok && r.value == "39.0");
+      if (lose == 1) assert(presses == base + 1);  // exactly one re-press
+      if (lose == 2) assert(presses <= base + 6);  // never re-pressed on the ack; the verify path decides
+    }
   }
 
   std::printf("ok\n");

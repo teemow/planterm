@@ -84,6 +84,28 @@ enum PlanKey : uint8_t {
   KEY_DOWN = 0x10,
 };
 
+// What became of one requested key press (A5 key lifecycle, R-KP-08/09/11/12):
+// the bridge's key pump reports it, the navigation engines consume it.
+//   ACCEPTED  the controller acked the burst that carried it (01' right after);
+//             the key may have executed -- it is never sent again.
+//   REJECTED  the burst went out and the controller did not ack it (re-poll,
+//             silence, anything else first): it did not execute.
+//   EXPIRED   no session-ready poll slot within the key's TTL, or it went
+//             stale in the queue while the bus was dead: never transmitted.
+enum KeyFate : uint8_t {
+  KEY_FATE_NONE = 0,
+  KEY_FATE_ACCEPTED = 1,
+  KEY_FATE_REJECTED = 2,
+  KEY_FATE_EXPIRED = 3,
+};
+// Key TTL (R-KP-09): a key not on the wire within this of its request is
+// expired, never sent late. Below NAV_VERIFY_MS, so the step that pressed it
+// is still waiting when the fate arrives.
+static constexpr uint32_t KEY_TTL_MS = 1500;
+// Verdict window (R-KP-11/12): the controller acks within ~0.4 ms; nothing at
+// all within this after our burst is the silent discard.
+static constexpr uint32_t KEY_VERDICT_MS = 100;
+
 // The controller's 9-byte link-layer poll token, ~93% of idle bus traffic.
 // A run of these, or the inter-token silence around them, marks the window a
 // terminal transmits into.
