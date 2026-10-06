@@ -343,7 +343,10 @@ struct Scenario {
 
 static std::vector<Scenario> scenarios() {
   std::vector<Scenario> v;
-  v.push_back({"cold_boot", 0, 120 * S, 0, 0, MK_NONE, 1});
+  // cold_boot I4 counts from the pGD's boot (A6 T2: 17.4-19.7 s), not t=0:
+  // until a terminal can answer, no walk can end (R-RC-05), and R-RC-30 makes
+  // the bridge join on the gap walk AFTER the pGD's own claim (+12 s, R-RC-03).
+  v.push_back({"cold_boot", 0, 120 * S, 0, 20 * S, MK_NONE, 1});
   v.push_back({"bridge_boot", 0, 150 * S, 30 * S, 30 * S, MK_NONE, 2});
   v.push_back({"bridge_reset_noise", 0, 180 * S, 60 * S, 62 * S, MK_NONE, 3});
   v.push_back({"pgd_power_cycle", 0, 180 * S, 60 * S, 85 * S, MK_NONE, 4});

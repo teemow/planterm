@@ -7,6 +7,7 @@
 
 #include <driver/gpio.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <soc/uart_periph.h>
 
 #include <lwip/sockets.h>
@@ -489,6 +490,33 @@ void PlanBridge::task_main() {
       de_hold_max_us_ = 0;
       cs_would_fire_ = 0;
       cs_blocked_ = 0;
+      // Wave E1 roll-call telemetry: warm/folded walks (of walks= above), FF
+      // probes left to 0x20 (R-RC-30), join probes skipped by the back-off,
+      // own joins opened/closed/failed, the failure streak, back-off and
+      // pGD-absent state. Read-and-reset per window except the state fields.
+      {
+        const int64_t now = esp_timer_get_time();
+        const int64_t bo = term_.rc_backoff_until_us_;
+        capture_diag_(plan::CAP_DIAG_INFO,
+                      "rollcall10s: warm=%u folded=%u ff_silent=%u backoff_skip=%u joins=%u ok=%u "
+                      "failed=%u streak=%u backoff_s=%d pgd_absent=%d",
+                      static_cast<unsigned>(term_.tel_walks_warm_),
+                      static_cast<unsigned>(term_.tel_walks_folded_),
+                      static_cast<unsigned>(term_.tel_rc_silent_),
+                      static_cast<unsigned>(term_.tel_rc_backoff_),
+                      static_cast<unsigned>(term_.tel_joins_), static_cast<unsigned>(term_.tel_joins_ok_),
+                      static_cast<unsigned>(term_.tel_joins_failed_),
+                      static_cast<unsigned>(term_.rc_join_streak_),
+                      bo > now ? static_cast<int>((bo - now) / 1000000) : 0,
+                      term_.pgd_absent(now) ? 1 : 0);
+        term_.tel_walks_warm_ = 0;
+        term_.tel_walks_folded_ = 0;
+        term_.tel_rc_silent_ = 0;
+        term_.tel_rc_backoff_ = 0;
+        term_.tel_joins_ = 0;
+        term_.tel_joins_ok_ = 0;
+        term_.tel_joins_failed_ = 0;
+      }
       if (term_.enroll_ || term_.enroll_replies_ > 0)
         capture_diag_(plan::CAP_DIAG_INFO,
                       "enroll(addr 0x%02X): %u roll-call replies, %u polls, %u session acks, "

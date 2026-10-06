@@ -7,10 +7,9 @@
 # class is from planterm's side (missing: the other side sends, planterm does not).
 jul17-soak-join	harness	tx_units=75 unaligned=0 isr_stale_drops=0
 jul17-soak-join	counterfactual-vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	1	L2537
-jul17-soak-join	counterfactual-vs-pgd-model	different-bytes	D3/DV-4 (R-LL-17)	1	L2541
-jul17-soak-join	counterfactual-vs-pgd-model	different-bytes	R-LL-19 dual-terminal forward (A6:T19, no pGD rule)	1	L2682
+jul17-soak-join	counterfactual-vs-pgd-model	different-bytes	R-LL-19 dual-terminal forward (A6:T19, no pGD rule)	10	L2584
 jul17-soak-join	counterfactual-vs-pgd-model	same	ident	1	L2770
-jul17-soak-join	counterfactual-vs-pgd-model	same	link	47	L2547
+jul17-soak-join	counterfactual-vs-pgd-model	same	link	39	L2541
 jul17-soak-join	counterfactual-vs-pgd-model	same	rollcall	3	L2533
 jul17-soak-join	counterfactual-vs-pgd-model	same	session_ack	21	L2587
 jul17-soak-join	pgd-model-vs-pgd	same	link	54	L2401
@@ -52,8 +51,7 @@ jul17-nofwd-join	vs-recorded	same	link	43	L1691
 jul17-nofwd-join	vs-recorded	same	rollcall	4	L1683
 jul17-nofwd-join	vs-recorded	same	session_ack	21	L1737
 oct02-passive-ffwalk	harness	tx_units=0 unaligned=0 isr_stale_drops=0
-oct02-passive-ffwalk	counterfactual-vs-pgd-model	extra	R-RC-30/V3	1	L683
-oct02-passive-ffwalk	counterfactual-vs-pgd-model	extra	R-RC-30/V3 + D2/DV-2 honest skip	1	L50
+oct02-passive-ffwalk	counterfactual-vs-pgd-model	same	silent (R-RC-30)	2	L50
 oct02-passive-ffwalk	pgd-model-vs-pgd	same	ident	2	L110
 oct02-passive-ffwalk	pgd-model-vs-pgd	same	link	204	L55
 oct02-passive-ffwalk	pgd-model-vs-pgd	same	resend (A6:T8/R-LL-05)	8	L343
@@ -69,26 +67,27 @@ oct05-enrolled-loop	pgd-model-vs-pgd	different-bytes	R-LL-20	2	L222
 oct05-enrolled-loop	pgd-model-vs-pgd	extra	A6:T19	1	L457
 oct05-enrolled-loop	pgd-model-vs-pgd	extra	R-RC-25 (pGD master walk/token)	2	L230
 oct05-enrolled-loop	pgd-model-vs-pgd	extra	R-SE-19/R-LL-20	4	L227
-oct05-enrolled-loop	vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	5	L116
-oct05-enrolled-loop	vs-pgd-model	different-bytes	D3/DV-4 (R-LL-17)	2	L224
+oct05-enrolled-loop	vs-pgd-model	different-bytes	D1/DV-1 (R-RC-13)	2	L116
 oct05-enrolled-loop	vs-pgd-model	extra	D4/DV-3	6	L225
-oct05-enrolled-loop	vs-pgd-model	extra	R-RC-30/V3	9	L265
-oct05-enrolled-loop	vs-pgd-model	extra	R-RC-30/V3 + D2/DV-2 honest skip	8	L50
 oct05-enrolled-loop	vs-pgd-model	missing	D5 (R-LL-05/A6:T8)	3	L375
-oct05-enrolled-loop	vs-pgd-model	same	link	3	L375
-oct05-enrolled-loop	vs-pgd-model	same	rollcall	12	L114
-oct05-enrolled-loop	vs-recorded	same	fwd_poll	2	L224
+oct05-enrolled-loop	vs-pgd-model	missing	counterfactual confirm (R-RC-30 silent before)	12	L219
+oct05-enrolled-loop	vs-pgd-model	same	link	5	L224
+oct05-enrolled-loop	vs-pgd-model	same	rollcall	3	L114
+oct05-enrolled-loop	vs-pgd-model	same	silent (R-RC-30)	17	L50
+oct05-enrolled-loop	vs-recorded	different-bytes	D3/DV-4 (R-LL-17)	2	L224
+oct05-enrolled-loop	vs-recorded	missing	counterfactual confirm (R-RC-30 silent before)	29	L50
 oct05-enrolled-loop	vs-recorded	same	link	3	L375
-oct05-enrolled-loop	vs-recorded	same	rollcall	34	L50
+oct05-enrolled-loop	vs-recorded	same	rollcall	5	L114
 oct05-enrolled-loop	vs-recorded	same	session_ack	6	L225
-oct05-enrolled-loop	walk-detector	same	ff-walk	22	L20
+oct05-enrolled-loop	walk-detector	same	ff-walk	17	L20
+oct05-enrolled-loop	walk-detector	same	ff-walk restart folded (R-RC-06)	5	L118
 oct05-passive-loop	harness	tx_units=0 unaligned=0 isr_stale_drops=0
 oct05-passive-loop	counterfactual-vs-pgd-model	extra	D7 (A6:T13; A1 R-RC-31 keeps it)	1	L327
-oct05-passive-loop	counterfactual-vs-pgd-model	extra	R-RC-30/V3	1	L358
+oct05-passive-loop	counterfactual-vs-pgd-model	same	silent (R-RC-30)	1	L358
 oct05-passive-loop	pgd-model-vs-pgd	extra	R-RC-25 (pGD master walk/token)	32	L297
 oct05-passive-loop	pgd-model-vs-pgd	same	ident	3	L376
 oct05-passive-loop	pgd-model-vs-pgd	same	link	7	L287
 oct05-passive-loop	pgd-model-vs-pgd	same	resend (A6:T8/R-LL-05)	3	L295
 oct05-passive-loop	pgd-model-vs-pgd	same	rollcall	2	L359
 oct05-passive-loop	pgd-model-vs-pgd	same	session_ack	9	L281
-oct05-passive-loop	walk-detector	missing	D8/V1 warm walk (claims not 00 00)	1	L329
+oct05-passive-loop	walk-detector	same	ff-walk	1	L329
