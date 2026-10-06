@@ -59,7 +59,133 @@ static void arm_key(PlanTerminal &t, uint8_t keycode) {
   t.tx_pending_ = true;
 }
 
+// --- wave E1 helpers: a controller roll-call frame `to' 02 from P(8) CK` ---
+static Bytes rcf(uint8_t to, uint8_t from, std::initializer_list<uint8_t> p) {
+  Bytes f{{to, 1}, {0x02, 0}, {from, 0}};
+  for (uint8_t v : p) f.push_back({v, 0});
+  uint8_t s = 0;
+  for (auto &b : f) s += b.v;
+  f.push_back({static_cast<uint8_t>(0xFF - s), 0});
+  return f;
+}
+static Bytes cat(Bytes a, const Bytes &b) {
+  a.insert(a.end(), b.begin(), b.end());
+  return a;
+}
+static const Bytes POLL1F{{0x1F, 1}, {0x01, 0}, {0x01, 0}, {0xDE, 0}};
+static const Bytes ACK{{0x01, 1}};
+static const Bytes PGD_SACK{{0x01, 1}, {0x03, 0}, {0x20, 0}, {0xDB, 0}};
+static const Bytes FF_PROBE_1F = rcf(0x1F, 0x01, {0xC0, 0, 0, 0x01, 0, 0, 0, 0});    // R-RC-05
+static const Bytes GAP_PROBE_1F = rcf(0x1F, 0x01, {0x80, 0, 0, 0x01, 0x80, 0, 0, 0}); // R-RC-03
+static const Bytes CONFIRM_1F = rcf(0x1F, 0x01, {0xC0, 0, 0, 0x01, 0xC0, 0, 0, 0});   // R-RC-13
+static const Bytes COLD_WALK = rcf(0x02, 0x01, {0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0});
+static const Bytes WARM_WALK = rcf(0x02, 0x01, {0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0, 0, 0});
+
+// Wave E1: roll-call / join rework (A1 R-RC-30/32, A2 D2/D3/D8, root cause 3).
+static void test_e1_rollcall() {
+  // D8 / V1 / R-RC-06/07: warm walks count, a lone announce probe is folded
+  // into its restart, the legacy detector (claims 00 00 only) misses warm.
+  {
+    Bus bus;
+    bus.feed(COLD_WALK);
+    bus.feed(rcf(0x03, 0x01, {0xFF, 0xFF, 0xFF, 0xFD, 0, 0, 0, 0}));
+    assert(bus.term.tel_walks_ == 1 && bus.term.link_reset_ && bus.term.tel_walks_warm_ == 0);
+    bus.now += 500'000;
+    bus.feed(WARM_WALK);
+    assert(bus.term.tel_walks_ == 2 && bus.term.tel_walks_warm_ == 1);
+    bus.now += 5'000'000;
+    bus.feed(COLD_WALK);  // a lone announce probe ...
+    bus.now += 1'800'000;
+    bus.feed(COLD_WALK);  // ... and its restart 1.8 s later: ONE recovery
+    bus.feed(rcf(0x03, 0x01, {0xFF, 0xFF, 0xFF, 0xFD, 0, 0, 0, 0}));
+    assert(bus.term.tel_walks_ == 3 && bus.term.tel_walks_folded_ == 1);
+    Bus legacy;
+    legacy.term.rc_walk_any_claims_ = 0;
+    legacy.feed(WARM_WALK);
+    legacy.feed(COLD_WALK);
+    assert(legacy.term.tel_walks_ == 1 && legacy.term.tel_walks_folded_ == 0);
+  }
+  // R-RC-30 + D2 + D3: silent on the FF-walk probe, join on the gap walk with
+  // 32 intact in both halves, echo the confirm, answer the first poll after
+  // the join ourselves, forward only to a pGD that acked a session frame.
+  {
+    Bus bus;
+    bus.term.enroll_ = true;
+    bus.term.fwd_polls_ = 1;
+    bus.feed(PGD_SACK);  // a pGD exists (and a session it had before our join)
+    assert(bus.feed(FF_PROBE_1F).empty() && bus.term.tel_rc_silent_ == 1);
+    Bytes r = bus.feed(GAP_PROBE_1F);
+    assert(r.size() == 12 && r[3].v == 0xC0 && r[7].v == 0xC0);  // R-RC-12, 32 kept
+    assert(bus.term.join_open() && bus.term.tel_joins_ == 1);
+    r = bus.feed(CONFIRM_1F);  // carries our bit AND 32's, but it is a confirm
+    assert(r.size() == 12 && r[3].v == 0xC0 && bus.term.tel_rc_silent_ == 1);
+    r = bus.feed(POLL1F);      // D3 / R-LL-17: ours, never forwarded
+    assert(r.size() == 4 && r[0].v == 0x01 && r[2].v == ENROLL_ADDR);
+    bus.feed(cat(ACK, POLL1F));  // acked: the join is closed
+    assert(!bus.term.join_open() && bus.term.tel_joins_ok_ == 1);
+    // no pGD session ack since our join (R-SE-11 re-inits it): no forward yet
+    r = bus.feed(POLL1F);
+    assert(r.size() == 4 && r[0].v == 0x01);
+    bus.feed(cat(PGD_SACK, ACK));
+    r = bus.feed(POLL1F);
+    assert(r.size() == 4 && r[0].v == 0x20);  // served pGD: alternation resumes
+    // legacy: the FF-walk probe is answered (and ends the walk at 31)
+    bus.term.rc_ff_silent_ = 0;
+    bus.feed(COLD_WALK);
+    assert(bus.feed(FF_PROBE_1F).size() == 12);
+  }
+  // R-RC-30's exception: the walker's probe of 0x20 unanswered and 0x20
+  // silent for pgd_absent_us_ = no pGD: answer the FF-walk, 32 cleared (what
+  // the walk itself established). Any pGD frame re-arms the silence.
+  {
+    Bus bus;
+    bus.term.enroll_ = true;
+    bus.feed(rcf(0x20, 0x01, {0x80, 0, 0, 0x01, 0, 0, 0, 0}));
+    bus.feed(COLD_WALK);
+    bus.feed(COLD_WALK);
+    assert(bus.feed(FF_PROBE_1F).empty());  // still inside the window
+    assert(!bus.term.pgd_absent(bus.now));
+    bus.now += 41'000'000;
+    assert(bus.term.pgd_absent(bus.now));
+    Bytes r = bus.feed(FF_PROBE_1F);
+    assert(r.size() == 12 && r[3].v == 0x40 && r[7].v == 0x40);
+    bus.feed(cat(Bytes{{0x01, 1}, {0x01, 0}, {0x20, 0}, {0xDD, 0}}, ACK));
+    assert(!bus.term.pgd_absent(bus.now));
+    bus.feed(COLD_WALK);
+    assert(bus.feed(FF_PROBE_1F).empty());
+  }
+  // Root cause 3: two own joins died in a walk -> silent on join probes
+  // while the loop runs (a walk within 12 s), answered again once the bus
+  // was walk-free for a gap period; a closed join resets the streak.
+  {
+    Bus bus;
+    bus.term.enroll_ = true;
+    for (int i = 0; i < 2; i++) {
+      assert(bus.feed(GAP_PROBE_1F).size() == 12);
+      bus.now += 3'000'000;
+      bus.feed(COLD_WALK);
+    }
+    assert(bus.term.tel_joins_failed_ == 2 && bus.term.rc_join_streak_ == 2);
+    bus.now += 5'000'000;
+    assert(bus.feed(GAP_PROBE_1F).empty() && bus.term.tel_rc_backoff_ == 1);
+    bus.now += 8'000'000;  // walk-free for 13 s: the loop stopped
+    assert(bus.feed(GAP_PROBE_1F).size() == 12);
+    bus.feed(CONFIRM_1F);
+    bus.feed(POLL1F);
+    bus.feed(cat(ACK, POLL1F));
+    assert(bus.term.rc_join_streak_ == 0 && bus.term.rc_backoff_until_us_ == 0);
+    Bus off;
+    off.term.enroll_ = true;
+    off.term.rc_backoff_ = 0;
+    for (int i = 0; i < 3; i++) {
+      assert(off.feed(GAP_PROBE_1F).size() == 12);
+      off.feed(COLD_WALK);
+    }
+  }
+}
+
 int main() {
+  test_e1_rollcall();
   // --- an un-enrolled, idle terminal never transmits ---
   {
     Bus bus;
@@ -107,6 +233,7 @@ int main() {
     MockController ctl;
     bus.term.enroll_ = true;
     bus.term.fwd_polls_ = 1;
+    bus.term.fwd_gate_ = 0;  // the pre-E1 liveness gate (the default is in the E1 block)
 
     // pGD not live yet: the FIRST poll becomes a bootstrap PROBE forward
     // (liveness resets on every reboot and an unpolled pGD never transmits;
@@ -548,6 +675,7 @@ int main() {
     MockController ctl;
     bus.term.enroll_ = true;
 
+    bus.term.rc_honest_skip_ = 1;  // pre-E1 liveness skip (the default is in the E1 block)
     // Token forwarded by a pGD at 0x1E (exact live frame, ck 0x7F): presence
     // echoed VERBATIM (the forwarding chain owns it -- the pGD's own cold
     // join behaves this way), our bit claimed in the CLAIMS half only,

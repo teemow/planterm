@@ -212,6 +212,7 @@ struct PlantermRun {
   std::vector<Unit> out;     // per rx index: what planterm put on the wire
   std::vector<bool> backoff; // per rx index: forward back-off active (a forward failed < 1 s ago)
   std::vector<bool> walk;    // per rx index: the FF-walk detector fired (tel_walks_ counted it)
+  std::vector<bool> folded;  // per rx index: an opener folded into its lone announce (R-RC-06)
   uint32_t not_sent = 0;     // actions the ISR's FIFO gate would have dropped (stale match)
 };
 
@@ -228,6 +229,7 @@ inline PlantermRun run_planterm(const Stream &s, const TaskState &ts) {
   r.out.resize(s.rx.size());
   r.backoff.resize(s.rx.size());
   r.walk.resize(s.rx.size());
+  r.folded.resize(s.rx.size());
   int64_t fail_at = -1;
   size_t ev = 0;
   for (size_t i = 0; i < s.rx.size(); i++) {
@@ -240,7 +242,7 @@ inline PlantermRun run_planterm(const Stream &s, const TaskState &ts) {
       else if (k == "tx_mode")
         term.tx_mode_ = v;
     });
-    const uint32_t fails = term.fwd_fail_, walks = term.tel_walks_;
+    const uint32_t fails = term.fwd_fail_, walks = term.tel_walks_, folds = term.tel_walks_folded_;
     // Task input: the key the recorded firmware had queued for this poll.
     const int ri = s.rec_of[i];
     if (ri >= 0 && s.tx[ri].kind == "key" && s.tx[ri].bytes.size() >= 11 && !term.tx_pending_) {
@@ -273,6 +275,7 @@ inline PlantermRun run_planterm(const Stream &s, const TaskState &ts) {
       fail_at = f.start_us;
     r.backoff[i] = fail_at >= 0 && f.start_us - fail_at < 1'000'000;
     r.walk[i] = term.tel_walks_ != walks;
+    r.folded[i] = term.tel_walks_folded_ != folds;
   }
   return r;
 }
@@ -347,6 +350,11 @@ inline std::string tag_for(const std::string &cmp, const Stream &s, size_t i, co
     }
     if ((kp == "rollcall" && ko == "link") || (kp == "link" && ko == "rollcall"))
       return "D1/DV-1 (R-RC-13)";
+    // The recording's confirm of a reply only the OLD firmware sent (planterm
+    // stayed silent on the FF probe before it, R-RC-30): the slot exists only
+    // because the bus was recorded with the old answer (B13 limits).
+    if (p.empty() && f.bytes.size() > 3 && (f.bytes[3] & 0x40))
+      return "counterfactual confirm (R-RC-30 silent before)";
     if (kp == "rollcall" && ko == "rollcall" && ((p.bytes[3] ^ o.bytes[3]) & 0x80))
       return "D2/DV-2 (R-RC-32)";
     return "R-LL-14";
@@ -485,6 +493,9 @@ inline std::vector<Div> compare_walks(const Stream &s, const PlantermRun &run) {
     const Unit mark{{0x02, 0x02, 0x01}};
     if (truth && run.walk[i])
       divs.push_back(make_div("walk-detector", "same", "ff-walk", s.rx[i], mark, mark, ""));
+    else if (truth && run.folded[i])  // the restart of a lone announce probe: one recovery
+      divs.push_back(make_div("walk-detector", "same", "ff-walk restart folded (R-RC-06)", s.rx[i], mark,
+                              mark, ""));
     else if (truth)
       divs.push_back(make_div("walk-detector", "missing",
                               s.rx[i].bytes[7] || s.rx[i].bytes[8] ? "D8/V1 warm walk (claims not 00 00)"

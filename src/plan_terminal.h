@@ -261,7 +261,13 @@ class PlanTerminal {
           tel_frames_us_ = tel_frames_us_ + 1;
         else
           tel_frames_other_ = tel_frames_other_ + 1;
+        rc_run_end_(now_us);
+      } else if (!rc_init_) {
+        rc_init_ = true;  // boot: presume a pGD may exist (see pgd_absent_now_)
+        t_pgd_tx_us_ = now_us;
       }
+      if (lr_ack_wait_ == 1)
+        lr_ack_wait_ = 2;  // this run is the first one after our link reply
       tel_active_ = true;  // (joining mid-frame at boot: first partial run is skipped)
       tel_addr_ = b;
       tel_sum_ = b;
@@ -271,6 +277,8 @@ class PlanTerminal {
         tel_type_ = b;  // frame type = first byte after the address byte
       else if (tel_len_ == 2)
         tel_b3_ = b;  // third byte: the sender in terminal->controller frames
+      else if (tel_len_ == 7)
+        tel_c1_ = b;  // roll-call: first CLAIMS byte (bit7 = address 32)
       tel_sum_ = static_cast<uint8_t>(tel_sum_ + b);
       tel_len_ = tel_len_ + 1;
     }
@@ -298,9 +306,16 @@ class PlanTerminal {
       fwd_ok_ = fwd_ok_ + 1;
     }
 
-    // Link-reset detector: the first frame of the controller's recovery walk
-    // is SS' 02 01 FF FF FF FF 00 00 00 00 CC. Eight bytes of context make a
-    // pixel-data false positive practically impossible.
+    // FF-walk detector: the first frame of the controller's recovery walk is
+    // 02' 02 01 FF FF FF FF C1 C2 C3 C4 CC. Cold walks carry claims 00..,
+    // WARM walks the claims carried over from a pGD master walk (80 ..; A1
+    // R-RC-07, A2 R-LL-11: 57 of 120 walks on 10-05). rc_walk_any_claims_ = 1
+    // (default) matches any claims at the C1 byte, anchored on the 02'
+    // address byte (no pixel false positive: data bytes never carry bit9),
+    // and FOLDS the lone announce probe into its restart 1.76-2.2 s later
+    // (R-RC-06: an opener whose previous frame was an opener is one recovery)
+    // -- the same detector as ekobeescope's plan.WalkCounter (#48).
+    // rc_walk_any_claims_ = 0: the legacy cold-only match (A2 D8 / A1 V1).
     reset_win_[0] = reset_win_[1];
     reset_win_[1] = reset_win_[2];
     reset_win_[2] = reset_win_[3];
@@ -309,12 +324,31 @@ class PlanTerminal {
     reset_win_[5] = reset_win_[6];
     reset_win_[6] = reset_win_[7];
     reset_win_[7] = b;
-    if (reset_win_[0] == 0x02 && reset_win_[1] == 0x01 && reset_win_[2] == 0xFF &&
-        reset_win_[3] == 0xFF && reset_win_[4] == 0xFF && reset_win_[5] == 0xFF &&
-        reset_win_[6] == 0x00 && reset_win_[7] == 0x00) {
+    const bool opener =
+        rc_walk_any_claims_
+            ? (tel_active_ && tel_addr_ == 0x02 && tel_len_ == 8 && reset_win_[1] == 0x02 &&
+               reset_win_[2] == 0x01 && reset_win_[3] == 0xFF && reset_win_[4] == 0xFF &&
+               reset_win_[5] == 0xFF && reset_win_[6] == 0xFF)
+            : (reset_win_[0] == 0x02 && reset_win_[1] == 0x01 && reset_win_[2] == 0xFF &&
+               reset_win_[3] == 0xFF && reset_win_[4] == 0xFF && reset_win_[5] == 0xFF &&
+               reset_win_[6] == 0x00 && reset_win_[7] == 0x00);
+    if (opener) {
       link_reset_ = true;
+      const bool fold = rc_walk_any_claims_ && walk_prev_ &&
+                        static_cast<uint64_t>(now_us - t_link_reset_us_) <= 3'000'000ull;
       t_link_reset_us_ = now_us;  // ring-forwarding lockout window
-      tel_walks_ = tel_walks_ + 1;  // planterm#47: FF-walks seen this window
+      walk_run_ = true;
+      pgd_sess_ = false;  // every walk rebuilds the sessions (R-SE-10)
+      rc_last_ok_ = false;  // a roll-call after this is a probe, never a confirm
+      if (fold) {
+        tel_walks_folded_ = tel_walks_folded_ + 1;
+      } else {
+        tel_walks_ = tel_walks_ + 1;  // planterm#47: FF-walks seen this window
+        if (rc_walk_any_claims_ && b != 0x00)
+          tel_walks_warm_ = tel_walks_warm_ + 1;
+        if (join_open_)
+          rc_join_failed_(now_us);  // our join died in this walk (R-RC-13/R-LL-16)
+      }
     }
 
     // Session-ready gate (A5 R-KP-07, F-03): a key sent in the first polls
@@ -360,6 +394,46 @@ class PlanTerminal {
         for (int i = 0; i < 8; i++)
           s += rc_payload_[i];
         if (static_cast<uint8_t>(s + b) == 0xFF) {
+          // Which controller frame is this? A CONFIRM re-sends our own last
+          // reply's masks (R-RC-09/13) with no FF-walk in between; anything
+          // else from 0x01 is a PROBE that would open a join. (Bytes, not
+          // time: a warm walk can carry exactly our last masks, C0/C0, but
+          // always after its opener.) An FF-walk probe carries the walker's
+          // optimistic MAP: our own bit AND 32's (not yet probed). A gap-walk
+          // probe never carries our bit (members are never probed, R-RC-03),
+          // nor does the member-loss re-probe carry a dropped 32.
+          const bool ctrl = rc_from_ == 0x01;
+          bool confirm = rc_last_ok_;
+          for (int i = 0; i < 8; i++)
+            confirm = confirm && rc_payload_[i] == rc_last_[i];
+          const bool absent = pgd_absent_now_(now_us);
+          if (ctrl && !confirm) {
+            // R-RC-30 (A1 V3): never end an FF-walk at 31 while a pGD may
+            // exist -- the first accepted answer ends the walk (R-RC-09), so
+            // our answer would leave CLAIMS = {31} and 0x20 unprobed. Stay
+            // silent: the walk reaches 0x20, the pGD claims, and we join on
+            // the controller's next gap walk (<= 12 s, C0/C0, R-RC-14), the
+            // path of every July dual join. Exception: the walker's own
+            // probe of 0x20 went unanswered and 0x20 stayed silent for
+            // pgd_absent_us_ (no pGD): then answer, or the walk loops forever.
+            if (rc_ff_silent_ && (rc_payload_[0] & OWN_BIT) && (rc_payload_[0] & 0x80) &&
+                !absent) {
+              tel_rc_silent_ = tel_rc_silent_ + 1;
+              return act;
+            }
+            // Join back-off (root cause 3): after rc_backoff_after_ own joins
+            // in a row died before their first link reply was acked, stay
+            // silent on join-opening probes for a growing interval -- but
+            // only while the loop keeps running (an FF-walk within one
+            // gap-walk period): on a calm bus the next gap-walk probe is
+            // answered again. Polls, acks and confirms are never gated.
+            if (rc_backoff_ && now_us < rc_backoff_until_us_ &&
+                static_cast<uint64_t>(now_us - t_link_reset_us_) < 12'000'000ull) {
+              tel_rc_backoff_ = tel_rc_backoff_ + 1;
+              return act;
+            }
+          }
+          rc_opens_join_ = ctrl && !confirm;
           act.kind = TxAction::ROLLCALL_REPLY;
           act.len = 12;
           // Forward the token to a LIVE member above us (a pGD at 0x20),
@@ -383,12 +457,16 @@ class PlanTerminal {
           bool pgd_live = t_pgd_alive_us_ != 0 &&
                           static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull;
           act.frame[0] = 0x01;
-          // Honest skip stays, but ONLY for a liveness-DEAD 32 (its onward
-          // bit cleared, like the pGD's own skip frames E0->A0->20; the
-          // intact-return of a dead 32 was the 01:04 FF-walk loop). A LIVE
-          // 32 keeps its presence bit -- the controller walks it itself
-          // right after our return (observed 07:43:04.012).
-          if (!pgd_live)
+          // 32's presence bit. A real terminal echoes it verbatim (A2 D2);
+          // only a walker clears the bit of an address that did not answer.
+          // Default (rc_honest_skip_ = 0): clear it only when the WALKER did
+          // exactly that -- its probe of 0x20 went unanswered and 0x20 stayed
+          // silent for pgd_absent_us_ -- so our reply reports what the walk
+          // itself established, and never because of a liveness timeout: the
+          // old 15 s honest skip cut a present pGD out of MAP, and nothing
+          // re-offers 32 once it is out (R-RC-22/R-RC-40, the 10-02 latch).
+          // rc_honest_skip_ = 1: the legacy liveness skip (CONTEXT finding 5).
+          if (rc_honest_skip_ ? !pgd_live : absent)
             rc_payload_[0] = static_cast<uint8_t>(rc_payload_[0] & ~0x80);
           act.frame[1] = 0x02;
           act.frame[2] = ENROLL_ADDR;
@@ -579,10 +657,29 @@ class PlanTerminal {
           // the EXISTING benign path (controller re-polls us ~ms later,
           // fwd_fail_ + 1 s backoff). Ring-token forwarding stays strictly
           // liveness-gated -- that is where the 07-16 FF-walk loops lived.
-          const bool pgd_live =
+          bool pgd_live =
               t_pgd_alive_us_ != 0 &&
               static_cast<uint64_t>(now_us - t_pgd_alive_us_) < 15'000'000ull;
-          const bool probe_due = !pgd_live && now_us >= fwd_probe_next_us_;
+          bool probe_due = !pgd_live && now_us >= fwd_probe_next_us_;
+          if (fwd_gate_) {
+            // A2 D3 / R-LL-17: the first poll after OUR join is ours -- the
+            // joiner's own link reply completes the join; a forward there
+            // kills it (FC_JOIN -> 2 s -> FF-walk). join_open_ holds until
+            // the controller acked one of our link replies. And forward only
+            // to a pGD that is provably SERVED: 32 in the CLAIMS of the last
+            // controller roll-call and a session frame acked since the last
+            // FF-walk (every walk rebuilds the sessions). Transmit liveness
+            // alone (a member-token answer, a type-1F request) is not service,
+            // and a recency window would deadlock: a served pGD that is not
+            // the poll focus transmits nothing until it is forwarded a token.
+            // The bootstrap probe survives only as the gap owner's offer
+            // (R-RC-32/R-RC-27): while 32 is outside the ring because the
+            // walker proved it absent, offer 0x20 a token at most every 2 s.
+            const bool served32 = rc_claims32_ && pgd_sess_;
+            pgd_live = !join_open_ && served32;
+            probe_due = !join_open_ && !served32 && pgd_absent_now_(now_us) &&
+                        now_us >= fwd_probe_next_us_;
+          }
           if (pgd_live || probe_due) {
             if (probe_due)
               fwd_probe_next_us_ = now_us + 2'000'000;
@@ -695,6 +792,16 @@ class PlanTerminal {
         enroll_replies_ = enroll_replies_ + 1;
         if (drain_)
           drain_replied_ = true;  // the renounce went out; task finishes the leave
+        for (int i = 0; i < 8; i++)
+          rc_last_[i] = act.frame[3 + i];  // what a confirm of it carries
+        rc_last_ok_ = true;
+        if (rc_opens_join_) {
+          if (join_open_)
+            rc_join_failed_(now_us);  // re-probed: the previous join never closed
+          join_open_ = true;
+          pgd_sess_ = false;  // our adoption re-inits every served terminal (R-SE-11)
+          tel_joins_ = tel_joins_ + 1;
+        }
         break;
       case TxAction::SESSION_ACK:
         session_acks_ = session_acks_ + 1;
@@ -704,9 +811,11 @@ class PlanTerminal {
         break;
       case TxAction::ENROLL_LINK_REPLY:
         enroll_polls_ = enroll_polls_ + 1;
+        lr_ack_wait_ = 1;  // a bare 01' as the next run = accepted (rc_run_end_)
         break;
       case TxAction::ENROLL_KEY_REPLY:
         enroll_polls_ = enroll_polls_ + 1;
+        lr_ack_wait_ = 1;
         tx_pending_ = false;
         tx_done_us_ = now_us;
         key_ack_ = 0;
@@ -843,6 +952,100 @@ class PlanTerminal {
   // row of the fresh session. A fresh state machine (host tests) starts open.
   volatile bool sess_ready_{true};
   volatile uint8_t walk_m_{0};       // walk-header matcher progress (02' 02 01 FF FF FF FF)
+
+  // --- wave E1: roll-call / join rework (A1 R-RC-30/32, A2 D2/D3/D8) --------
+  // Knobs (task -> ISR, runtime-switchable via PlanBridge setters). Defaults
+  // are the fixed behaviour; 0 restores the pre-E1 behaviour of that change.
+  volatile uint8_t rc_ff_silent_{1};       // R-RC-30: silent on FF-walk probes while a pGD may exist
+  volatile uint8_t rc_honest_skip_{0};     // 1 = legacy D2 skip (clear 32 after 15 s pGD silence)
+  volatile uint8_t fwd_gate_{1};           // D3: no forward before our join closed / to an unserved pGD
+  volatile uint8_t rc_walk_any_claims_{1}; // D8/V1: warm walks count, lone announce probe folded
+  volatile uint8_t rc_backoff_{1};         // root cause 3: back off our joins while they keep failing
+  volatile uint8_t rc_backoff_after_{2};   // consecutive failed own joins before the back-off
+  volatile uint32_t pgd_absent_us_{40'000'000};  // 0x20 silent this long at its walk probe = no pGD
+  // Telemetry (ISR increments; the task reads and resets per bus10s window,
+  // except the state fields).
+  volatile uint32_t tel_walks_warm_{0};    // of tel_walks_: warm (claims carried)
+  volatile uint32_t tel_walks_folded_{0};  // lone announce probes folded into their restart
+  volatile uint32_t tel_rc_silent_{0};     // FF-walk probes left to 0x20 (R-RC-30)
+  volatile uint32_t tel_rc_backoff_{0};    // join probes skipped by the back-off
+  volatile uint32_t tel_joins_{0};         // joins opened (reply to a controller probe)
+  volatile uint32_t tel_joins_ok_{0};      // ... closed: our link reply acked
+  volatile uint32_t tel_joins_failed_{0};  // ... died before that (walk / re-probe)
+  volatile uint32_t rc_join_streak_{0};    // state: consecutive failed own joins
+  volatile int64_t rc_backoff_until_us_{0};// state: back-off end (0 = none)
+  bool pgd_absent(int64_t now_us) const { return pgd_absent_now_(now_us); }
+  bool join_open() const { return join_open_; }
+
+ protected:
+  volatile bool rc_init_{false};       // first byte seen (boot time stamped)
+  volatile uint8_t tel_c1_{0};         // first CLAIMS byte of the current run
+  volatile int64_t t_pgd_tx_us_{0};    // last frame FROM 0x20 (types 01-03), boot if none
+  volatile bool rc20_open_{false};     // the previous run was the controller's probe of 0x20
+  volatile bool rc20_unans_{false};    // ... and nothing from 0x20 answered it (sticky)
+  volatile bool rc_claims32_{true};    // 32 in the CLAIMS of the last controller roll-call
+                                       // (true until one is seen: unknown does not block)
+  volatile bool pgd_sess_{false};      // the pGD acked a session frame since the last walk
+  volatile bool walk_run_{false};      // the current run is an FF-walk opener
+  volatile bool walk_prev_{false};     // the previous run was one
+  volatile uint8_t rc_last_[8]{0};     // our last roll-call reply's masks ...
+  volatile bool rc_last_ok_{false};    // ... valid until the next FF-walk opener
+  volatile bool rc_opens_join_{false}; // the pending roll-call reply answers a probe
+  volatile bool join_open_{false};     // our join is open: no link reply acked yet
+  volatile uint8_t lr_ack_wait_{0};    // 1: link reply sent, 2: its next run is being read
+
+  // No pGD: the controller's own probe of 0x20 went unanswered and 0x20 has
+  // not transmitted for pgd_absent_us_ (since boot if never). The window
+  // covers a pGD reboot (A6: 17-20 s silent) so a power cycle never opens
+  // the gap above 31.
+  bool PLAN_IRAM pgd_absent_now_(int64_t now_us) const {
+    return rc20_unans_ && static_cast<uint64_t>(now_us - t_pgd_tx_us_) >= pgd_absent_us_;
+  }
+
+  // Run boundary: the run in tel_addr_/tel_type_/tel_b3_/tel_len_ completed.
+  void PLAN_IRAM rc_run_end_(int64_t now_us) {
+    // A frame sent BY 0x20 (link reply 01 01 20, roll-call answer or master
+    // token NN 02 20, ack 01 03 20, poll token 1F 01 20): the pGD exists.
+    // Types 01-03 only -- a session frame's third byte is its length.
+    const bool from_pgd = tel_addr_ != 0x20 && tel_len_ >= 4 && tel_b3_ == 0x20 &&
+                          tel_type_ >= 0x01 && tel_type_ <= 0x03;
+    if (from_pgd) {
+      t_pgd_tx_us_ = now_us;
+      rc20_unans_ = false;
+      if (tel_addr_ == 0x01 && tel_type_ == 0x03)
+        pgd_sess_ = true;  // it acked a controller session frame
+    } else if (rc20_open_) {
+      rc20_unans_ = true;
+    }
+    const bool ctrl_rc = tel_type_ == 0x02 && tel_b3_ == 0x01 && tel_len_ == 12;
+    rc20_open_ = ctrl_rc && tel_addr_ == 0x20;
+    if (ctrl_rc)
+      rc_claims32_ = (tel_c1_ & 0x80) != 0;
+    if (lr_ack_wait_ == 2) {
+      if (tel_addr_ == 0x01 && tel_len_ == 1 && join_open_) {
+        join_open_ = false;  // the controller accepted our first link reply
+        tel_joins_ok_ = tel_joins_ok_ + 1;
+        rc_join_streak_ = 0;
+        rc_backoff_until_us_ = 0;
+      }
+      lr_ack_wait_ = 0;
+    }
+    walk_prev_ = walk_run_;
+    walk_run_ = false;
+  }
+
+  void PLAN_IRAM rc_join_failed_(int64_t now_us) {
+    join_open_ = false;
+    tel_joins_failed_ = tel_joins_failed_ + 1;
+    rc_join_streak_ = rc_join_streak_ + 1;
+    if (rc_join_streak_ >= rc_backoff_after_) {
+      // one gap-walk period, doubling per further failure, capped at 16x
+      uint32_t k = rc_join_streak_ - rc_backoff_after_;
+      if (k > 4)
+        k = 4;
+      rc_backoff_until_us_ = now_us + (static_cast<int64_t>(12'000'000) << k);
+    }
+  }
 };
 
 }  // namespace plan

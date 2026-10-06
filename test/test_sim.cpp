@@ -282,20 +282,25 @@ static void test_july_gap_walk_join() {
   for (int r = 0; r < 8; r++) CHECK(w.pgd.screen[r] == w.ctl.screen.pages[1].rows[r]);
 }
 
-// KNOWN DEVIATION (A2 D3 / R-LL-17): planterm forwards the FIRST poll after
-// its join when forwarding is on, so the strict controller drops the join.
-// This pins today's behaviour; it flips when planterm answers that poll itself.
-static void test_known_deviation_forward_on_join_poll() {
-  World w(true, true);
-  w.ctl.start(0);
-  w.bus.run_until(5 * S);
-  w.br.term.enroll_ = true;
-  w.br.term.fwd_polls_ = 1;
-  w.bus.run_until(20 * S);
-  auto b = w.bus.from(0x1F);
-  CHECK(b.size() >= 4);
-  if (b.size() >= 4) CHECK_HEX(b[3].f, "20' 01 1F BF");  // spec wants 01' 01 1F DE
-  CHECK(w.ctl.link_faults >= 1 && w.ctl.joins >= 1);
+// A2 D3 / R-LL-17 (fixed, wave E1): with forwarding on, planterm answers the
+// FIRST poll after its join itself; the join completes, no link fault. With
+// the legacy gate (fwd_gate_ = 0) it forwards that poll and the strict
+// controller drops the join (the pinned pre-E1 deviation).
+static void test_forward_on_join_poll() {
+  for (int legacy = 0; legacy < 2; legacy++) {
+    World w(true, true);
+    w.ctl.start(0);
+    w.bus.run_until(5 * S);
+    w.br.term.enroll_ = true;
+    w.br.term.fwd_polls_ = 1;
+    w.br.term.fwd_gate_ = legacy ? 0 : 1;
+    w.bus.run_until(20 * S);
+    auto b = w.bus.from(0x1F);
+    CHECK(b.size() >= 4);
+    if (b.size() >= 4) CHECK_HEX(b[3].f, legacy ? "20' 01 1F BF" : "01' 01 1F DE");
+    if (legacy) CHECK(w.ctl.link_faults >= 1 && w.ctl.joins >= 1);
+    else CHECK(w.ctl.link_faults == 0 && w.ctl.claims == 0xC0000000u && w.br.term.tel_joins_ok_ == 1);
+  }
 }
 
 // Corrupts the first roll-call echo 0x1F sends to the controller.
@@ -313,11 +318,14 @@ struct FirstEchoCorrupt : FaultHook {
 // R-RC-09 / R-RC-18 / R-RC-20: an FF-walk the bridge ends at 31 leaves
 // CLAIMS = {31}: 0x20 is never probed and never painted. R-RC-10: a rejected
 // answer aborts the walk (no 20' probe), 2.00 s, a new walk.
+// (Controller rules, so the bridge runs with the pre-E1 FF-walk answer,
+// rc_ff_silent_ = 0; the default bridge is test_ff_walk_silent_at_31.)
 static void test_walk_ends_at_31() {
   for (int rejected = 0; rejected < 2; rejected++) {
     World w(true, true);
     FirstEchoCorrupt h;
     if (rejected) w.bus.hook = &h;
+    w.br.term.rc_ff_silent_ = 0;
     w.br.term.enroll_ = true;
     w.ctl.start(0);
     w.bus.run_until(30 * S);
@@ -340,14 +348,42 @@ static void test_walk_ends_at_31() {
   }
 }
 
+// R-RC-30 + R-RC-32 (wave E1): enrolled from power-up next to a live pGD,
+// the bridge stays silent on the FF-walk probe for 0x1F, the walk reaches
+// 0x20, the pGD claims, and the bridge joins on the next gap walk (C0/C0,
+// R-RC-14). A later link fault (our replies lost for 200 ms) repeats it.
+// Gap ownership: no reply of ours ever drops 32 from MAP, so the gap above
+// 31 never opens -- 0x20 is probed in every walk, by the controller, and the
+// bridge never needs a `20' 02 1F` gap probe (which the pGD ignores, A6 T13).
+static void test_ff_walk_silent_at_31() {
+  World w(true, true);
+  DropHook h(0x1F, 0x01, 40 * S, 40 * S + 200 * MS);
+  w.bus.hook = &h;
+  w.br.term.enroll_ = true;
+  w.ctl.start(0);
+  w.bus.run_until(20 * S);
+  CHECK(w.ctl.link_faults == 0 && w.ctl.map == 0xC0000001u && w.ctl.claims == 0xC0000000u);
+  CHECK(w.br.term.tel_rc_silent_ == 1 && w.br.term.tel_joins_ok_ == 1);
+  w.bus.run_until(70 * S);
+  CHECK(w.ctl.link_faults == 1 && w.ctl.ff_walks == 2 && w.br.term.tel_rc_silent_ == 2);
+  CHECK(w.ctl.map == 0xC0000001u && w.ctl.claims == 0xC0000000u && w.br.term.tel_joins_ok_ == 2);
+  CHECK(w.to(0x20, 0x02, 40 * S).size() >= 1);  // the walk reached 0x20
+  for (auto &l : w.bus.from(0x1F))
+    if (l.f.size() == 12 && l.f[1].v == 0x02) CHECK((l.f[3].v & 0x80) && (l.f[7].v & 0x80));
+}
+
 // R-KP-01/04/11, R-DI-08/09/12/16/17: a bridge key burst, the controller's
 // `01'` within 1 ms, then 0x65, delta rows ascending, 0x0C for one char.
 static void test_bridge_keypad() {
   World w(false, true);
   w.br.term.enroll_ = true;
   w.ctl.start(0);
-  w.bus.run_until(5 * S);
-  CHECK(w.ctl.focus == 0x1F && w.ctl.idents == 1);
+  // No pGD: the bridge stays silent on the FF-walk until 0x20 was probed and
+  // stayed silent for pgd_absent_us_ (R-RC-30's exception), then takes over.
+  w.bus.run_until(w.br.term.pgd_absent_us_ - 1 * S);
+  CHECK(w.ctl.joins == 0 && w.br.term.tel_rc_silent_ > 10);
+  w.bus.run_until(w.br.term.pgd_absent_us_ + 5 * S);
+  CHECK(w.ctl.focus == 0x1F && w.ctl.idents == 1 && w.ctl.map == 0x40000001u);
   for (int n = 0; n < 2; n++) {
     int64_t tk = w.bus.now;
     w.br.press(0x10);
@@ -382,8 +418,9 @@ int main() {
   test_link_fault_walk();
   test_sack_retry();
   test_july_gap_walk_join();
-  test_known_deviation_forward_on_join_poll();
+  test_forward_on_join_poll();
   test_walk_ends_at_31();
+  test_ff_walk_silent_at_31();
   test_bridge_keypad();
   if (fails) {
     fprintf(stderr, "test_sim: %d check(s) failed\n", fails);

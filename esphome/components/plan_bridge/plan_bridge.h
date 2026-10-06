@@ -135,6 +135,20 @@ class PlanBridge : public Component {
   // Dual-terminal poll chaining (heatpump-firmware#14): forward our poll
   // token to the live pGD@32. Default off; flip per experiment.
   void set_poll_fwd(bool e) { term_.fwd_polls_ = e ? 1 : 0; }
+  // Wave E1 roll-call / join knobs (PlanTerminal; defaults = the fixed
+  // behaviour, false = the pre-E1 behaviour of that one change):
+  // rc_ff_silent: stay silent on FF-walk probes while a pGD may exist (R-RC-30);
+  // rc_honest_skip: TRUE restores the 15 s liveness skip of 32's MAP bit (D2);
+  // fwd_gate: never forward the first poll after our join, nor to an unserved
+  // pGD (D3); walk_any_claims: warm walks counted, lone announce folded (D8);
+  // rc_backoff: back off our joins while they keep dying in walks (root cause 3);
+  // pgd_absent_s: 0x20 silent this long at its walk probe = no pGD (default 40).
+  void set_rc_ff_silent(bool e) { term_.rc_ff_silent_ = e ? 1 : 0; }
+  void set_rc_honest_skip(bool e) { term_.rc_honest_skip_ = e ? 1 : 0; }
+  void set_fwd_gate(bool e) { term_.fwd_gate_ = e ? 1 : 0; }
+  void set_walk_any_claims(bool e) { term_.rc_walk_any_claims_ = e ? 1 : 0; }
+  void set_rc_backoff(bool e) { term_.rc_backoff_ = e ? 1 : 0; }
+  void set_pgd_absent_s(uint32_t s) { term_.pgd_absent_us_ = s * 1000000u; }
   // The PLANCAP PSK (raw 32 bytes, from base64 in YAML -- on ESPHome devices
   // codegen defaults it to api.encryption.key). Called by codegen only when
   // a key is configured (which also sets the PLAN_CAP_NOISE build flag);
