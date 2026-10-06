@@ -219,6 +219,17 @@ class PlanTerminal {
       tel_last_tx_us_ = 0;
     }
 
+    // Key fate (A5 R-KP-11/12): the FIRST byte after our key burst decides
+    // the exchange. The controller acks with a bare 01' ~0.4 ms after the
+    // burst; a re-poll of us (1F') or anything else first means it did not
+    // take the burst, and silence is judged by the task (KEY_VERDICT_MS). A
+    // walk marker seen before the burst no longer counts against it: the
+    // verdict is per TX, never a sticky flag.
+    if (key_await_) {
+      key_await_ = false;
+      key_ack_ = (bit9 != 0 && b == 0x01 && now_us - tx_done_us_ < 5000) ? 1 : 2;
+    }
+
     // Phase 0 telemetry -- frame accounting. Frames are delimited by the
     // bit9/address byte: a new one closes the previous run, which is then
     // classified by destination address and checksum-validated (classic
@@ -304,6 +315,21 @@ class PlanTerminal {
       link_reset_ = true;
       t_link_reset_us_ = now_us;  // ring-forwarding lockout window
       tel_walks_ = tel_walks_ + 1;  // planterm#47: FF-walks seen this window
+    }
+
+    // Session-ready gate (A5 R-KP-07, F-03): a key sent in the first polls
+    // after a walk dies with the session (7 of 9 measured). Any recovery
+    // walk -- cold or warm, i.e. 02' 02 01 FF FF FF FF whatever claims it
+    // carries -- closes the gate; so do the controller's session-init frames
+    // to us (below); the first display row of the fresh session opens it.
+    // Address-bit anchored, so pixel data cannot match.
+    if (bit9 != 0)
+      walk_m_ = (b == 0x02) ? 1 : 0;
+    else if (walk_m_ != 0)
+      walk_m_ = (b == (walk_m_ == 1 ? 0x02 : walk_m_ == 2 ? 0x01 : 0xFF)) ? walk_m_ + 1 : 0;
+    if (walk_m_ == 7) {
+      walk_m_ = 0;
+      sess_ready_ = false;
     }
 
     // Terminal enrollment: the roll-call is a TOKEN RING, not a
@@ -451,6 +477,15 @@ class PlanTerminal {
             bool crc_type = fa_type_ == GRAPHIC_TYPE || fa_type_ == SESSION_INIT_TYPE ||
                             fa_type_ == SESSION_CTL_TYPE;
             bool ck_ok = crc_type ? (fa_crc_ == 0) : (fa_sum_ == 0xFF);
+            if (ck_ok) {
+              // Session-ready gate: the session (re)init (0A/50/66/65)
+              // closes it, the first text row (0B/0C) after it opens it.
+              if (fa_type_ == 0x0A || fa_type_ == IDENT_REQ_TYPE ||
+                  fa_type_ == SESSION_CTL_TYPE || fa_type_ == SESSION_INIT_TYPE)
+                sess_ready_ = false;
+              else if (fa_type_ == 0x0B || fa_type_ == 0x0C)
+                sess_ready_ = true;
+            }
             if (!ck_ok) {
               ack_ck_fail_ = ack_ck_fail_ + 1;  // stay silent on garble
             } else if (fa_type_ == IDENT_REQ_TYPE) {
@@ -569,7 +604,9 @@ class PlanTerminal {
         fwd_just_ = false;  // a direct reply re-arms the forward alternation
       const uint8_t lr[4] = {ret, 0x01, ENROLL_ADDR,
                              static_cast<uint8_t>(0xFF - ret - 0x01 - ENROLL_ADDR)};
-      if (tx_pending_ && tx_mode_ == 2) {
+      // A pending key rides only a session-ready slot (R-KP-07); until then
+      // the bare link reply keeps the link while the controller re-sessions.
+      if (tx_pending_ && tx_mode_ == 2 && sess_ready_) {
         act.kind = TxAction::ENROLL_KEY_REPLY;
         act.len = REPLY9_LEN;
         for (size_t i = 0; i < KEYPAD_LEN + 1; i++)
@@ -672,12 +709,16 @@ class PlanTerminal {
         enroll_polls_ = enroll_polls_ + 1;
         tx_pending_ = false;
         tx_done_us_ = now_us;
+        key_ack_ = 0;
+        key_await_ = true;  // the next byte heard decides the fate
         tx_fired_ = true;
         break;
       case TxAction::AFTER_BURST_REPORT:
       case TxAction::RACE_KEY_REPLY:
         tx_pending_ = false;
         tx_done_us_ = now_us;
+        key_ack_ = 0;
+        key_await_ = true;
         tx_fired_ = true;
         break;
       case TxAction::FORWARD_POLL:
@@ -789,6 +830,19 @@ class PlanTerminal {
   volatile uint32_t tel_post_tx_gap_max_us_{0};  // max our-TX-end -> next-byte gap
   volatile uint32_t tel_tx_unacked_{0};          // our TX not followed within 100 ms
   volatile uint32_t tel_walks_{0};               // FF-walk markers this window
+
+  // --- key fate + session-ready gate (A5 R-KP-07/11/12, wave E3) -----------
+  // LAYOUT RULE (see tel_type_): new members at the class END only.
+  // key_ack_: verdict on our last key burst, from the first byte heard after
+  // it: 0 = none yet (task: silence after KEY_VERDICT_MS), 1 = acked by the
+  // controller, 2 = anything else first (re-poll, another frame). Task resets.
+  volatile uint8_t key_ack_{0};
+  volatile bool key_await_{false};   // key burst sent, first byte after it pending
+  // Keys may ride our poll slot (R-KP-07). Closed by any recovery walk, the
+  // session-init frames to us and set_enroll(true); opened by the first text
+  // row of the fresh session. A fresh state machine (host tests) starts open.
+  volatile bool sess_ready_{true};
+  volatile uint8_t walk_m_{0};       // walk-header matcher progress (02' 02 01 FF FF FF FF)
 };
 
 }  // namespace plan

@@ -351,6 +351,50 @@ int main() {
     assert(!bus.term.tx_rejected_);
   }
 
+  // --- key fate + session-ready gate (wave E3, A5 R-KP-07/11/12) ---
+  {
+    Bus bus;
+    MockController ctl;
+    bus.term.enroll_ = true;
+    bus.term.tx_mode_ = 2;
+
+    // The controller's 01' right after the burst = accepted.
+    arm_key(bus.term, KEY_DOWN);
+    assert(bus.feed(ctl.emit_poll(ENROLL_ADDR)).size() == REPLY9_LEN);
+    assert(bus.term.key_await_ && bus.term.key_ack_ == 0);
+    bus.feed(ctl.emit_ack());
+    assert(!bus.term.key_await_ && bus.term.key_ack_ == 1);
+
+    // A re-poll of us first = rejected (the burst did not land).
+    arm_key(bus.term, KEY_UP);
+    bus.term.key_ack_ = 0;
+    assert(bus.feed(ctl.emit_poll(ENROLL_ADDR)).size() == REPLY9_LEN);
+    bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(bus.term.key_ack_ == 2);
+
+    // A recovery walk (cold, or warm with carried claims) closes the gate:
+    // a pending key is held, the poll gets the bare link reply ...
+    Bytes warm = ctl.emit_link_reset();
+    warm[8].v = 0x40;  // a carried claim: the old link_reset_ matcher misses this one
+    bus.feed(warm);
+    assert(!bus.term.sess_ready_);
+    arm_key(bus.term, KEY_ESC);
+    assert(bus.feed(ctl.emit_poll(ENROLL_ADDR)).size() == 4 && bus.term.tx_pending_);
+    // ... through the re-session's init frames, and the first text row of
+    // the fresh session opens it: the key rides the NEXT poll, once.
+    bus.feed(ctl.emit_session_crc(ENROLL_ADDR, 0x65, std::vector<uint8_t>(9, 0)));
+    assert(!bus.term.sess_ready_);
+    assert(bus.feed(ctl.emit_poll(ENROLL_ADDR)).size() == 4 && bus.term.tx_pending_);
+    bus.feed(ctl.emit_session(ENROLL_ADDR, 0x0B, {0x00, 'H', 'i'}));
+    assert(bus.term.sess_ready_);
+    Bytes kr = bus.feed(ctl.emit_poll(ENROLL_ADDR));
+    assert(kr.size() == REPLY9_LEN && kr[4].v == KEY_ESC && !bus.term.tx_pending_);
+    // A walk marker from BEFORE the TX never counts against the key: the
+    // verdict is the first byte after this burst.
+    bus.feed(ctl.emit_ack());
+    assert(bus.term.key_ack_ == 1);
+  }
+
   // --- failure modes the captures pinned down ---
   {
     Bus bus;

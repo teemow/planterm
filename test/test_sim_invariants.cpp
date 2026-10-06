@@ -34,9 +34,12 @@
 //      today's (the owner's hard rule). Today's durations are the limits.
 //
 // The task-side key pump and the edit step engine are host models of
-// plan_bridge.cpp (task_main key path, repeat 1, tx_mode 2) and of the
-// NavEngine step semantics (settle 600 ms quiet + PlanScreen::settled, 6 s cap, 2 s
-// verify): those parts are not host-compilable today. Expected failures of
+// plan_bridge.cpp (key_tick_, repeat 1, tx_mode 2: once on the wire, fate
+// from PlanTerminal::key_ack_, 1.5 s TTL) and of NavEngine::step_ (settle
+// 600 ms quiet, 6 s cap fall-through, 2 s verify, one re-press on a
+// REJECTED/EXPIRED fate; quiet + PlanScreen::settled, wave E4) driving PlanEdit's set (focus/edit on the value
+// page, confirming re-visit): those parts are not host-compilable today --
+// change them together with the firmware (wave E3). Expected failures of
 // today's firmware live in test/sim/invariants_expected.tsv: the test fails
 // on a NEW failure and on an expected failure that now PASSES (flip the row).
 //
@@ -93,6 +96,7 @@ class IsrBridge : public Station {
   void boot() {
     term.reset(new PlanTerminal);
     term->enroll_ = true;
+    term->sess_ready_ = false;  // set_enroll(true): keys wait for the session's first row
     term->fwd_polls_ = 1;
     scr = PlanScreen();
     has_ = false;
@@ -152,21 +156,27 @@ class IsrBridge : public Station {
   int idx_ = 0;
 };
 
-// --- task model: the key pump of plan_bridge.cpp task_main (tx_mode 2) ------
+// --- task model: the key pump of plan_bridge.cpp key_tick_ (tx_mode 2) -------
+// Mirror of the firmware's pump, kept in step with it (wave E3): a press is
+// armed once and held by the ISR's session-ready gate (R-KP-07); its fate is
+// the first byte after the burst (PlanTerminal::key_ack_: the controller's
+// 01' = ACCEPTED, anything else first or 100 ms of silence = REJECTED); no
+// session-ready slot within KEY_TTL_MS = EXPIRED, and every press queued
+// behind it is dropped as EXPIRED too; a press already older than the TTL
+// when its turn comes is dropped. Never a second transmission.
 struct KeyPump : Station {
   struct Req {
     uint8_t key;
     int64_t t_req, t_start = -1, t_done = -1;
-    bool ok = false;
+    uint8_t fate = KEY_FATE_NONE;
     size_t keys_before = 0, keys_after = 0;
   };
   IsrBridge *br = nullptr;
   SimController *ctl = nullptr;
   std::vector<Req> reqs;
-  enum { IDLE, ARMED, VERDICT, WAIT } st = IDLE;
+  enum { IDLE, ARMED, DISARM, VERDICT } st = IDLE;
   size_t cur = 0;
-  int retries = 0, vticks = 0;
-  int64_t deadline = 0, vt = 0, wait_until = 0;
+  int64_t deadline = 0, t_x = 0;
 
   KeyPump() : Station(0) {}
   void start(int64_t t) { bus->at(this, t, 0); }
@@ -182,14 +192,20 @@ struct KeyPump : Station {
     encode_reply9(reqs[cur].key, 0x01, f);
     for (size_t i = 0; i < REPLY9_LEN; i++) T.tx_frame_[i] = f[i];
     T.tx_fired_ = false;
+    T.key_ack_ = 0;
     T.tx_pending_ = true;
   }
-  void done_(bool ok, int64_t t) {
-    reqs[cur].ok = ok;
+  void done_(uint8_t fate, int64_t t) {
+    reqs[cur].fate = fate;
     reqs[cur].t_done = t;
     reqs[cur].keys_after = ctl->keys.size();
     cur++;
     st = IDLE;
+  }
+  void fired_(PlanTerminal &T, int64_t t) {
+    T.tx_fired_ = false;
+    st = VERDICT;
+    t_x = t;
   }
   void on_timer(int, int64_t t) override {
     bus->at(this, t + 5 * MS, 0);
@@ -197,103 +213,112 @@ struct KeyPump : Station {
     PlanTerminal &T = *br->term;
     switch (st) {
       case IDLE:
-        if (cur == reqs.size() || reqs[cur].t_req > t) return;
-        reqs[cur].t_start = t;
-        reqs[cur].keys_before = ctl->keys.size();
-        retries = 0;
-        T.tx_rejected_ = false;
-        T.link_reset_ = false;
-        deadline = t + 2 * S;
-        arm_(T);
-        st = ARMED;
+        while (cur < reqs.size() && reqs[cur].t_req <= t) {
+          if (t - reqs[cur].t_req >= KEY_TTL_MS * MS) {  // stale in the queue (F-04/F-05)
+            done_(KEY_FATE_EXPIRED, t);
+            continue;
+          }
+          reqs[cur].t_start = t;
+          reqs[cur].keys_before = ctl->keys.size();
+          deadline = reqs[cur].t_req + KEY_TTL_MS * MS;
+          arm_(T);
+          st = ARMED;
+          return;
+        }
         return;
       case ARMED:
-        if (T.tx_fired_) {
-          T.tx_fired_ = false;
-          st = VERDICT;
-          vt = t;
-          vticks = 0;
-        } else if (t >= deadline) {  // "no clean slot": tx_pending_ stays armed
-          if (++retries <= 10) deadline = t + 2 * S;
-          else T.tx_pending_ = false, done_(false, t);
+        if (T.tx_fired_) fired_(T, t);
+        else if (t >= deadline) T.tx_pending_ = false, st = DISARM, t_x = t;  // R-KP-09
+        return;
+      case DISARM:
+        if (T.tx_fired_) fired_(T, t);  // the ISR had already taken it
+        else if (t - t_x >= 10 * MS) {
+          done_(KEY_FATE_EXPIRED, t);
+          while (cur < reqs.size() && reqs[cur].t_req <= t) done_(KEY_FATE_EXPIRED, t);  // drop the queue
         }
         return;
       case VERDICT:
-        if (t - vt < 20 * MS * (vticks + 1)) return;
-        vticks++;
-        if (T.tx_rejected_ || T.link_reset_) {
-          bool rs = T.link_reset_;
-          T.tx_rejected_ = false;
-          T.link_reset_ = false;
-          if (++retries <= 10) wait_until = t + (rs ? 400 : 600) * MS, st = WAIT;
-          else done_(false, t);
-        } else if (vticks >= 2) {
-          done_(true, t);  // "accepted": 40 ms without a re-poll or walk marker
-        }
-        return;
-      case WAIT:
-        if (t < wait_until) return;
-        deadline = t + 2 * S;
-        arm_(T);
-        st = ARMED;
+        if (T.key_ack_ == 0 && t - t_x < KEY_VERDICT_MS * MS) return;
+        T.key_await_ = false;
+        done_(T.key_ack_ == 1 ? KEY_FATE_ACCEPTED : KEY_FATE_REJECTED, t);
         return;
     }
   }
 };
 
-// --- task model: NavEngine-style step engine (press, settle, verify) --------
+// --- task model: NavEngine step_ (press, settle, verify) + key_fate ---------
+// Mirror of NavEngine::step_ / esc_anchor_ as plan_observe drives them:
+// settle = 600 ms quiet since the press AND PlanScreen::settled (quiet, no
+// session init painting, controller live; wave E4), capped at 6 s (a keyed
+// step still verifies at the cap, a keyless read FAILs, W-05); verify
+// window 2 s; key 0 = a keyless read. The bridge's key fates are forwarded (key_fate): a press
+// that was REJECTED or EXPIRED is pressed once more by the same step, an
+// ACCEPTED one never. An anchor step is esc_anchor_: Esc, settle, look for
+// the clock, at most NAV_ESC_MAX Escs.
 struct Step {
   uint8_t key;
   int row;  // -1: no read-back (a blind predicate)
   const char *expect;
+  bool anchor = false;
 };
 struct Macro {
   const std::vector<Step> *steps = nullptr;
   size_t i = 0;
-  enum { OFF, PRESS, SETTLE, VERIFY, DONE } st = OFF;
-  int64_t t_begin = 0, t_end = -1, step_t = 0, verify_t = 0;
-  bool ok = false;
+  enum { OFF, RUN, DONE } st = OFF;
+  int aph = 0, escs = 0;
+  int64_t t_begin = 0, t_end = -1, at0 = 0;
+  bool ok = false, repressed = false;
   size_t req = 0;
 
   void start(const std::vector<Step> *s, int64_t t) {
     steps = s;
     i = 0;
-    st = PRESS;
+    aph = 0;
+    escs = 0;
+    st = RUN;
     t_begin = t;
   }
+  void press_(KeyPump &p, uint8_t k, int64_t t) {
+    req = p.reqs.size();
+    p.request(k, t);
+    at0 = t;
+    aph = 1;
+  }
   void tick(int64_t t, KeyPump &p, const IsrBridge &br) {
-    switch (st) {
-      case PRESS:
-        req = p.reqs.size();
-        p.request((*steps)[i].key, t);
-        st = SETTLE;
-        step_t = -1;
-        return;
-      case SETTLE:
-        if (step_t < 0) {
-          if (p.reqs[req].t_done == -1) return;
-          if (!p.reqs[req].ok) return finish_(false, t);
-          step_t = t;
-        }
-        // NavEngine::step_: NAV_QUIET_MS since the press AND
-        // PlanScreen::settled (quiet, no session init painting, controller
-        // live), capped by NAV_SETTLE_CAP_MS (a keyed step still verifies
-        // at the cap; only the keyless emit settle fails there, W-05).
-        if ((t - step_t >= 600 * MS && br.settled(t)) || t - step_t >= 6 * S)
-          st = VERIFY, verify_t = t;
-        return;
-      case VERIFY: {
-        const Step &s = (*steps)[i];
-        bool pass = s.row < 0 || strstr(br.scr.row(SCR_TERM_ESP, s.row), s.expect) != nullptr;
-        if (!pass && t - verify_t < 2 * S) return;  // NAV_VERIFY_MS
-        if (!pass) return finish_(false, t);
-        if (++i == steps->size()) return finish_(true, t);
-        st = PRESS;
-        return;
-      }
-      default:
-        return;
+    if (st != RUN) return;
+    const Step &s = (*steps)[i];
+    if (aph == 0) {
+      repressed = false;
+      if (s.key) return press_(p, s.key, t);
+      at0 = t;
+      aph = 1;
+      return;
     }
+    if (s.key && !repressed && req < p.reqs.size() &&
+        (p.reqs[req].fate == KEY_FATE_REJECTED || p.reqs[req].fate == KEY_FATE_EXPIRED)) {
+      repressed = true;  // did not execute: once more, fresh settle (R-KP-14/15)
+      return press_(p, s.key, t);
+    }
+    if (aph == 1) {
+      bool quiet = (s.key == 0 || t - at0 >= 600 * MS) && (br.last_disp_t < 0 || br.settled(t));
+      if (!quiet && t - at0 < 6 * S) return;
+      if (!quiet && s.key == 0) return finish_(false, t);  // NAV_SETTLE_CAP_MS: nothing read (W-05)
+      at0 = t;
+      aph = 2;
+    }
+    bool pass = s.row < 0 || strstr(br.scr.row(SCR_TERM_ESP, s.row), s.expect) != nullptr;
+    if (pass) {
+      aph = 0;
+      escs = 0;
+      if (++i == steps->size()) finish_(true, t);
+      return;
+    }
+    if (s.anchor) {  // esc_anchor_: no verify window, next Esc
+      if (++escs >= 6) return finish_(false, t);
+      aph = 0;
+      return;
+    }
+    if (t - at0 >= 2 * S) finish_(false, t);  // NAV_VERIFY_MS
   }
   void finish_(bool k, int64_t t) {
     ok = k;
@@ -343,14 +368,24 @@ static std::vector<Scenario> scenarios() {
   return v;
 }
 
+// PlanEdit's macro set as the step engine runs it (wave E3): the focus and
+// edit presses must leave the value on its own page (row 3 of page 3 is
+// that page's value row: a press that paged away fails it, F-12); the
+// commit's in-visit read-back shows the candidate either way, so success
+// needs the confirming re-visit after the teardown (F-13).
 static const std::vector<Step> EDIT = {
-    {KEY_DOWN, -1, nullptr}, {KEY_DOWN, -1, nullptr}, {KEY_DOWN, 0, "Setpoint"},
-    {KEY_ENTER, -1, nullptr},             // focus: blind (F-12)
-    {KEY_UP, 3, "46.0"},                  // candidate shown
-    {KEY_ENTER, 3, "46.0"},               // commit: read-back of the shown value (F-13)
-    {KEY_ESC, -1, nullptr}, {KEY_ESC, 0, "10:00"}};
+    {KEY_DOWN, -1, nullptr}, {KEY_DOWN, -1, nullptr}, {KEY_DOWN, 0, "Setpoint"},  // ROUTE
+    {KEY_ENTER, 3, "45.0"},               // FOCUS: still the value page
+    {KEY_UP, 3, "46.0"},                  // EDIT: the candidate, on the value page
+    {KEY_ENTER, 3, "46.0"},               // COMMIT: in-visit read-back
+    {KEY_ESC, 0, "10:00", true},          // ANCHOR: closes every focus
+    {KEY_DOWN, -1, nullptr}, {KEY_DOWN, -1, nullptr}, {KEY_DOWN, 0, "Setpoint"},  // ROUTE again
+    {0, 3, "46.0"},                       // READ: the confirming re-visit decides
+    {KEY_ESC, 0, "10:00", true}};         // TEARDOWN
+// The alarm acknowledge reports done only on the controller's confirmation:
+// the alarm page, its reset repaint, and the anchor's STATUS row (R-KP-26).
 static const std::vector<Step> ALARM = {
-    {KEY_ALARM, 0, "Alarms"}, {KEY_ALARM, 2, "No active alarm"}, {KEY_ESC, 0, "10:00"}};
+    {KEY_ALARM, 0, "Alarms"}, {KEY_ALARM, 2, "No active alarm"}, {KEY_ESC, 6, "STATUS:  AUTO"}};
 static const std::vector<Step> WALK = {
     {KEY_DOWN, 0, "Main menu          1/8"}, {KEY_DOWN, 0, "Main menu          2/8"},
     {KEY_ESC, 0, "10:00"}};
@@ -522,6 +557,7 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
       br.term->drain_ = false;
       br.term->drain_replied_ = false;
       br.term->claim_mask_ = OWN_BIT;
+      br.term->sess_ready_ = false;
       br.term->enroll_ = true;
     }
     if (with_bridge && br.powered && br.term->drain_) {
@@ -643,7 +679,9 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
   for (size_t q = 0; q < pump.reqs.size(); q++) {
     const KeyPump::Req &rq = pump.reqs[q];
     if (rq.t_start < 0) continue;
-    int64_t t1 = q + 1 < pump.reqs.size() && pump.reqs[q + 1].t_start >= 0 ? pump.reqs[q + 1].t_start : sc.dur;
+    size_t nx = q + 1;  // the next request that went to the pump (dropped ones never did)
+    while (nx < pump.reqs.size() && pump.reqs[nx].t_start < 0) nx++;
+    int64_t t1 = nx < pump.reqs.size() ? pump.reqs[nx].t_start : sc.dur;
     int copies = 0;
     for (const auto &l : L) {
       if (l.from != ENROLL_ADDR || l.t < rq.t_start || l.t >= t1 || l.f.size() < 2 || l.f[1].v != 0x1E) continue;
@@ -665,9 +703,7 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
         r.i6_first++;
       }
     }
-    size_t exec_after = rq.t_done >= 0 ? (q + 1 < pump.reqs.size() && pump.reqs[q + 1].t_start >= 0
-                                              ? pump.reqs[q + 1].keys_before
-                                              : ctl.keys.size())
+    size_t exec_after = rq.t_done >= 0 ? (nx < pump.reqs.size() ? pump.reqs[nx].keys_before : ctl.keys.size())
                                        : rq.keys_before;
     size_t execs = exec_after - std::min(exec_after, rq.keys_before);
     if (copies > 1 || execs > 1) {

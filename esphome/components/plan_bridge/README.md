@@ -168,8 +168,9 @@ types (all integers little-endian; exact layouts in the spec):
 |---|---|---|
 | `EV_STATE` (1) | armed, enroll (no/yes/drain), tx_mode | device truth, on change + every 10 s (the in-band keepalive) + once on session establish |
 | `EV_JOIN` (2) | — | the actual link join: first poll to our address answered since `set_enroll(true)` |
-| `EV_TX_FIRED` (3) | keycode, attempt | the keypad report went out |
-| `EV_KEY_ACCEPTED` (4) | keycode, attempt | verdict: no rejection signature followed |
+| `EV_TX_FIRED` (3) | keycode, 0 | the keypad report went out (once per press, never resent) |
+| `EV_KEY_ACCEPTED` (4) | keycode, 0 | verdict: the controller acked the burst (`01'` first after it) |
+| `EV_KEY_FATE` (6) | keycode, fate | 2 = rejected (no `01'` ack first, or nothing within 100 ms), 3 = expired (no session-ready slot within 1.5 s, or stale in the queue) |
 | `EV_HOLD` (5) | paused flag | a rider component's menu walk yielded the session |
 
 **Screen-snapshot replay:** the controller repaints only *changed* rows,
@@ -200,12 +201,26 @@ its largest block) so a session's heap cost reads off its own stream.
 
 ## Injection verdict
 
-After each transmitted report the task watches for the two rejection
-signatures — the controller's immediate re-poll and the link-reset FF-walk
-— and retries on failure. In **tx_mode 2** (enrolled slot, the default
-worth using) silent discards were never observed and the accepted verdict
-arrives ~40 ms after the TX; modes 0 (slot-racing the pGD) and 1 are
-legacy experiments and unreliable.
+A press is put on the wire **at most once** (wave E3, A5 R-KP-07..15):
+
+- it rides only a *session-ready* poll slot to 31: after any recovery walk,
+  the controller's session-init frames to 31, or `set_enroll(true)`, keys
+  wait for the first text row of the fresh session (a key in the first poll
+  after a walk died 7 of 9 times); plain link replies continue meanwhile;
+- the verdict is the first byte after the burst: the controller's `01'` ack
+  = **accepted**; a re-poll, another frame, or nothing within 100 ms =
+  **rejected**. A walk marker from before the TX never counts against it.
+  There is no retry: a key that may have executed is never resent, one that
+  did not is reported so the navigation engine re-decides from the screen;
+- a key with no session-ready slot within its 1.5 s TTL is withdrawn and
+  reported **expired**, and every press queued behind it is dropped and
+  reported too (no stale bursts after a dead-bus stretch). A queued press
+  older than the TTL when its turn comes is dropped the same way.
+
+Fates go out as `EV_KEY_ACCEPTED` / `EV_KEY_FATE` and as `key_fate_word()`
+for in-firmware consumers (plan_observe forwards them to
+`NavEngine::key_fate`). Modes 0 (slot-racing the pGD) and 1 are legacy
+experiments and unreliable.
 
 Disenroll (`set_enroll(false)`) is a graceful drain that ends at a fixed
 ~15 s deadline: the controller never roll-calls an established terminal,

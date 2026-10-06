@@ -28,7 +28,16 @@
 //     Down; a wrapping list that comes back to the start without showing
 //     the target errors out (full-cycle detection);
 //   - any divergence presses Esc (cancels the edit focus) WITHOUT
-//     committing; commit is Enter + read-back verify.
+//     committing; commit is Enter + read-back verify;
+//   - edit focus is real (A5 R-KP-23, F-12): the focus Enter and every edit
+//     press must leave the value page in place -- a press that pages away
+//     had no edit focus and aborts before the walk can follow a neighbouring
+//     page whose extractor happens to match;
+//   - success is CONFIRMED (A5 R-KP-24, F-13): during the edit the value row
+//     shows the candidate, so a lost commit Enter reads back the target too
+//     and the teardown Esc then cancel-restores the old value. A macro set
+//     therefore reports ok only after a fresh visit of the page, once the
+//     teardown has closed every focus, reads the target back.
 //
 // Failure contract: an edit either commits a verified value or aborts back
 // to the status anchor. Teardown is just Esc to the anchor -- an always-on
@@ -274,12 +283,27 @@ class PlanEdit : public NavEngine {
         // readValue: the extractor row must match within the verify window.
         Act a = step_(0, [this] { return read_(cur_); }, NAV_VERIFY_MS, now, false);
         if (a == Act::FAIL) {
-          fail_("value row never matched");
+          fail_(confirm_ ? "commit not confirmed: value row never matched on the re-visit"
+                         : "value row never matched");
           break;
         }
         if (a != Act::OK)
           break;
+        if (confirm_) {  // the confirming re-visit after a set (F-13)
+          confirm_ = false;
+          if (emit_)
+            emit_();
+          if (!edit_eq(cur_, ops_[0].target)) {
+            std::snprintf(buf_, sizeof buf_, "commit not confirmed: the page shows %.24s after the teardown",
+                          cur_);
+            fail_(buf_);
+            break;
+          }
+          finish_(true, "");
+          break;
+        }
         std::strcpy(old_, cur_);
+        page_(page0_);
         if (emit_)
           emit_();  // page settled + verified: full-page force snapshot
         if (sweep_) {  // read_sweep: page the selector, commit nothing
@@ -332,6 +356,10 @@ class PlanEdit : public NavEngine {
           abort_("focus hop altered the value");
           break;
         }
+        if (!on_value_page_()) {
+          abort_("focus Enter left the value page");
+          break;
+        }
         field_++;
         arrive_();
         break;
@@ -357,6 +385,10 @@ class PlanEdit : public NavEngine {
         if (a == Act::RUN)
           break;
         press_i_++;
+        if (a == Act::OK && !on_value_page_()) {
+          abort_("no edit focus: the press paged away");
+          break;
+        }
         if (a == Act::FAIL) {
           // stall: no edit focus, or the value sits at a device limit
           if (!t_is_num_ && !reversed_) {
@@ -405,6 +437,18 @@ class PlanEdit : public NavEngine {
           break;
         }
         field_++;  // the commit Enter advanced the focus to the next field
+        if (op_i_ + 1 >= nops_ && nops_ == 1) {
+          // F-13: the row shows the target whether or not the commit Enter
+          // landed. Esc back to the anchor (closes any focus; a lost commit
+          // is cancel-restored there) and visit the page again: only that
+          // read decides. (set_ops keeps the in-visit read-back: its
+          // dependent rows need the same focus walk to be read at all.)
+          confirm_ = true;
+          op_i_ = 0;
+          field_ = 0;
+          st_ = St::ANCHOR;
+          break;
+        }
         if (op_i_ + 1 >= nops_) {
           finish_(true, "");
           break;
@@ -546,6 +590,8 @@ class PlanEdit : public NavEngine {
 
   void begin_() {
     old_[0] = cur_[0] = '\0';
+    page0_[0] = '\0';
+    confirm_ = false;
     attempt_ = 0;
     reset_edit_();
     st_ = St::ANCHOR;
@@ -575,6 +621,10 @@ class PlanEdit : public NavEngine {
     std::strcpy(estart_, cur_);
     st_ = St::EDIT;
   }
+
+  // Still on the page the value was read from (an unidentified page has no
+  // ID to compare and passes; the extractor checks still apply).
+  bool on_value_page_() const { return page0_[0] == '\0' || page_is_(page0_); }
 
   // readValue off the CURRENT page: the current op's extractor row.
   bool read_(char *out) const {
@@ -811,6 +861,8 @@ class PlanEdit : public NavEngine {
   uint8_t nops_{0};
   uint8_t op_i_{0};   // current op
   uint8_t field_{0};  // Enter-walk field currently focused (0 = none)
+  char page0_[FIELDS_PAGE_MAX]{};  // page ID the value was read on (focus check)
+  bool confirm_{false};            // the next READ is the confirming re-visit
   bool set_req_{false};
   bool sweep_{false};
   int sweep_expected_{0};

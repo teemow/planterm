@@ -213,9 +213,10 @@ u8  b          kind-specific, unused fields are 0
 |------|---------|-----|-----|
 | 1 | **state** — the device's current truth | bit 0 = armed; bits 1+ = enroll: 0 no, 1 yes, 2 drain (graceful leave in progress) | transmit mode |
 | 2 | **join** — first poll to the bridge's enrolled address answered since enrollment was requested; the poll slot is live | 0 | 0 |
-| 3 | **TX fired** — a keypad report went out | keycode | attempt number |
-| 4 | **key accepted** — no rejection signature followed the injection | keycode | attempt number |
+| 3 | **TX fired** — a keypad report went out (once per press; never resent) | keycode | 0 |
+| 4 | **key accepted** — the controller acked the burst (`01'` the first byte after it) | keycode | 0 |
 | 5 | **hold** — a background menu walker on the device yielded the terminal session | 1 = explicitly paused, 0 = yielded to the armed write path | 0 |
+| 6 | **key fate** — the press did not execute: 2 = rejected (no `01'` ack first, or silence for 100 ms), 3 = expired (no session-ready slot within 1.5 s, or stale in the queue) | keycode | fate |
 
 The state event is the device's authoritative state: clients trust it
 over any assumption about their own commands' effects. The server emits
@@ -297,7 +298,7 @@ The server acks **every** command record exactly once, in order.
 `accepted` means the command was dispatched (state set, or key press
 enqueued) — the *outcome* arrives as events: a state event follows every
 arm/enroll change, a join event certifies the live poll slot, and TX
-fired / key accepted events report each injection attempt's verdict.
+fired / key accepted / key fate events report each press's single verdict.
 `rejected` means the command was valid but refused by a gate — e.g. a
 key injection while disarmed, or a full injection queue; the server
 should say why in a diagnostic record. `unknown op` means the op byte

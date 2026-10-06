@@ -221,6 +221,20 @@ class NavEngine {
   }
   int pin_of(uint8_t which) const { return which >= 1 && which <= 2 ? pins_[which - 1] : 0; }
 
+  // Fate of a press from the bridge's key pump (KeyFate; plan_bridge
+  // key_fate_word). A press that provably did not execute -- REJECTED at
+  // the link (no controller ack) or EXPIRED before a session-ready slot --
+  // is pressed once more by the step that made it (A5 R-KP-14/15: the step
+  // survives a walk instead of failing the cycle); an ACCEPTED press is
+  // never repeated, it may have executed. Without a feed every step works
+  // as before (settle + verify). The pump is serial and fates arrive in
+  // press order, so a running step only ever sees its own press's fate.
+  void key_fate(uint8_t key, uint8_t fate) {
+    if (aphase_ != 0 && key != 0 && key == step_key_ &&
+        (fate == KEY_FATE_REJECTED || fate == KEY_FATE_EXPIRED))
+      step_lost_ = true;
+  }
+
  protected:
   enum class Act : uint8_t { RUN, OK, FAIL };
 
@@ -319,9 +333,22 @@ class NavEngine {
     if (aphase_ == 0) {
       if (key != 0 && press_)
         press_(key);
+      step_key_ = key;
+      step_lost_ = false;
+      step_repressed_ = false;
       at0_ = now;
       aphase_ = settle ? 1 : 2;
       return Act::RUN;
+    }
+    if (step_lost_) {  // this step's press did not execute: once more, fresh settle
+      step_lost_ = false;
+      if (!step_repressed_ && press_) {
+        step_repressed_ = true;
+        press_(step_key_);
+        at0_ = now;
+        aphase_ = settle ? 1 : 2;
+        return Act::RUN;
+      }
     }
     if (aphase_ == 1) {
       // PlanScreen::settled: quiet, no session init still painting, the
@@ -552,6 +579,9 @@ class NavEngine {
   // step_ sub-state (shared: exactly one step_ runs at a time)
   uint8_t aphase_{0};
   uint32_t at0_{0};
+  uint8_t step_key_{0};          // the running step's key (key_fate match)
+  bool step_lost_{false};        // its press did not execute (key_fate)
+  bool step_repressed_{false};   // the one re-press is spent
   // sub-machine state
   int esc_i_{0};
   uint8_t mphase_{0};

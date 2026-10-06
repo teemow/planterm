@@ -33,6 +33,9 @@ static const char *txkind_name(uint8_t k) {
 
 // Depth of the pending-key-press queue. A human pressing menu buttons never
 // outruns this; extra presses are dropped rather than queued unboundedly.
+// Queued presses carry their request time: one older than KEY_TTL_MS when
+// its turn comes is dropped and reported EXPIRED, never flushed late (A5
+// F-04/F-05: 8 stale Escs drained in 460 ms after a dead-bus stretch).
 static const int QUEUE_DEPTH = 8;
 // ISR -> logging-task stream of (byte, bit9) pairs. Sized for bursts (display
 // redraws are a few hundred bytes); overflow only drops *log* bytes, never
@@ -65,18 +68,21 @@ static size_t heap_free() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 // pGD tap is exactly ONE keypad report with NN=0x01; NN only ramps while a
 // key is held.
 static const uint8_t HOLD_BASE = 0x01;
-// Whether we win the response slot depends on how busy the real pGD is: while
-// it is redrawing it answers polls slowly (>2 ms) and our burst fits; on a
-// static idle screen it answers in ~0.4 ms and collides with us every time.
-// A rejected injection resets the link, whose full-screen redraw (~2 s later)
-// makes the pGD slow again -- pacing retries at 600 ms reaches into that
-// window, so the first (sacrificial) attempt bootstraps acceptance.
-static const int MAX_RETRIES = 10;
-static const uint32_t RETRY_SPACING_MS = 600;
+// Key lifecycle (A5 section 4, wave E3): QUEUED -> ARMED (the ISR holds it
+// until a session-ready poll slot, R-KP-07) -> on the wire ONCE -> verdict
+// from the first byte after the burst (PlanTerminal::key_ack_, R-KP-11/12).
+// There is no retry: a key that may have executed is never sent again
+// (F-06/F-07), and one that provably did not (REJECTED/EXPIRED) is reported
+// so the navigation engine re-decides from the screen (R-KP-14/15).
+enum KeySt : uint8_t { KS_IDLE, KS_ARMED, KS_DISARM, KS_VERDICT, KS_REPEAT };
+// After the task withdraws an expired key the ISR may still be mid-burst
+// with it (poll matched before the withdrawal): look for tx_fired_ this long.
+static const uint32_t KEY_DISARM_MS = 10;
 
 struct KeyReq {
   uint8_t keycode;
   bool internal;  // observe navigation: bypasses the armed gate
+  uint32_t t_ms;  // request time: the TTL runs from here
 };
 
 // uart_reg_update, tx_9bit and PlanBridge::uart_isr live in
@@ -165,7 +171,7 @@ void PlanBridge::setup() {
 void PlanBridge::press_key(uint8_t keycode) {
   if (!ready_ || queue_ == nullptr)
     return;
-  KeyReq r{keycode, false};
+  KeyReq r{keycode, false, millis()};
   if (xQueueSend(queue_, &r, 0) != pdTRUE)
     ESP_LOGW(TAG, "key queue full, press 0x%02X dropped", keycode);
 }
@@ -173,7 +179,7 @@ void PlanBridge::press_key(uint8_t keycode) {
 void PlanBridge::press_key_internal(uint8_t keycode) {
   if (!ready_ || queue_ == nullptr)
     return;
-  KeyReq r{keycode, true};
+  KeyReq r{keycode, true, millis()};
   if (xQueueSend(queue_, &r, 0) != pdTRUE)
     ESP_LOGW(TAG, "key queue full, internal press 0x%02X dropped", keycode);
 }
@@ -215,6 +221,7 @@ void PlanBridge::set_enroll(bool e) {
     term_.drain_ = false;
     term_.drain_replied_ = false;
     term_.claim_mask_ = plan::OWN_BIT;
+    term_.sess_ready_ = false;  // keys wait for the session's first row (R-KP-07)
     term_.enroll_ = true;
   } else if (term_.enroll_ && !term_.drain_) {
     // Graceful leave: stay fully on the link but renounce our bit in the next
@@ -243,7 +250,126 @@ void PlanBridge::arm_isr_tx_() {
   for (size_t i = 0; i < plan::REPLY9_LEN; i++)
     term_.tx_frame_[i] = f[i];
   term_.tx_fired_ = false;
+  term_.key_ack_ = 0;
   term_.tx_pending_ = true;  // last: publishes the frame to the ISR
+}
+
+// Bus task only (single writer). One word, so the main-loop consumers (plan_observe feeding
+// NavEngine/PlanEdit::key_fate) read a consistent (seq, key, fate) triple
+// without a lock: seq << 16 | key << 8 | fate.
+void PlanBridge::publish_fate_(uint8_t key, uint8_t fate) {
+  uint32_t seq = ((key_fate_word_ >> 16) + 1) & 0xFFFF;
+  key_fate_word_ = (seq << 16) | (static_cast<uint32_t>(key) << 8) | fate;
+}
+
+// The ISR took the armed frame: log it, start the verdict.
+void PlanBridge::key_fired_(uint32_t now) {
+  term_.tx_fired_ = false;
+  // The wire bytes (report re-addressed to 31) are in the "tx sent key" line.
+  capture_diag_(plan::CAP_DIAG_DEBUG, "key 0x%02X on the wire (stale polls: %u)", pending_key_,
+                static_cast<unsigned>(term_.isr_stale_));
+  capture_event_(EV_TX_FIRED, pending_key_, 0);
+  key_t_ms_ = now;
+  key_st_ = KS_VERDICT;
+}
+
+// Every queued press is stale once the bus was dead for a whole TTL: drop
+// them all and report each, instead of bursting them into the next slots.
+void PlanBridge::drop_queue_(const char *why) {
+  KeyReq req;
+  while (xQueueReceive(queue_, &req, 0) == pdTRUE) {
+    capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X dropped: %s", req.keycode, why);
+    capture_event_(EV_KEY_FATE, req.keycode, plan::KEY_FATE_EXPIRED);
+    publish_fate_(req.keycode, plan::KEY_FATE_EXPIRED);
+  }
+}
+
+// The key pump (bus task, non-blocking: the stream drain never stalls on it).
+void PlanBridge::key_tick_(uint32_t now) {
+  switch (key_st_) {
+    case KS_IDLE: {
+      KeyReq req;
+      if (xQueueReceive(queue_, &req, 0) != pdTRUE)
+        return;
+      if (!armed_ && !req.internal) {
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X ignored: not armed", req.keycode);
+        return;
+      }
+      // Signed age: a press enqueued after `now` was sampled is not stale.
+      if (static_cast<int32_t>(now - req.t_ms) >= static_cast<int32_t>(plan::KEY_TTL_MS)) {
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X expired in the queue (%u ms old)", req.keycode,
+                      static_cast<unsigned>(now - req.t_ms));
+        capture_event_(EV_KEY_FATE, req.keycode, plan::KEY_FATE_EXPIRED);
+        publish_fate_(req.keycode, plan::KEY_FATE_EXPIRED);
+        return;
+      }
+      capture_diag_(plan::CAP_DIAG_INFO, "injecting key 0x%02X: %d poll-slot(s)", req.keycode, repeat_);
+      pending_key_ = req.keycode;
+      pending_frames_ = repeat_;
+      hold_ = HOLD_BASE;
+      term_.isr_stale_ = 0;
+      inject_deadline_ms_ = req.t_ms + plan::KEY_TTL_MS;
+      key_st_ = KS_ARMED;
+      arm_isr_tx_();
+      return;
+    }
+    case KS_ARMED:
+      if (term_.tx_fired_) {
+        key_fired_(now);
+      } else if (static_cast<int32_t>(now - inject_deadline_ms_) >= 0) {
+        // No session-ready slot within the TTL (R-KP-09): withdraw it.
+        term_.tx_pending_ = false;
+        key_t_ms_ = now;
+        key_st_ = KS_DISARM;
+      }
+      return;
+    case KS_DISARM:
+      if (term_.tx_fired_) {  // the ISR had already taken it: judge it normally
+        key_fired_(now);
+      } else if (now - key_t_ms_ >= KEY_DISARM_MS) {
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: expired, no session-ready slot in %u ms",
+                      pending_key_, static_cast<unsigned>(plan::KEY_TTL_MS));
+        capture_event_(EV_KEY_FATE, pending_key_, plan::KEY_FATE_EXPIRED);
+        publish_fate_(pending_key_, plan::KEY_FATE_EXPIRED);
+        pending_frames_ = 0;
+        key_st_ = KS_IDLE;
+        drop_queue_("queued behind a key that found no slot (bus dead)");
+      }
+      return;
+    case KS_VERDICT: {
+      uint8_t v = term_.key_ack_;
+      if (v == 0 && now - key_t_ms_ < plan::KEY_VERDICT_MS)
+        return;
+      term_.key_await_ = false;
+      if (v != 1) {
+        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: rejected (%s), not resent", pending_key_,
+                      v == 0 ? "no byte within 100 ms" : "no 01' ack first");
+        capture_event_(EV_KEY_FATE, pending_key_, plan::KEY_FATE_REJECTED);
+        publish_fate_(pending_key_, plan::KEY_FATE_REJECTED);
+        pending_frames_ = 0;
+        key_st_ = KS_IDLE;
+        return;
+      }
+      hold_ = (hold_ + 2 > 0xC8) ? 0xC8 : static_cast<uint8_t>(hold_ + 2);
+      if (--pending_frames_ > 0) {  // a configured hold: next report after the spacing
+        key_t_ms_ = now;
+        key_st_ = KS_REPEAT;
+        return;
+      }
+      capture_diag_(plan::CAP_DIAG_INFO, "key 0x%02X: accepted (controller ack)", pending_key_);
+      capture_event_(EV_KEY_ACCEPTED, pending_key_, 0);
+      publish_fate_(pending_key_, plan::KEY_FATE_ACCEPTED);
+      key_st_ = KS_IDLE;
+      return;
+    }
+    case KS_REPEAT:
+      if (now - key_t_ms_ >= repeat_interval_ms_) {
+        inject_deadline_ms_ = now + plan::KEY_TTL_MS;
+        key_st_ = KS_ARMED;
+        arm_isr_tx_();
+      }
+      return;
+  }
 }
 
 // Slow path only: drain the ISR's byte stream for frame logging and run the
@@ -426,105 +552,7 @@ void PlanBridge::task_main() {
     }
     capture_flush_();
 
-    uint32_t now = millis();
-    if (pending_frames_ == 0) {
-      KeyReq req;
-      if (xQueueReceive(queue_, &req, 0) != pdTRUE)
-        continue;
-      if (!armed_ && !req.internal) {
-        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X ignored: not armed", req.keycode);
-        continue;
-      }
-      capture_diag_(plan::CAP_DIAG_INFO, "injecting key 0x%02X: %d poll-slot(s)", req.keycode,
-                    repeat_);
-      pending_key_ = req.keycode;
-      pending_frames_ = repeat_;
-      hold_ = HOLD_BASE;
-      term_.isr_stale_ = 0;
-      retries_ = 0;
-      term_.tx_rejected_ = false;
-      term_.link_reset_ = false;
-      inject_deadline_ms_ = now + 2000;
-      arm_isr_tx_();
-      continue;
-    }
-
-    if (term_.tx_fired_) {
-      term_.tx_fired_ = false;
-      capture_diag_(
-          plan::CAP_DIAG_DEBUG,
-          "TX(9bit) %02X' %02X %02X %02X %02X %02X %02X  %02X' %02X %02X %02X (stale polls: "
-          "%u, attempt %d)",
-          term_.tx_frame_[0], term_.tx_frame_[1], term_.tx_frame_[2], term_.tx_frame_[3],
-          term_.tx_frame_[4], term_.tx_frame_[5], term_.tx_frame_[6], term_.tx_frame_[7],
-          term_.tx_frame_[8], term_.tx_frame_[9], term_.tx_frame_[10],
-          static_cast<unsigned>(term_.isr_stale_), retries_);
-      capture_event_(EV_TX_FIRED, pending_key_, static_cast<uint8_t>(retries_));
-      // Verdict phase. Two rejection signatures exist: an immediate re-poll
-      // (tx_rejected_, within ms) and the silent discard, which surfaces only
-      // as the controller's link-reset FF-walk ~2 s later. Only 2.5 s of
-      // quiet after the TX means the key was accepted.
-      //
-      // In tx_mode 2 the report rides in OUR OWN poll slot: no pGD to collide
-      // with and (measured 2026-07-02, dozens of injections) no silent
-      // discards -- every key was accepted on attempt 0. The rejection
-      // re-poll lands within ~5 ms of our TX (the ISR flags it), so two
-      // 20 ms ticks cover it with margin and the accepted verdict logs
-      // ~40 ms after the TX instead of 300 ms.
-      bool failed = false;
-      int verdict_ticks = (term_.tx_mode_ == 2) ? 2 : 25;
-      uint32_t tick_ms = (term_.tx_mode_ == 2) ? 20 : 100;
-      for (int i = 0; i < verdict_ticks; i++) {
-        vTaskDelay(pdMS_TO_TICKS(tick_ms));
-        if (term_.tx_rejected_ || term_.link_reset_) {
-          failed = true;
-          break;
-        }
-      }
-      if (failed) {
-        bool was_reset = term_.link_reset_;
-        term_.tx_rejected_ = false;
-        term_.link_reset_ = false;
-        if (++retries_ <= MAX_RETRIES) {
-          capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: %s, retry %d/%d", pending_key_,
-                        was_reset ? "link reset (silent discard)" : "collision with pGD reply",
-                        retries_, MAX_RETRIES);
-          // A link reset is followed by a full-screen redraw that keeps the
-          // pGD busy (slow poll replies) -- the retry lands in that window.
-          vTaskDelay(pdMS_TO_TICKS(was_reset ? 400 : RETRY_SPACING_MS));
-          inject_deadline_ms_ = millis() + 2000;
-          arm_isr_tx_();
-          continue;
-        }
-        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: gave up after %d attempts",
-                      pending_key_, MAX_RETRIES);
-        pending_frames_ = 0;
-        continue;
-      }
-      hold_ = (hold_ + 2 > 0xC8) ? 0xC8 : static_cast<uint8_t>(hold_ + 2);
-      if (--pending_frames_ == 0) {
-        capture_diag_(plan::CAP_DIAG_INFO, "key 0x%02X: accepted (attempt %d)", pending_key_,
-                      retries_);
-        capture_event_(EV_KEY_ACCEPTED, pending_key_, static_cast<uint8_t>(retries_));
-      } else {
-        // Space repeats at roughly the pGD's cadence, then re-arm.
-        vTaskDelay(pdMS_TO_TICKS(repeat_interval_ms_));
-        arm_isr_tx_();
-      }
-    } else if ((int32_t) (now - inject_deadline_ms_) >= 0) {
-      // No poll slot could be filled (the pGD beat us into every one).
-      // That costs nothing on the bus, so retry on the same budget.
-      if (++retries_ <= MAX_RETRIES) {
-        capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: no clean slot, retry %d/%d",
-                      pending_key_, retries_, MAX_RETRIES);
-        inject_deadline_ms_ = now + 2000;
-        continue;
-      }
-      term_.tx_pending_ = false;
-      capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X: aborted (%d slot(s) unfilled, stale polls: %u)",
-                    pending_key_, pending_frames_, static_cast<unsigned>(term_.isr_stale_));
-      pending_frames_ = 0;
-    }
+    key_tick_(millis());
   }
 }
 
@@ -866,7 +894,7 @@ void PlanBridge::capture_command_(size_t ci, uint8_t id, uint8_t op, uint8_t arg
         capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X rejected: not armed", arg);
         break;
       }
-      KeyReq r{arg, false};
+      KeyReq r{arg, false, millis()};
       if (!ready_ || queue_ == nullptr || xQueueSend(queue_, &r, 0) != pdTRUE) {
         status = plan::CAP_ACK_REJECTED;
         capture_diag_(plan::CAP_DIAG_WARNING, "key 0x%02X rejected: queue full", arg);
