@@ -35,7 +35,7 @@
 //
 // The task-side key pump and the edit step engine are host models of
 // plan_bridge.cpp (task_main key path, repeat 1, tx_mode 2) and of the
-// NavEngine step semantics (settle 600 ms quiet, 6 s cap fall-through, 2 s
+// NavEngine step semantics (settle 600 ms quiet + PlanScreen::settled, 6 s cap, 2 s
 // verify): those parts are not host-compilable today. Expected failures of
 // today's firmware live in test/sim/invariants_expected.tsv: the test fails
 // on a NEW failure and on an expected failure that now PASSES (flip the row).
@@ -82,6 +82,13 @@ class IsrBridge : public Station {
   bool disp_dirty = false;
 
   IsrBridge() : Station(ENROLL_ADDR) {}
+  // The read gate of the firmware (SettleGate / NavEngine): 600 ms quiet
+  // (timed from the frame start, as D12 measured the I7 limits) AND
+  // PlanScreen::settled's protocol conditions (no session init still
+  // painting, controller still transmitting; A4 R-DI-26, wave E4).
+  bool settled(int64_t t) const {
+    return t - last_disp_t >= 600 * MS && scr.settled(SCR_TERM_ESP, static_cast<uint32_t>(t / 1000), 0);
+  }
   // Power-on / reboot: fresh state machine, the device's boot config.
   void boot() {
     term.reset(new PlanTerminal);
@@ -268,9 +275,11 @@ struct Macro {
           if (!p.reqs[req].ok) return finish_(false, t);
           step_t = t;
         }
-        // NAV_QUIET_MS after the last display frame, capped by
-        // NAV_SETTLE_CAP_MS (W-05: the cap falls through to the read).
-        if ((t - step_t >= 600 * MS && t - br.last_disp_t >= 600 * MS) || t - step_t >= 6 * S)
+        // NavEngine::step_: NAV_QUIET_MS since the press AND
+        // PlanScreen::settled (quiet, no session init painting, controller
+        // live), capped by NAV_SETTLE_CAP_MS (a keyed step still verifies
+        // at the cap; only the keyless emit settle fails there, W-05).
+        if ((t - step_t >= 600 * MS && br.settled(t)) || t - step_t >= 6 * S)
           st = VERIFY, verify_t = t;
         return;
       case VERIFY: {
@@ -538,8 +547,9 @@ static Result run(const Scenario &sc, uint64_t seed, bool with_bridge) {
       if (sc.mk == MK_KEYS && t >= 30 * S && t % (1500 * MS) == 0 && pump.idle())
         pump.request((t / (1500 * MS)) % 2 ? KEY_DOWN : KEY_UP, t);
       mac.tick(t, pump, br);
-      // I5: publish instant = settle after display activity
-      if (br.disp_dirty && t - br.last_disp_t >= 600 * MS) {
+      // I5: publish instant = settle after display activity (SettleGate::due:
+      // marked AND PlanScreen::settled)
+      if (br.disp_dirty && br.settled(t)) {
         br.disp_dirty = false;
         if (t < sc.eval_t0) continue;
         for (int row = 0; row < 8; row++) {

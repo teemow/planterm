@@ -108,6 +108,7 @@ struct TestScreen : PlanScreen {
     int t = term_index(addr);
     std::snprintf(rows_[t][r], SCR_COLS + 1, "%-22.22s", text);
     row_set_[t][r] = true;
+    trusted_[t] = static_cast<uint8_t>(trusted_[t] | 1u << r);  // a full repaint
     painted_[t] = now;
   }
   void clear_(uint8_t addr, uint32_t now) {
