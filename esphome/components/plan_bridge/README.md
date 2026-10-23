@@ -258,6 +258,26 @@ so the renounce slot never comes. This is measured, known, and deliberately
 left as is (an immediate leave broke re-enrollment on hardware — the
 frozen-shape rule again).
 
+## How the library gets into the build
+
+The component builds against the planterm headers of its own checkout, so
+component and library cannot drift apart. ESPHome 2026.7 replaced the
+PlatformIO library staging with a native ESP-IDF toolchain: `cg.add_library()`
+now git-clones any repository URI, and PlatformIO-only schemes such as
+`symlink://` fail (`ssh: Could not resolve hostname symlink`). The component
+therefore registers `<repo>/planterm` as a local IDF component with
+`esphome.components.esp32.add_idf_component(name=..., path=...)`, which lands
+in the generated `src/idf_component.yml` as a path dependency. The IDF
+component manager names a local component after its directory, so that
+directory has to be called `planterm`; its `CMakeLists.txt` only exposes
+`../src` as the include directory. The call is the same on ESPHome 2026.5
+to 2026.7, under the PlatformIO and the native toolchain alike.
+
+When a build seems to use stale code: the native toolchain keeps the ESP-IDF
+installation under `~/.cache/esphome/idf` (shared by every configuration on
+the machine) and the converted PlatformIO libraries under
+`<config dir>/.esphome/pio_components`.
+
 ## Tests
 
 The protocol state machine the ISR runs is planterm's `PlanTerminal`,
