@@ -42,6 +42,9 @@ transceiver (the 3.3 V sibling of the MAX485 — ESP32 GPIOs are not
 5 V-tolerant). The reference board is a lolin_c3_mini (ESP32-C3), but any
 ESP32 works: the GPIO matrix routes UARTs to arbitrary pins, and the ESP32
 generates the 62500 baud rate exactly (80 MHz / 1280).
+The bridge also runs on an ESP32-S3 (with an SP3485 transceiver); see the
+notes on `set_tx_char_floor` and the `plan_ctrl` task's core in
+[the bridge's README](esphome/components/plan_bridge/README.md).
 
 The pin labels below are those of the common MAX3485 breakout module (bare
 chip names in parentheses):

@@ -165,8 +165,19 @@ void PlanBridge::setup() {
   // 5120, not 4096: the wave E5 bus10s fields cost 288 B (the formatted
   // health block) + 256 B (capture_diag_'s larger line buffer) of stack on
   // this task; 1 KiB more keeps the old headroom with margin.
+  // Pinned to the core that just allocated the UART interrupt (the caller's
+  // core), not a fixed core 0. uart_isr's xStreamBufferSendFromISR() notifies
+  // the blocked reader without a cross-core lock (sbSEND_COMPLETE_FROM_ISR only
+  // masks local interrupts), while the reader clears xTaskWaitingToReceive
+  // after its receive timeout. On a dual-core chip (ESP32-S3: ESPHome's loop,
+  // and so the ISR, runs on core 1) with the reader on the other core, that
+  // race nulls the handle between check and use -> configASSERT(xTaskToNotify)
+  // abort in xTaskGenericNotifyFromISR (observed about once a day). On one
+  // core the reader's critical section masks the ISR. Single-core targets
+  // (ESP32-C3) are unaffected: the only core is 0 either way.
+  const BaseType_t isr_core = xPortGetCoreID();
   BaseType_t ok = xTaskCreatePinnedToCore(task_trampoline, "plan_ctrl", 5120, this,
-                                          configMAX_PRIORITIES - 3, &task_, 0);
+                                          configMAX_PRIORITIES - 3, &task_, isr_core);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "task create failed");
     this->mark_failed();

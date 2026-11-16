@@ -32,7 +32,18 @@
 // the ESP. On the host the attributes compile away.
 #ifdef ESP_PLATFORM
 #include <esp_attr.h>
+#if defined(__XTENSA__)
+// Xtensa (ESP32, ESP32-S2/S3): these methods are defined in-class, so an
+// out-of-line copy is a COMDAT function whose literal pool the assembler names
+// `.literal.<symbol>` -- ESP-IDF maps that to flash, and the IRAM-resident
+// L32R loads cannot reach it (link error "dangerous relocation: l32r: literal
+// placed after use"). Force-inlining emits no COMDAT copy and puts the
+// literals in the caller's IRAM literal pool. RISC-V targets (ESP32-C3) have
+// no literal pools and keep the plain attribute.
+#define PLAN_IRAM IRAM_ATTR __attribute__((always_inline))
+#else
 #define PLAN_IRAM IRAM_ATTR
+#endif
 #define PLAN_DRAM DRAM_ATTR
 #else
 #define PLAN_IRAM
