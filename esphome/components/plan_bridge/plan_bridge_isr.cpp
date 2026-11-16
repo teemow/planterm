@@ -54,9 +54,14 @@ namespace plan_bridge {
 // parity switch silently never reaches the shifter (loopback-verified: every
 // byte went out with the boot-time EVEN parity). IDF 5.5's C3 uart_ll has no
 // wrapper for it, so poke the bit directly.
+// The bitfield is named `update` in the C3's uart_struct.h but `reg_update` in
+// the S3's; on both it is bit 31 of UART_ID_REG, so go through the raw
+// register value. The wait is bounded so a chip that never clears the bit
+// cannot wedge the ISR.
+static constexpr uint32_t UART_REG_UPDATE_BIT = 1u << 31;
 static inline void IRAM_ATTR uart_reg_update(uart_dev_t *hw) {
-  hw->id.update = 1;
-  while (hw->id.update) {
+  hw->id.val = hw->id.val | UART_REG_UPDATE_BIT;
+  for (uint32_t i = 0; i < 10000 && (hw->id.val & UART_REG_UPDATE_BIT); i++) {
   }
 }
 

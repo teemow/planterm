@@ -155,10 +155,14 @@ class PlanBridge : public Component {
   // against the reject counters (tx_unacked / walks).
   void set_de_tail_us(uint32_t us) { de_tail_us_ = us; }
   void set_carrier_sense(bool e) { carrier_sense_ = e ? 1 : 0; }
-  // Wave E5 / A7 F1 (default OFF, live A/B first): after each byte's TX-idle
-  // read, also wait out one full character time since the FIFO write, so an
-  // early idle (counted always as tx_early_idle) can never switch the parity
-  // or drop DE mid-character. Adds no time when the hardware behaves.
+  // Wave E5 / A7 F1: after each byte's TX-idle read, also wait out one full
+  // character time since the FIFO write, so an early idle (counted always as
+  // tx_early_idle) can never switch the parity or drop DE mid-character. Adds
+  // no time when the hardware behaves. Default OFF (live A/B first), except on
+  // the ESP32-S3: its UART reports TX idle right after the FIFO write, so
+  // without the floor the next byte's parity -- the 9th (address) bit -- is
+  // switched while the previous byte is still shifting out, and the
+  // controller silently discards every reply.
   void set_tx_char_floor(bool e) { tx_char_floor_ = e ? 1 : 0; }
   // Enable/disable answering the controller's roll-call for a free terminal
   // address. Disabling starts the graceful drain (see PlanTerminal::drain_);
@@ -425,7 +429,11 @@ class PlanBridge : public Component {
   // 12-bit character (start + 8 + bit9 + 2 stop) at baud_rate_, set in
   // setup(); tx_char_floor_ = the knob above; bus_win_ = the last window.
   volatile uint32_t char_us_{192};
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  volatile uint8_t tx_char_floor_{1};  // see set_tx_char_floor()
+#else
   volatile uint8_t tx_char_floor_{0};
+#endif
   plan::BusWindow bus_win_{};
   static float pct_(uint32_t n, uint32_t of) { return of != 0 ? 100.0f * n / of : NAN; }
 };

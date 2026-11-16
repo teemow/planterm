@@ -46,6 +46,28 @@ The RX ISR is IRAM-resident so it keeps answering polls while the flash
 cache is disabled (WiFi/NVS/OTA writes); every function it calls must be
 IRAM too, or the first flash write panics the device.
 
+### ESP32-S3
+
+The bridge runs on an ESP32-S3 too (tested with an SP3485 transceiver
+against a pCO1). Four things differ from the single-core RISC-V C3, all
+handled in the code:
+
+- **Parity latch:** the `UART_ID_REG` update bit is called `reg_update` on
+  the S3 (`update` on the C3); the ISR writes bit 31 of the raw register.
+- **IRAM literals:** on Xtensa the in-class `PLAN_IRAM` methods are
+  force-inlined, otherwise the link fails with *"dangerous relocation: l32r:
+  literal placed after use"*.
+- **Early TX idle:** the S3's UART reports TX idle right after the FIFO
+  write, so the next byte's parity (= the 9th bit) would be switched while
+  the previous byte is still shifting out. The address bit then lands on the
+  wrong byte and the controller drops every reply, although logs, payloads
+  and checksums all look right. `set_tx_char_floor` is therefore on by
+  default on the S3; `tx_early_idle` in the bus-health line counts the
+  affected bytes.
+- **Dual core:** the `plan_ctrl` task is pinned to the core that owns the
+  UART interrupt, otherwise a cross-core race in the stream-buffer notify
+  aborts the device (`configASSERT(xTaskToNotify)`) roughly once a day.
+
 ## The 9-bit problem
 
 pLAN is a **9-bit multidrop protocol** ([protocol.md §1](../../../docs/protocol.md)):
@@ -219,7 +241,7 @@ window (`last_bus_window()` or the named one), for Home Assistant sensors:
 | `frm` / `brk` / `glitch` | `last_uart_framing_errors()` / `last_uart_breaks()` / `last_uart_glitches()` | 0 | UART receive errors (raw ISR status, counted only) |
 | `addr_bad` | `last_addr_garble()` | 0 | 9th-bit bytes above 0x20: a parity-flipped data byte |
 | `tx` / `hold_dev_min` / `hold_dev_max` | `last_tx_frames()` / `last_hold_dev_min_us()` / `last_hold_dev_max_us()` | 0 .. +20 us | DE hold minus `len x 192 + 16 (+ de_tail)` per frame; below -96 a frame was cut short |
-| `early_idle` | `last_tx_early_idle()` | 0 | bytes whose TX-idle read came before one character time (A7 F1); `set_tx_char_floor(true)` (default off) waits those out |
+| `early_idle` | `last_tx_early_idle()` | 0 | bytes whose TX-idle read came before one character time (A7 F1); `set_tx_char_floor(true)` (default off; on by default on the ESP32-S3, whose UART always reports idle early) waits those out |
 
 `health`: **loop** at >= 3 FF-walks in the trailing 30 s or a window without
 a controller frame; **degraded** at any pGD roll-call, a controller silence
